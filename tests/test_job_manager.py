@@ -990,6 +990,17 @@ class TestDbGetNextQueuedJob:
         assert await _db_get_next_queued_job(session=db_session) is None
 
     @pytest.mark.asyncio
+    async def test_opens_its_own_session_when_none_given(self, db_session: AsyncSession):
+        """Production always calls this with no argument (_start_next_queued_job
+        never passes a session), so the self-opening branch — not just the
+        test-injected-session one every other test here exercises — needs
+        its own coverage. db_session is requested only to trigger the test
+        database redirect so the real AsyncSessionLocal() connects to the
+        same test container; its own (rolled-back) transaction is unused."""
+        _ = db_session
+        assert await _db_get_next_queued_job() is None
+
+    @pytest.mark.asyncio
     async def test_cancelled_job_counts_as_served_known_limitation(
         self, db_session: AsyncSession, test_user: User, test_user2: User
     ):
