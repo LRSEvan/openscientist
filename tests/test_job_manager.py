@@ -16,6 +16,7 @@ from openscientist.job_manager import (
     JobStatus,
     JobStatusUpdateResult,
     _db_get_next_queued_job,
+    _simulate_privileged_queue_order,
 )
 
 
@@ -948,7 +949,8 @@ class TestEffectiveModel:
 
 
 class TestDbGetNextQueuedJob:
-    """Real-database tests for the fair queue-picking query (issue #268).
+    """Real-database tests for the fair queue-picking query (issue #268),
+    including the privileged/regular two-pool extension on top of it.
 
     This is a nontrivial join/subquery, so it's tested against a real
     Postgres (via db_session, same transaction-per-test pattern as the rest
@@ -1036,6 +1038,48 @@ class TestDbGetNextQueuedJob:
         assert await _db_get_next_queued_job() is None
 
     @pytest.mark.asyncio
+    async def test_owner_served_before_lookback_window_treated_as_never_served(
+        self, db_session: AsyncSession, test_user: User, test_user2: User
+    ):
+        """Recency bound (_LAST_SERVED_LOOKBACK): an
+        owner whose only non-queued job falls outside the window is treated
+        the same as never-served, even though test_user2 (genuinely never
+        served) has a newer queued job — never-served-or-stale beats
+        previously-served regardless of which owner's queued job is older,
+        matching the existing within-window never-served-first rule."""
+        from openscientist.job_manager import _LAST_SERVED_LOOKBACK
+
+        now = datetime.now(UTC)
+
+        stale_served = Job(
+            owner_id=test_user.id,
+            research_question="Served, but outside the lookback window",
+            status="completed",
+            updated_at=now - _LAST_SERVED_LOOKBACK - timedelta(days=1),
+        )
+        test_user_queued = Job(
+            owner_id=test_user.id,
+            research_question="test_user's queued job (older)",
+            status="queued",
+            created_at=now - timedelta(hours=2),
+        )
+        test_user2_queued = Job(
+            owner_id=test_user2.id,
+            research_question="test_user2's queued job (newer, genuinely never served)",
+            status="queued",
+            created_at=now - timedelta(minutes=1),
+        )
+        db_session.add_all([stale_served, test_user_queued, test_user2_queued])
+        await db_session.commit()
+
+        next_job = await _db_get_next_queued_job(session=db_session)
+
+        # Both owners are "never served" under the lookback window, so the
+        # usual FIFO tiebreak applies: test_user's older queued job wins.
+        assert next_job is not None
+        assert next_job.id == test_user_queued.id
+
+    @pytest.mark.asyncio
     async def test_cancelled_job_counts_as_served_known_limitation(
         self, db_session: AsyncSession, test_user: User, test_user2: User
     ):
@@ -1078,3 +1122,134 @@ class TestDbGetNextQueuedJob:
         # as "served" under this known limitation.
         assert next_job is not None
         assert next_job.id == test_user2_queued.id
+
+    @pytest.mark.asyncio
+    async def test_privileged_owners_job_beats_longer_waiting_regular_owner(
+        self, db_session: AsyncSession, test_user: User, test_user2: User
+    ):
+        """A privileged owner's queued job always wins, even against a
+        regular owner who has waited longer and has never been served."""
+        now = datetime.now(UTC)
+        test_user.privileged = True
+        await db_session.commit()
+
+        regular_queued = Job(
+            owner_id=test_user2.id,
+            research_question="Regular user, waited longest, never served",
+            status="queued",
+            created_at=now - timedelta(hours=6),
+        )
+        privileged_queued = Job(
+            owner_id=test_user.id,
+            research_question="Privileged user, submitted just now",
+            status="queued",
+            created_at=now,
+        )
+        db_session.add_all([regular_queued, privileged_queued])
+        await db_session.commit()
+
+        next_job = await _db_get_next_queued_job(session=db_session)
+
+        assert next_job is not None
+        assert next_job.id == privileged_queued.id
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_regular_pool_when_no_privileged_job_queued(
+        self, db_session: AsyncSession, test_user: User, test_user2: User
+    ):
+        """With no privileged job in the queue, the fairness rule applies
+        unchanged within the regular pool."""
+        now = datetime.now(UTC)
+        test_user.privileged = True
+        await db_session.commit()
+
+        # test_user is privileged but has nothing queued right now.
+        regular_queued = Job(
+            owner_id=test_user2.id,
+            research_question="Only job in the queue, owned by a regular user",
+            status="queued",
+            created_at=now,
+        )
+        db_session.add(regular_queued)
+        await db_session.commit()
+
+        next_job = await _db_get_next_queued_job(session=db_session)
+
+        assert next_job is not None
+        assert next_job.id == regular_queued.id
+
+    @pytest.mark.asyncio
+    async def test_orphaned_null_owner_job_lands_in_regular_pool(
+        self, db_session: AsyncSession, test_user: User
+    ):
+        """A job with no owner (NULL owner_id) must not be silently excluded
+        from the regular pool by a bare NOT IN against the privileged-id
+        subquery (NULL semantics) — it should still be picked when it's the
+        only queued job and no privileged job is queued."""
+        test_user.privileged = True
+        await db_session.commit()
+
+        orphaned_queued = Job(
+            owner_id=None,
+            research_question="Orphaned job, no owner",
+            status="queued",
+        )
+        db_session.add(orphaned_queued)
+        await db_session.commit()
+
+        next_job = await _db_get_next_queued_job(session=db_session)
+
+        assert next_job is not None
+        assert next_job.id == orphaned_queued.id
+
+
+class TestSimulatePrivilegedQueueOrder:
+    """Real-database tests for the non-mutating queue-order simulation
+    backing the admin "Queue" panel."""
+
+    @pytest.mark.asyncio
+    async def test_returns_full_drain_order_without_persisting_changes(
+        self, db_session: AsyncSession, test_user: User, test_user2: User
+    ):
+        """The simulation must report the same order a real drain would
+        produce, but leave every job's real status/updated_at untouched
+        once it returns (the SAVEPOINT rollback must actually take)."""
+        now = datetime.now(UTC)
+        test_user.privileged = True
+        await db_session.commit()
+
+        privileged_job = Job(
+            owner_id=test_user.id,
+            research_question="Privileged job",
+            status="queued",
+            created_at=now,
+        )
+        regular_job = Job(
+            owner_id=test_user2.id,
+            research_question="Regular job",
+            status="queued",
+            created_at=now - timedelta(hours=1),
+        )
+        db_session.add_all([privileged_job, regular_job])
+        await db_session.commit()
+        # Capture IDs before the simulation's SAVEPOINT rollback expires
+        # these ORM instances (confirmed below) — a bare attribute access
+        # after that would need an async-aware reload.
+        privileged_job_id = str(privileged_job.id)
+        regular_job_id = str(regular_job.id)
+
+        order = await _simulate_privileged_queue_order(db_session)
+
+        assert [entry["pool"] for entry in order] == ["privileged", "regular"]
+        assert order[0]["job_id"] == privileged_job_id
+        assert order[1]["job_id"] == regular_job_id
+
+        # Nothing should actually have been persisted by the simulation.
+        await db_session.refresh(privileged_job)
+        await db_session.refresh(regular_job)
+        assert privileged_job.status == "queued"
+        assert regular_job.status == "queued"
+
+    @pytest.mark.asyncio
+    async def test_empty_queue_returns_empty_list(self, db_session: AsyncSession):
+        assert await _simulate_privileged_queue_order(db_session) == []

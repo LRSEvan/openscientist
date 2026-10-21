@@ -262,10 +262,26 @@ async def _db_list_jobs(
         return list(result.scalars().all())
 
 
-async def _db_get_next_queued_job(session: AsyncSession | None = None) -> JobModel | None:
-    """Pick the next queued job fairly: least-recently-served owner first,
-    that owner's oldest queued job as the tiebreak (FIFO within an owner,
-    rotation across owners).
+_LAST_SERVED_LOOKBACK = timedelta(days=90)
+"""How far back ``_select_next_queued_job`` looks for an owner's
+last-served job. Bounds the aggregate to a recency window instead of a
+user's entire job history, which would otherwise scan ~100% of a growing
+jobs table on every pick (a plain index can't narrow a filter that excludes
+almost nothing — verified via EXPLAIN against ~50k synthetic rows before
+adding this bound). An owner whose last job predates this window is
+treated as never-served — a deliberate tradeoff: a long-dormant user gets
+welcomed back promptly rather than penalized, which isn't really unfair in
+practice.
+"""
+
+
+async def _select_next_queued_job(
+    session: AsyncSession, *, privileged_only: bool | None = None
+) -> JobModel | None:
+    """The fairness query: least-recently-served owner first, that owner's
+    oldest queued job as the tiebreak (FIFO within an owner, rotation
+    across owners). Factored out so both the self-opening and
+    test-injected-session paths in ``_db_get_next_queued_job`` share it.
 
     A dedicated query rather than reusing ``_db_list_jobs`` — that function's
     newest-first ordering is its own documented contract (``list_jobs()``),
@@ -273,12 +289,14 @@ async def _db_get_next_queued_job(session: AsyncSession | None = None) -> JobMod
     question ("who goes next") from "list jobs for display."
 
     "Last served" is approximated as the most recent ``updated_at`` among an
-    owner's jobs that have left the queue (i.e. started at least once) —
-    jobs are marked ``running`` before launch (see ``_run_job_in_container``),
-    so ``updated_at`` is stamped at start. This is the same proxy
-    ``JobInfo.started_at`` already relies on (``job/types.py``), so it needs
-    no new column. An owner with no such jobs (never served, including
-    orphaned/``NULL``-owner jobs) sorts first via ``NULLS FIRST``.
+    owner's jobs that have left the queue within ``_LAST_SERVED_LOOKBACK``
+    (i.e. started at least once, recently) — jobs are marked ``running``
+    before launch (see ``_run_job_in_container``), so ``updated_at`` is
+    stamped at start. This is the same proxy ``JobInfo.started_at`` already
+    relies on (``job/types.py``), so it needs no new column. An owner with
+    no such jobs (never served, including orphaned/``NULL``-owner jobs, or
+    only served outside the lookback window) sorts first via ``NULLS
+    FIRST``.
 
     Known limitation: ``NULL = NULL`` is never true in SQL, so the owner
     join can never match one orphaned (``owner_id IS NULL``) job's "last
@@ -299,28 +317,25 @@ async def _db_get_next_queued_job(session: AsyncSession | None = None) -> JobMod
     submission), not after the first real iteration — so it can't tell
     "never queued-to-run" apart from "ran once." Closing this gap for real
     would need a genuine ``started_at``-style column, which is out of scope
-    for this fix (the issue's own review explicitly called for none).
+    here.
 
-    Accepts an optional ``session`` (same idiom as
-    ``KnowledgeState.save_to_database``) so tests can run the real query
-    inside the shared per-test transaction; production always calls this
-    with no argument, opening its own session exactly like ``_db_list_jobs``.
+    ``privileged_only=None`` (the default) ranks across all queued jobs.
+    ``True``/``False`` additionally restricts to jobs owned by a
+    privileged/regular ``User``, scoping the identical ranking rule to one
+    pool instead of duplicating it — ``_db_get_next_queued_job`` uses this
+    to let privileged owners' jobs always run first. A ``NULL`` owner
+    (orphaned job) is treated as regular.
     """
-    if session is not None:
-        return await _select_next_queued_job(session)
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        return await _select_next_queued_job(session)
-
-
-async def _select_next_queued_job(session: AsyncSession) -> JobModel | None:
-    """The actual fairness query, factored out so both the self-opening and
-    test-injected-session paths in ``_db_get_next_queued_job`` share it."""
+    last_served_cutoff = datetime.now(UTC) - _LAST_SERVED_LOOKBACK
     last_served = (
         select(
             JobModel.owner_id.label("owner_id"),
             func.max(JobModel.updated_at).label("last_served"),
         )
-        .where(JobModel.status.not_in([JobStatus.QUEUED.value, JobStatus.PENDING.value]))
+        .where(
+            JobModel.status.not_in([JobStatus.QUEUED.value, JobStatus.PENDING.value]),
+            JobModel.updated_at > last_served_cutoff,
+        )
         .group_by(JobModel.owner_id)
         .subquery()
     )
@@ -331,11 +346,157 @@ async def _select_next_queued_job(session: AsyncSession) -> JobModel | None:
         # note on _db_get_next_queued_job above.
         .outerjoin(last_served, last_served.c.owner_id == JobModel.owner_id)
         .where(JobModel.status == JobStatus.QUEUED.value)
-        .order_by(last_served.c.last_served.asc().nulls_first(), JobModel.created_at.asc())
-        .limit(1)
     )
+    if privileged_only is not None:
+        privileged_owner_ids = select(User.id).where(User.privileged.is_(True)).scalar_subquery()
+        if privileged_only:
+            stmt = stmt.where(JobModel.owner_id.in_(privileged_owner_ids))
+        else:
+            # owner_id NOT IN (...) is NULL (never true) for orphaned jobs,
+            # so they'd be silently excluded from the regular pool too
+            # without this explicit IS NULL case.
+            stmt = stmt.where(
+                (JobModel.owner_id.is_(None)) | (JobModel.owner_id.not_in(privileged_owner_ids))
+            )
+    stmt = stmt.order_by(
+        last_served.c.last_served.asc().nulls_first(), JobModel.created_at.asc()
+    ).limit(1)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def _pick_privileged_or_regular(session: AsyncSession) -> JobModel | None:
+    """A privileged owner's queued job always wins; otherwise falls back to
+    the regular pool. Both pools reuse ``_select_next_queued_job``'s
+    ranking unchanged, so an owner's position within their own pool is
+    unaffected by privilege."""
+    privileged_pick = await _select_next_queued_job(session, privileged_only=True)
+    if privileged_pick is not None:
+        return privileged_pick
+    return await _select_next_queued_job(session, privileged_only=False)
+
+
+async def _db_get_next_queued_job(session: AsyncSession | None = None) -> JobModel | None:
+    """Pick the next queued job (see ``_pick_privileged_or_regular``). With
+    no privileged users (true for every user before this feature), this
+    degenerates to exactly #268's original single-pool behavior.
+
+    Accepts an optional ``session`` (same idiom as
+    ``KnowledgeState.save_to_database``) so tests — and the admin Queue
+    panel's ``_simulate_privileged_queue_order``, which is production code,
+    not a test — can run the real query inside their own transaction;
+    ``_start_next_queued_job`` always calls this with no argument, opening
+    its own session exactly like ``_db_list_jobs``.
+    """
+    if session is not None:
+        return await _pick_privileged_or_regular(session)
+    async with AsyncSessionLocal(thread_safe=True) as session:
+        return await _pick_privileged_or_regular(session)
+
+
+_NEVER_SERVED = datetime.min.replace(tzinfo=UTC)
+"""Sort-first sentinel standing in for SQL's NULLS FIRST in the pure-Python
+re-simulation below (datetime.min sorts before every real timestamp)."""
+
+
+async def _simulate_privileged_queue_order(session: AsyncSession) -> list[dict[str, Any]]:
+    """Non-destructively compute the full order the scheduler
+    (``_db_get_next_queued_job``) would drain the current queue in, for the
+    admin queue-visibility panel.
+
+    Computed as a pure in-memory re-simulation of ``_select_next_queued_job``'s
+    ranking rule over data fetched once — not by repeatedly calling the
+    real pick-and-mark-served function against the database. Doing it that
+    way would require a SAVEPOINT held for the whole drain (so each pick's
+    "mark as served" write stays visible to the next pick), which would
+    keep every picked job's row locked for as long as the whole simulation
+    takes — on a long queue, that could stall the real scheduler trying to
+    start one of those same jobs while an admin merely has this panel
+    open. This version never writes anything, so there's nothing to lock
+    or roll back.
+
+    Caution: this re-implements ``_select_next_queued_job``'s ranking
+    rule rather than calling it, so if that rule ever changes, this must
+    be updated to match — ``TestSimulatePrivilegedQueueOrder`` exists to
+    catch drift between the two.
+    """
+    cutoff = datetime.now(UTC) - _LAST_SERVED_LOOKBACK
+    last_served_stmt = (
+        select(JobModel.owner_id, func.max(JobModel.updated_at))
+        .where(
+            JobModel.owner_id.is_not(None),
+            JobModel.status.not_in([JobStatus.QUEUED.value, JobStatus.PENDING.value]),
+            JobModel.updated_at > cutoff,
+        )
+        .group_by(JobModel.owner_id)
+    )
+    # owner_id is NOT NULL here by the query's own filter above; the
+    # column's nullable type is just a static-typing artifact of the FK.
+    last_served_by_owner: dict[UUID, datetime] = {
+        owner_id: last_served
+        for owner_id, last_served in (await session.execute(last_served_stmt)).all()
+        if owner_id is not None
+    }
+
+    queued_stmt = (
+        select(JobModel, User)
+        .outerjoin(User, User.id == JobModel.owner_id)
+        .where(JobModel.status == JobStatus.QUEUED.value)
+        .order_by(JobModel.created_at.asc())
+    )
+    queued_rows = (await session.execute(queued_stmt)).all()
+
+    # Group by pool, keyed by owner_id for a real owner (so last_served is
+    # looked up once per owner) or by the job's own id for an orphaned job
+    # — mirroring SQL's NULL != NULL, every orphaned job is independently
+    # never-served rather than grouped with other orphaned jobs.
+    privileged_pool: dict[object, list[tuple[JobModel, User | None]]] = {}
+    regular_pool: dict[object, list[tuple[JobModel, User | None]]] = {}
+    for job, owner in queued_rows:
+        target_pool = privileged_pool if (owner is not None and owner.privileged) else regular_pool
+        key: object = owner.id if owner is not None else job.id
+        target_pool.setdefault(key, []).append((job, owner))
+
+    # Sort key per key is (generation, value): generation 0 means "not yet
+    # picked in this simulation" (value = real last_served, or _NEVER_SERVED),
+    # generation 1 means "picked at virtual_clock=value" — any generation-1
+    # key sorts after every generation-0 key regardless of value, and
+    # higher virtual_clock sorts later, which is exactly "simulated-serving
+    # is always more recent than real history, and later picks are more
+    # recent than earlier ones." Avoids mixing real and synthetic
+    # timestamps in one comparable type.
+    order: list[tuple[JobModel, User | None]] = []
+    for pool in (privileged_pool, regular_pool):
+        remaining = {key: list(jobs) for key, jobs in pool.items()}
+        last_served: dict[object, tuple[int, datetime | int]] = {}
+        for key, jobs in remaining.items():
+            owner = jobs[0][1]
+            seed = last_served_by_owner.get(owner.id, _NEVER_SERVED) if owner else _NEVER_SERVED
+            last_served[key] = (0, seed)
+        virtual_clock = 0
+        while remaining:
+            next_key = min(
+                remaining,
+                key=lambda k: (last_served[k], remaining[k][0][0].created_at),
+            )
+            job, owner = remaining[next_key].pop(0)
+            order.append((job, owner))
+            virtual_clock += 1
+            last_served[next_key] = (1, virtual_clock)
+            if not remaining[next_key]:
+                del remaining[next_key]
+
+    return [
+        {
+            "rank": i + 1,
+            "pool": "privileged" if (owner is not None and owner.privileged) else "regular",
+            "owner_name": owner.name if owner is not None else "(orphaned, no owner)",
+            "job_id": str(job.id),
+            "research_question": job.research_question,
+            "created_at": job.created_at,
+        }
+        for i, (job, owner) in enumerate(order)
+    ]
 
 
 async def _db_delete_job(job_id: str, user_id: UUID | None = None) -> None:

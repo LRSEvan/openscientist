@@ -14,10 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from openscientist.database.models import Job, User
 from openscientist.database.rls import set_current_user
 from openscientist.webapp_components.pages.admin import (
+    _build_admin_user_rows,
     _filter_users_for_admin_table,
     admin_page,
     delete_user,
     set_user_approval_status,
+    set_user_privileged,
 )
 from tests.helpers import fake_admin_session
 
@@ -481,6 +483,142 @@ async def test_set_user_approval_status_handles_missing_user(
 
     assert success is False
     assert message == "User not found"
+
+
+@pytest.mark.asyncio
+async def test_set_user_privileged_can_grant(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """Admin helper can grant privileged status to a regular user."""
+    monkeypatch.setattr(
+        "openscientist.webapp_components.pages.admin.get_admin_session",
+        fake_admin_session(db_session),
+    )
+
+    user = User(email="regular@example.com", name="Regular User", privileged=False)
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    success, message = await set_user_privileged(user.id, privileged=True)
+
+    assert success is True
+    assert message == "User granted privileged status"
+
+    await db_session.refresh(user)
+    assert user.privileged is True
+
+
+@pytest.mark.asyncio
+async def test_set_user_privileged_can_revoke(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """Admin helper can remove privileged status from a privileged user."""
+    monkeypatch.setattr(
+        "openscientist.webapp_components.pages.admin.get_admin_session",
+        fake_admin_session(db_session),
+    )
+
+    user = User(email="privileged@example.com", name="Privileged User", privileged=True)
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    success, message = await set_user_privileged(user.id, privileged=False)
+
+    assert success is True
+    assert message == "User's privileged status removed"
+
+    await db_session.refresh(user)
+    assert user.privileged is False
+
+
+@pytest.mark.asyncio
+async def test_set_user_privileged_rejects_self_revoke(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """Admin helper should reject removing privileged status from the
+    current user, mirroring set_user_approval_status's self-protection."""
+    monkeypatch.setattr(
+        "openscientist.webapp_components.pages.admin.get_admin_session",
+        fake_admin_session(db_session),
+    )
+
+    user = User(email="self-priv@example.com", name="Self Privileged User", privileged=True)
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    monkeypatch.setattr(
+        "openscientist.webapp_components.pages.admin.get_current_user_id",
+        lambda: str(user.id),
+    )
+
+    success, message = await set_user_privileged(user.id, privileged=False)
+
+    assert success is False
+    assert message == "You cannot remove your own privileged status"
+
+    await db_session.refresh(user)
+    assert user.privileged is True
+
+
+@pytest.mark.asyncio
+async def test_set_user_privileged_noop_when_already_set(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """Admin helper should report noop when the state is already as requested."""
+    monkeypatch.setattr(
+        "openscientist.webapp_components.pages.admin.get_admin_session",
+        fake_admin_session(db_session),
+    )
+
+    user = User(email="regular2@example.com", name="Regular User 2", privileged=False)
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    success, message = await set_user_privileged(user.id, privileged=False)
+
+    assert success is False
+    assert message == "User is already regular"
+
+
+@pytest.mark.asyncio
+async def test_set_user_privileged_handles_missing_user(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """Admin helper should return not found for unknown user IDs."""
+    monkeypatch.setattr(
+        "openscientist.webapp_components.pages.admin.get_admin_session",
+        fake_admin_session(db_session),
+    )
+
+    success, message = await set_user_privileged(uuid4(), privileged=True)
+
+    assert success is False
+    assert message == "User not found"
+
+
+@pytest.mark.asyncio
+async def test_build_admin_user_rows_includes_privileged_status(
+    db_session: AsyncSession,
+):
+    """Row-building reflects each user's privileged flag/status label."""
+    regular = User(email="row-regular@example.com", name="Row Regular", privileged=False)
+    privileged = User(email="row-privileged@example.com", name="Row Privileged", privileged=True)
+    db_session.add_all([regular, privileged])
+    await db_session.commit()
+    await db_session.refresh(regular)
+    await db_session.refresh(privileged)
+
+    rows = await _build_admin_user_rows(db_session, [regular, privileged])
+    by_email = {row["email"]: row for row in rows}
+
+    assert by_email["row-regular@example.com"]["privileged"] is False
+    assert by_email["row-regular@example.com"]["privileged_status"] == "Regular"
+    assert by_email["row-privileged@example.com"]["privileged"] is True
+    assert by_email["row-privileged@example.com"]["privileged_status"] == "Privileged"
 
 
 def test_filter_users_for_admin_table_hides_current_user():

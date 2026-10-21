@@ -15,6 +15,7 @@ from openscientist.admin.orphan_jobs import assign_orphaned_job, list_orphaned_j
 from openscientist.auth.middleware import get_current_user_id, require_admin, require_auth
 from openscientist.database.models import Job, ReviewToken, User
 from openscientist.database.session import get_admin_session
+from openscientist.job_manager import _simulate_privileged_queue_order
 from openscientist.webapp_components.pages.billing import render_billing_panel
 from openscientist.webapp_components.ui_components import (
     format_uptime,
@@ -90,6 +91,50 @@ async def set_user_approval_status(user_id: UUID, is_approved: bool) -> tuple[bo
     return True, "User approval removed successfully"
 
 
+async def set_user_privileged(user_id: UUID, privileged: bool) -> tuple[bool, str]:
+    """
+    Update a user's privileged flag (always run ahead of regular users in
+    the job queue — see ``_db_get_next_queued_job`` in ``job_manager.py``).
+
+    Args:
+        user_id: User to update
+        privileged: Desired privileged state
+
+    Returns:
+        Tuple of (success, message)
+    """
+    async with get_admin_session() as session:
+        stmt = select(User).where(User.id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            return False, "User not found"
+
+        # Mirrors set_user_approval_status's self-protection: block an
+        # admin from revoking their own privileged status by mistake.
+        current_user_id: str | None = None
+        if not privileged:
+            try:
+                current_user_id = get_current_user_id()
+            except (RuntimeError, AssertionError, AttributeError):
+                logger.debug("Current user ID unavailable during privilege update", exc_info=True)
+
+        if not privileged and current_user_id == str(user.id):
+            return False, "You cannot remove your own privileged status"
+
+        if bool(user.privileged) == privileged:
+            state = "privileged" if privileged else "regular"
+            return False, f"User is already {state}"
+
+        user.privileged = privileged
+        await session.commit()
+
+    if privileged:
+        return True, "User granted privileged status"
+    return True, "User's privileged status removed"
+
+
 @ui.page("/admin")
 @require_auth
 @require_admin
@@ -107,6 +152,7 @@ async def admin_page() -> None:
             review_tokens_tab = ui.tab("Review Tokens", icon="rate_review")
             containers_tab = ui.tab("Containers", icon="dns")
             billing_tab = ui.tab("Billing", icon="payments")
+            queue_tab = ui.tab("Queue", icon="playlist_play")
 
         with ui.tab_panels(tabs, value=users_tab).classes("w-full"):
             # Orphaned Jobs Panel (deferred — not the default tab)
@@ -128,6 +174,10 @@ async def admin_page() -> None:
             # Billing Panel (deferred)
             with ui.tab_panel(billing_tab):
                 ui.timer(0.1, render_billing_panel, once=True)
+
+            # Queue visibility panel (deferred)
+            with ui.tab_panel(queue_tab):
+                ui.timer(0.1, render_queue_panel, once=True)
 
 
 async def render_orphaned_jobs_panel() -> None:
@@ -237,6 +287,65 @@ async def load_orphaned_jobs(container: ui.column, search_query: str = "") -> No
         logger.error("Error loading orphaned jobs: %s", e, exc_info=True)
         with container:
             ui.label("Error loading jobs. Check server logs for details.").classes("text-red-500")
+
+
+async def render_queue_panel() -> None:
+    """Read-only view of the current queue, grouped by pool
+    (privileged/regular) and ordered the way the scheduler would actually
+    drain it. Computed as a pure in-memory simulation that never writes
+    to the database (see ``_simulate_privileged_queue_order``'s docstring).
+    """
+    ui.markdown(
+        "_Shows the order the scheduler would pick queued jobs in, "
+        "computed without changing any data._"
+    ).classes("text-sm text-gray-600 mb-2")
+
+    try:
+        async with get_admin_session() as session:
+            order = await _simulate_privileged_queue_order(session)
+    except Exception as e:
+        logger.error("Error simulating queue order: %s", e, exc_info=True)
+        render_alert_banner(
+            title="Queue Order Unavailable",
+            message="Error computing queue order. Check server logs.",
+            severity="error",
+        )
+        return
+
+    if not order:
+        render_empty_state("Nothing is currently queued.")
+        return
+
+    columns = [
+        {"name": "rank", "label": "#", "field": "rank", "align": "left"},
+        {"name": "pool", "label": "Pool", "field": "pool", "align": "left"},
+        {"name": "owner_name", "label": "Owner", "field": "owner_name", "align": "left"},
+        {
+            "name": "research_question",
+            "label": "Job",
+            "field": "research_question",
+            "align": "left",
+        },
+        {"name": "created_at", "label": "Queued at", "field": "created_at", "align": "left"},
+    ]
+    rows = [
+        {
+            "rank": entry["rank"],
+            "pool": entry["pool"],
+            "owner_name": entry["owner_name"],
+            "research_question": (
+                entry["research_question"][:60] + "..."
+                if len(entry["research_question"]) > 60
+                else entry["research_question"]
+            ),
+            "created_at": entry["created_at"].strftime("%Y-%m-%d %H:%M")
+            if entry["created_at"]
+            else "N/A",
+            "job_id": entry["job_id"],
+        }
+        for entry in order
+    ]
+    ui.table(columns=columns, rows=rows, row_key="job_id").classes("w-full")
 
 
 async def show_assign_dialog(job_id: str) -> None:
@@ -364,6 +473,12 @@ def _admin_users_columns() -> list[dict[str, str]]:
             "field": "approval_status",
             "align": "center",
         },
+        {
+            "name": "privileged_status",
+            "label": "Privileged",
+            "field": "privileged_status",
+            "align": "center",
+        },
         {"name": "actions", "label": "Actions", "field": "actions", "align": "center"},
     ]
 
@@ -388,6 +503,8 @@ async def _build_admin_user_rows(session: Any, users: list[User]) -> list[dict[s
             "job_count": job_counts.get(user.id, 0),
             "approval_status": "Approved" if user.is_approved else "Pending",
             "is_approved": bool(user.is_approved),
+            "privileged_status": "Privileged" if user.privileged else "Regular",
+            "privileged": bool(user.privileged),
         }
         for user in users
     ]
@@ -428,6 +545,36 @@ async def _handle_approval_update(
         ui.notify(error_message, color="negative")
 
 
+async def _handle_privileged_update(
+    e: Any, privileged: bool, reload_users: Callable[[], Awaitable[None]]
+) -> None:
+    user_id = e.args.get("id")
+    if not user_id:
+        ui.notify("Invalid user selection", color="negative")
+        return
+
+    try:
+        success, message = await set_user_privileged(
+            UUID(user_id),
+            privileged=privileged,
+        )
+        ui.notify(message, color="positive" if success else "info")
+        if success:
+            await reload_users()
+    except ValueError:
+        ui.notify("Invalid user selection", color="negative")
+    except Exception as ex:
+        action = "grant privileged status to" if privileged else "remove privileged status from"
+        logger.error(
+            "Error trying to %s user %s: %s",
+            action,
+            user_id,
+            ex,
+            exc_info=True,
+        )
+        ui.notify("Failed to update privileged status. Check server logs.", color="negative")
+
+
 def _render_admin_users_table(
     users_container: ui.column,
     rows: list[dict[str, object]],
@@ -444,6 +591,17 @@ def _render_admin_users_table(
                 <q-badge
                     :color="props.row.is_approved ? 'positive' : 'warning'"
                     :label="props.row.approval_status"
+                />
+            </q-td>
+            """,
+        )
+        users_table.add_slot(
+            "body-cell-privileged_status",
+            """
+            <q-td :props="props">
+                <q-badge
+                    :color="props.row.privileged ? 'purple' : 'grey'"
+                    :label="props.row.privileged_status"
                 />
             </q-td>
             """,
@@ -470,6 +628,22 @@ def _render_admin_users_table(
                         @click="$parent.$emit('unapprove-user', props.row)"
                     />
                     <q-btn
+                        v-if="!props.row.privileged"
+                        size="sm"
+                        color="purple"
+                        icon="star"
+                        label="Grant Privilege"
+                        @click="$parent.$emit('grant-privilege', props.row)"
+                    />
+                    <q-btn
+                        v-else
+                        size="sm"
+                        color="grey"
+                        icon="star_outline"
+                        label="Revoke Privilege"
+                        @click="$parent.$emit('revoke-privilege', props.row)"
+                    />
+                    <q-btn
                         size="sm"
                         color="negative"
                         icon="delete"
@@ -487,6 +661,12 @@ def _render_admin_users_table(
         async def unapprove_user(e: Any) -> None:
             await _handle_approval_update(e, is_approved=False, reload_users=reload_users)
 
+        async def grant_privilege(e: Any) -> None:
+            await _handle_privileged_update(e, privileged=True, reload_users=reload_users)
+
+        async def revoke_privilege(e: Any) -> None:
+            await _handle_privileged_update(e, privileged=False, reload_users=reload_users)
+
         async def handle_delete_user(e: Any) -> None:
             user_id = e.args.get("id")
             user_name = e.args.get("name", "this user")
@@ -501,6 +681,8 @@ def _render_admin_users_table(
 
         users_table.on("approve-user", approve_user)
         users_table.on("unapprove-user", unapprove_user)
+        users_table.on("grant-privilege", grant_privilege)
+        users_table.on("revoke-privilege", revoke_privilege)
         users_table.on("delete-user", handle_delete_user)
 
 
