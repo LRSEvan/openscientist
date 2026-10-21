@@ -803,6 +803,26 @@ class JobManager:
                 return
 
             job_id = str(next_job.id)
+
+            # Claim the job by flipping it out of "queued" here, while
+            # still holding self._lock, rather than leaving that to the
+            # spawned thread below. _db_get_next_queued_job's query only
+            # considers status == "queued" rows; without this, the picked
+            # job stays "queued" in the database until that thread gets
+            # around to its own status update, and another
+            # _start_next_queued_job call landing in that window (e.g.
+            # from a second job finishing or being cancelled moments
+            # later) could pick this same job again and launch it twice.
+            # Using the raw DB write (not the notification-sending
+            # self._update_job_status wrapper) keeps this idempotent and
+            # side-effect-free -- the thread's own self._update_job_status
+            # call below still fires the one real "job started" notification.
+            try:
+                _run_async(_db_update_job_status(job_id, JobStatus.RUNNING))
+            except Exception as e:
+                logger.warning("Failed to claim job %s before starting: %s", job_id, e)
+                return
+
             logger.info("Starting queued job %s", job_id)
             thread = threading.Thread(target=self._run_job, args=(job_id,), daemon=True)
             self._running_jobs[job_id] = thread

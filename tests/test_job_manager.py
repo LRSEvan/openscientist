@@ -538,10 +538,15 @@ class TestJobManagerCoinvestigate:
                 new_callable=AsyncMock,
                 return_value=queued_db_job,
             ),
+            patch(
+                "openscientist.job_manager._db_update_job_status",
+                new_callable=AsyncMock,
+            ) as mock_claim,
             patch("openscientist.job_manager.threading.Thread", return_value=fake_thread),
         ):
             manager._start_next_queued_job()
 
+        mock_claim.assert_called_once_with(job_id, JobStatus.RUNNING)
         assert manager._running_jobs[job_id] is fake_thread
         fake_thread.start.assert_called_once()
 
@@ -574,6 +579,36 @@ class TestJobManagerCoinvestigate:
             manager._start_next_queued_job()  # must not raise
 
         assert manager._running_jobs == {}
+
+    def test_start_next_queued_job_does_not_start_thread_when_claim_fails(self, tmp_path):
+        """If the synchronous "mark as running" claim (done while still
+        holding self._lock, to close the pick-twice race between two
+        _start_next_queued_job calls) raises, the job must not be started —
+        leaving it "queued" so a later call can pick it up again, rather
+        than running a job the DB still thinks is unclaimed."""
+        manager = _new_manager(tmp_path)
+        job_id = str(uuid4())
+        _write_config(tmp_path, job_id, status="queued")
+        queued_db_job = _make_db_job("queued", "2026-02-01T00:00:00", job_id=job_id)
+        fake_thread = MagicMock()
+
+        with (
+            patch(
+                "openscientist.job_manager._db_get_next_queued_job",
+                new_callable=AsyncMock,
+                return_value=queued_db_job,
+            ),
+            patch(
+                "openscientist.job_manager._db_update_job_status",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("transient DB error"),
+            ),
+            patch("openscientist.job_manager.threading.Thread", return_value=fake_thread),
+        ):
+            manager._start_next_queued_job()  # must not raise
+
+        assert manager._running_jobs == {}
+        fake_thread.start.assert_not_called()
 
     def test_coinvestigate_count(self, tmp_path):
         manager = _new_manager(tmp_path)
