@@ -17,13 +17,12 @@ BEGIN
 END
 $$;
 
--- Create admin role with BYPASSRLS privilege
--- Uses the same password as the main user for simplicity in development.
--- In production, use a different secure password.
+-- Create admin role with BYPASSRLS privilege. The migrations set its password
+-- from POSTGRES_ADMIN_PASSWORD.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'openscientist_admin') THEN
-        CREATE ROLE openscientist_admin WITH LOGIN PASSWORD 'openscientist_dev_password' BYPASSRLS;
+        CREATE ROLE openscientist_admin WITH LOGIN BYPASSRLS;
         RAISE NOTICE 'Created openscientist_admin role with BYPASSRLS privilege';
     END IF;
 END

@@ -188,6 +188,7 @@ def _apply_alembic_migrations(database_url: str) -> None:
     # Set environment variable for Alembic
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
+    env["POSTGRES_ADMIN_PASSWORD"] = "test-admin-password"
 
     # Get the path to the project root (where alembic.ini is)
     project_root = Path(__file__).parent.parent

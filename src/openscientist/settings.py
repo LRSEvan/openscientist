@@ -12,7 +12,7 @@ import os
 import re
 from functools import lru_cache
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -323,6 +323,9 @@ class DatabaseSettings(BaseSettings):
     # Admin database URL for elevated operations (bypasses RLS via DB role).
     # If not set, falls back to DATABASE_URL.
     admin_database_url: str | None = Field(default=None, alias="ADMIN_DATABASE_URL")
+
+    # Password the migrations give openscientist_admin. Only Alembic reads it.
+    postgres_admin_password: SecretStr | None = Field(default=None, alias="POSTGRES_ADMIN_PASSWORD")
 
     # Debug settings
     sql_echo: bool = Field(default=False, alias="SQL_ECHO")
