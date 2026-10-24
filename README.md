@@ -111,7 +111,7 @@ openscientist/
 │   ├── knowledge_state.py # JSON-based state storage
 │   ├── code_executor.py   # Sandboxed Python execution
 │   └── literature.py      # PubMed search
-├── CLAUDE.md              # Development guide and system prompt
+├── AGENTS.md              # Development guide for coding agents
 ├── jobs/                  # Job results (created at runtime)
 ├── Dockerfile             # Docker image definition
 ├── docker-compose.yml     # Container orchestration
