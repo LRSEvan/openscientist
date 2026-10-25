@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -306,24 +307,25 @@ async def test_the_webs_late_failure_does_not_overwrite_a_completed_job(
     assert await _status(test_engine, job) == "completed"
 
 
-async def test_a_status_write_that_cannot_reach_the_database_is_not_applied(
+async def test_a_status_write_that_cannot_reach_the_database_raises(
     make_job: MakeJob, tmp_path: Path
 ) -> None:
-    """A database failure is reported as not applied, so the owner is not
-    told about a move that never happened."""
+    """A database failure reaches the caller, and the owner is not told about a
+    move that never happened."""
     manager = _manager(tmp_path)
     job = await make_job(JobStatus.RUNNING)
     with (
         patch("openscientist.job_manager._run_async", side_effect=RuntimeError("database down")),
         patch.object(manager, "_send_status_notification") as notify,
+        pytest.raises(RuntimeError, match="database down"),
     ):
-        applied = manager._update_job_status(
+        manager._update_job_status(
             str(job),
             JobStatus.FAILED,
             allowed_from=JobManager.STARTED_STATUSES,
             error_message="boom",
+            retry=False,
         )
-    assert applied is False
     notify.assert_not_called()
 
 
@@ -380,6 +382,10 @@ async def test_the_web_startup_recovers_the_jobs_the_previous_process_lost(
         web_app._state.job_manager = None
         with patch.object(JobManager, "_run_job"):
             web_app._initialize_job_manager_runtime(tmp_path)
+            # Recovery runs in the background, so startup does not wait on it.
+            for thread in threading.enumerate():
+                if thread.name == "job-recovery":
+                    thread.join(timeout=30)
         manager = web_app._state.job_manager
         assert manager is not None
         assert await _status(test_engine, pending) == "queued"

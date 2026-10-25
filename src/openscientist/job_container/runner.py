@@ -28,6 +28,7 @@ from docker.models.containers import Container
 
 import docker
 from docker import errors as docker_errors
+from openscientist.database.retry import CONTAINER_DB_RETRY_SECONDS
 from openscientist.exec_broker_client import (
     EXEC_BROKER_URL_ENV,
     EXEC_TOKEN_ENV,
@@ -89,6 +90,8 @@ class JobContainerRunner:
             "JOB_DIR": job_mount,
             # The container's own login, never the web's.
             "DATABASE_URL": database_url,
+            # A short database outage should not end the job.
+            "OPENSCIENTIST_DB_CONNECT_RETRY_SECONDS": str(CONTAINER_DB_RETRY_SECONDS),
             "OPENSCIENTIST_SECRET_KEY": derive_job_secret(settings.secret_key, job_id),
             # Per-job execution credential the broker verifies, plus the broker URL.
             EXEC_TOKEN_ENV: make_exec_placeholder(settings.secret_key, job_id),

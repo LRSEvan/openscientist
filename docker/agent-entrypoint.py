@@ -56,6 +56,7 @@ async def main() -> int:
     logger.info("Starting agent for job %s in %s (mode=%s)", job_id, job_dir, run_mode)
 
     try:
+        from openscientist.job.agent_error import write_agent_error
         from openscientist.orchestrator.discovery import (
             regenerate_report_async,
             run_discovery_async,
@@ -76,10 +77,16 @@ async def main() -> int:
             result.get("iterations", 0),
             result.get("findings", 0),
         )
-        return 0 if result.get("status") == "completed" else 1
+        if result.get("status") == "completed":
+            return 0
+        # The web sees only the exit code, so leave it the reason.
+        if result.get("error"):
+            write_agent_error(job_dir, str(result["error"]))
+        return 1
 
     except Exception as e:
         logger.error("Job %s failed: %s", job_id, e, exc_info=True)
+        write_agent_error(job_dir, f"{type(e).__name__}: {e}")
         return 1
 
 

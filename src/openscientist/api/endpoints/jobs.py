@@ -576,13 +576,9 @@ async def cancel_job(
     job_manager = _get_job_manager()
     try:
         job_manager.cancel_job(str(job.id))
-        logger.info("Cancelled job %s for user %s", job.id, user.email)
-    except Exception as e:
-        logger.exception("Failed to cancel job %s", job.id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to cancel job",
-        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    logger.info("Cancelled job %s for user %s", job.id, user.email)
 
 
 @router.get("/{job_id}/report")

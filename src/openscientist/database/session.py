@@ -23,6 +23,7 @@ from sqlalchemy.pool import NullPool
 from openscientist.settings import get_settings
 
 from .engine import get_admin_engine, get_engine
+from .retry import guard_connect
 from .rls import set_current_user, use_app_role
 
 logger = logging.getLogger(__name__)
@@ -80,10 +81,13 @@ def _create_fresh_session_factory(
 
     # Create a fresh engine with NullPool - no caching since each
     # asyncio.run() creates a new event loop and connections are loop-bound
-    thread_engine = create_async_engine(
-        database_url or settings.database.effective_database_url,
-        poolclass=NullPool,  # No pooling - each connection is fresh
-        echo=settings.database.sql_echo,
+    thread_engine = guard_connect(
+        create_async_engine(
+            database_url or settings.database.effective_database_url,
+            poolclass=NullPool,  # No pooling - each connection is fresh
+            echo=settings.database.sql_echo,
+        ),
+        retry_for=settings.database.connect_retry_seconds,
     )
     return async_sessionmaker(
         thread_engine,

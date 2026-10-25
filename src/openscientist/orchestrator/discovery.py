@@ -853,6 +853,7 @@ async def regenerate_report_async(job_dir: Path) -> dict[str, Any]:
             "status": "failed",
             "iterations": iterations,
             "findings": findings,
+            "error": str(e),
         }
     finally:
         await _finalize_executor(executor, job_id)

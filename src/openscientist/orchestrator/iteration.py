@@ -18,6 +18,7 @@ from uuid import UUID
 from sqlalchemy import func, select, update
 
 from openscientist.database.models.job import Job as JobModel
+from openscientist.database.retry import CONTAINER_DB_RETRY_SECONDS, retry_async
 from openscientist.database.session import AsyncSessionLocal, SessionOpener
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.prompts.common import namespace_tool_mentions
@@ -388,16 +389,19 @@ def increment_ks_iteration(job_id: str) -> None:
 
 
 async def _get_job_status(job_id: str) -> str | None:
-    """Fetch current job status from the database."""
-    try:
+    """Fetch current job status from the database, retrying a lost connection
+    for :data:`CONTAINER_DB_RETRY_SECONDS`."""
+
+    async def read() -> str | None:
         async with AsyncSessionLocal(thread_safe=True) as session:
             result = await session.execute(
                 select(JobModel.status).where(JobModel.id == UUID(job_id))
             )
             return result.scalar_one_or_none()
-    except Exception as e:
-        logger.warning("Failed to fetch status for job %s: %s", job_id, e)
-        return None
+
+    return await retry_async(
+        read, within=CONTAINER_DB_RETRY_SECONDS, what=f"reading the status of job {job_id}"
+    )
 
 
 def _parse_job_uuid(job_id: str) -> UUID | None:
@@ -415,6 +419,7 @@ async def _persist_job_status(
     error_message: str | None,
     allowed_from: Collection[str],
     open_session: SessionOpener,
+    retry_for: float,
 ) -> bool:
     values: dict[str, object] = {"status": status}
     if error_message:
@@ -427,7 +432,8 @@ async def _persist_job_status(
         .values(**values)
         .returning(JobModel.id)
     )
-    try:
+
+    async def write() -> bool:
         async with open_session() as session:
             if (await session.execute(stmt)).scalar_one_or_none() is None:
                 logger.info(
@@ -436,9 +442,8 @@ async def _persist_job_status(
                 return False
             await session.commit()
             return True
-    except Exception as e:
-        logger.warning("Failed to update status for job %s: %s", job_id, e)
-        return False
+
+    return await retry_async(write, within=retry_for, what=f"moving job {job_id} to {status}")
 
 
 async def update_job_status(
@@ -448,9 +453,13 @@ async def update_job_status(
     *,
     allowed_from: Collection[str],
     open_session: SessionOpener | None = None,
+    retry_for: float = CONTAINER_DB_RETRY_SECONDS,
 ) -> bool:
     """Move the job to ``status`` if it is in one of ``allowed_from``, in
-    ``open_session``, else the process's own login. Returns whether it applied."""
+    ``open_session``, else the process's own login. Returns whether it applied.
+
+    A lost connection is retried for ``retry_for`` seconds and then raised, as
+    is any other database error."""
     job_id = job_dir.name
 
     job_uuid = _parse_job_uuid(job_id)
@@ -464,6 +473,7 @@ async def update_job_status(
         error_message,
         allowed_from,
         open_session or partial(AsyncSessionLocal, thread_safe=True),
+        retry_for,
     )
 
 

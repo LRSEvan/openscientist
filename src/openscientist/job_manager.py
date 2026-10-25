@@ -10,7 +10,7 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import AsyncIterator, Collection, Coroutine
+from collections.abc import AsyncIterator, Collection, Coroutine, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,8 +24,15 @@ from openscientist.container_manager import get_container_manager
 from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.models.job_share import JobShare
+from openscientist.database.retry import (
+    BACKGROUND_BACKOFF_CAP_SECONDS,
+    backoff,
+    is_connection_error,
+    retry_sync,
+)
 from openscientist.database.session import thread_safe_admin_session, thread_safe_user_session
 from openscientist.exceptions import ProviderError
+from openscientist.job.agent_error import take_agent_error
 from openscientist.job.types import JobInfo, JobStatus, JobStatusUpdateResult
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.ntfy import notify_job_status_change
@@ -377,6 +384,10 @@ class JobManager:
         self.scheduler_window = scheduler_window
         self._running_jobs: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        # A pick that lost the database tries again on its own, since nothing
+        # else may trigger one on an idle server.
+        self._repick: threading.Timer | None = None
+        self._repick_delays: Iterator[float] | None = None
 
         logger.info(
             "JobManager initialized: %s, max_concurrent=%d",
@@ -386,38 +397,45 @@ class JobManager:
 
     def recover_after_restart(self) -> None:
         """End the jobs whose container the previous web process lost, and start
-        the jobs still waiting for a slot."""
-        lost_container = self.STARTED_STATUSES | {JobStatus.GENERATING_REPORT}
-        for job_info in self._list_operational_jobs():
-            job_id = job_info.job_id
-            if job_info.status == JobStatus.PENDING:
-                self._update_job_status(
-                    job_id, JobStatus.QUEUED, allowed_from={JobStatus.PENDING}, notify=False
-                )
-                continue
-            if job_info.status not in lost_container:
-                continue
-            logger.warning(
-                "Cancelling job %s, whose container the restart lost (was %s)",
-                job_id,
-                job_info.status.value,
-            )
-            self._update_job_status(
-                job_id,
-                JobStatus.CANCELLED,
-                allowed_from=lost_container,
-                cancellation_reason="Server restarted while job was running",
-                notify=False,
-            )
+        the jobs still waiting for a slot. Waits out a lost database connection."""
+        jobs = retry_sync(self._list_operational_jobs, what="listing jobs to recover")
+        for job_info in jobs:
             try:
-                from openscientist.job_container import JobContainerRunner
-
-                JobContainerRunner().cleanup(job_id)
-            except Exception as e:
-                logger.warning("Failed to cleanup container for stale job %s: %s", job_id, e)
-
+                self._recover_job(job_info)
+            except Exception:
+                logger.exception("Could not recover job %s", job_info.job_id)
         while self._start_next_queued_job():
             pass
+
+    def _recover_job(self, job_info: JobInfo) -> None:
+        job_id = job_info.job_id
+        lost_container = self.STARTED_STATUSES | {JobStatus.GENERATING_REPORT}
+        if job_info.status == JobStatus.PENDING:
+            self._update_job_status(
+                job_id, JobStatus.QUEUED, allowed_from={JobStatus.PENDING}, notify=False, retry=True
+            )
+            return
+        if job_info.status not in lost_container:
+            return
+        logger.warning(
+            "Cancelling job %s, whose container the restart lost (was %s)",
+            job_id,
+            job_info.status.value,
+        )
+        self._update_job_status(
+            job_id,
+            JobStatus.CANCELLED,
+            allowed_from=lost_container,
+            cancellation_reason="Server restarted while job was running",
+            notify=False,
+            retry=True,
+        )
+        try:
+            from openscientist.job_container import JobContainerRunner
+
+            JobContainerRunner().cleanup(job_id)
+        except Exception as e:
+            logger.warning("Failed to cleanup container for stale job %s: %s", job_id, e)
 
     def _ensure_job_not_exists(self, job_id: str) -> None:
         if self.get_job(job_id) is not None:
@@ -632,7 +650,7 @@ class JobManager:
             # Check concurrent limit
             if self._get_active_job_count() >= self.max_concurrent:
                 if not self._update_job_status(
-                    job_id, JobStatus.QUEUED, allowed_from=self.WAITING_STATUSES
+                    job_id, JobStatus.QUEUED, allowed_from=self.WAITING_STATUSES, retry=False
                 ):
                     raise ValueError(f"Job {job_id} cannot be started: it stopped waiting")
                 logger.info("Job %s queued (max concurrent reached)", job_id)
@@ -700,10 +718,13 @@ class JobManager:
         launched = False
 
         try:
-            if not self._update_job_status(job_id, JobStatus.RUNNING, allowed_from=running_from):
+            if not self._update_job_status(
+                job_id, JobStatus.RUNNING, allowed_from=running_from, retry=True
+            ):
                 logger.info("Job %s stopped waiting to start, so it is not launched", job_id)
                 return
             launched = True
+            take_agent_error(job_dir)  # an earlier run's, which this run must not report
             runner.launch(job_id, job_dir, run_mode=run_mode)
             logger.info("Agent container launched for job %s (mode=%s)", job_id, run_mode)
 
@@ -731,6 +752,8 @@ class JobManager:
                         )
                         return
                 except Exception as poll_err:
+                    if not is_connection_error(poll_err):
+                        raise
                     logger.warning("DB poll failed for job %s: %s", job_id, poll_err)
 
                 # If the container has exited but the DB still shows running,
@@ -745,11 +768,14 @@ class JobManager:
                         job_id,
                         exit_code,
                     )
+                    exited = f"Agent container exited with code {exit_code}"
+                    agent_error = take_agent_error(job_dir)
                     self._update_job_status(
                         job_id,
                         JobStatus.FAILED,
                         allowed_from=self.STARTED_STATUSES,
-                        error_message=f"Agent container exited with code {exit_code}",
+                        error_message=f"{exited}: {agent_error}" if agent_error else exited,
+                        retry=True,
                     )
                     return
 
@@ -760,6 +786,7 @@ class JobManager:
                 JobStatus.FAILED,
                 allowed_from=self.STARTED_STATUSES,
                 error_message=f"Job timed out after {timeout_hours:.1f} hours",
+                retry=True,
             )
 
         except Exception as e:
@@ -767,7 +794,11 @@ class JobManager:
                 "Container job %s failed [%s]: %s", job_id, get_version_string(), e, exc_info=True
             )
             self._update_job_status(
-                job_id, JobStatus.FAILED, allowed_from=self.ACTIVE_STATUSES, error_message=str(e)
+                job_id,
+                JobStatus.FAILED,
+                allowed_from=self.ACTIVE_STATUSES,
+                error_message=str(e),
+                retry=True,
             )
 
         finally:
@@ -792,8 +823,12 @@ class JobManager:
                     _db_next_queued_job(self.scheduler_window, set(self._running_jobs))
                 )
             except Exception as e:
-                logger.warning("Failed to pick the next queued job: %s", e)
+                if is_connection_error(e):
+                    self._schedule_repick(e)
+                else:
+                    logger.exception("Failed to pick the next queued job")
                 return False
+            self._repick_delays = None
             if job_id is None:
                 return False
 
@@ -802,6 +837,29 @@ class JobManager:
             self._running_jobs[job_id] = thread
             thread.start()
             return True
+
+    def _schedule_repick(self, error: Exception) -> None:
+        """Pick again after the next backoff delay, unless a retry is already pending.
+        Called with ``self._lock`` held."""
+        if self._repick is not None:
+            return
+        if self._repick_delays is None:
+            self._repick_delays = backoff(cap=BACKGROUND_BACKOFF_CAP_SECONDS)
+        delay = next(self._repick_delays)
+        logger.error(
+            "Database unreachable while picking the next queued job, picking again in %.0f s: %s",
+            delay,
+            error,
+        )
+        self._repick = threading.Timer(delay, self._repick_now)
+        self._repick.daemon = True
+        self._repick.start()
+
+    def _repick_now(self) -> None:
+        with self._lock:
+            self._repick = None
+        while self._start_next_queued_job():
+            pass
 
     def cancel_job(self, job_id: str) -> None:
         """
@@ -821,6 +879,7 @@ class JobManager:
             JobStatus.CANCELLED,
             allowed_from=self.ACTIVE_STATUSES,
             cancellation_reason="Cancelled by user",
+            retry=False,
         ):
             raise ValueError(f"Job {job_id} has already ended")
 
@@ -1009,12 +1068,8 @@ class JobManager:
 
         Jobs are sourced exclusively from the database.
         """
-        try:
-            db_jobs = _run_async(_db_list_jobs(status=status, limit=limit))
-            return [self._db_model_to_job_info(job) for job in db_jobs]
-        except Exception as e:
-            logger.warning("Failed to list jobs from database for operational scan: %s", e)
-            return []
+        db_jobs = _run_async(_db_list_jobs(status=status, limit=limit))
+        return [self._db_model_to_job_info(job) for job in db_jobs]
 
     def _db_model_to_job_info(self, job_model: JobModel) -> JobInfo:
         """Convert a database JobModel to JobInfo with real-time progress from KS."""
@@ -1033,15 +1088,8 @@ class JobManager:
         """
         Load job info from database.
         """
-        try:
-            job_model = _run_async(_db_get_job(job_id))
-            if job_model:
-                return self._db_model_to_job_info(job_model)
-        except Exception as e:
-            logger.warning("Failed to load job %s from database: %s", job_id, e)
-            return None
-
-        return None
+        job_model = _run_async(_db_get_job(job_id))
+        return None if job_model is None else self._db_model_to_job_info(job_model)
 
     def _update_job_status(
         self,
@@ -1052,11 +1100,16 @@ class JobManager:
         error_message: str | None = None,
         cancellation_reason: str | None = None,
         notify: bool = True,
+        retry: bool,
     ) -> bool:
         """Move the job to ``status`` if it is in one of ``allowed_from``, and tell
-        the owner when ``notify`` is set. Returns whether the write applied."""
-        try:
-            target = _run_async(
+        the owner when ``notify`` is set. Returns whether the write applied.
+
+        With ``retry``, a lost database connection is retried until the write
+        goes through. Any other database error is raised."""
+
+        def write() -> JobStatusUpdateResult:
+            return _run_async(
                 _db_update_job_status(
                     job_id,
                     status,
@@ -1065,9 +1118,10 @@ class JobManager:
                     cancellation_reason=cancellation_reason,
                 )
             )
-        except Exception as e:
-            logger.error("Failed to update job status in database: %s", e)
-            return False
+
+        target = (
+            retry_sync(write, what=f"moving job {job_id} to {status.value}") if retry else write()
+        )
         if not target.applied:
             return False
         if notify:

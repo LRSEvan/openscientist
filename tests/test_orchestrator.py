@@ -547,7 +547,7 @@ class TestGuardedStatusWrites:
         assert await update_job_status(job_dir, "running", allowed_from=("running",)) is False
 
     @pytest.mark.asyncio
-    async def test_update_is_not_applied_when_the_database_refuses(self, tmp_path):
+    async def test_a_database_error_reaches_the_caller(self, tmp_path):
         from openscientist.orchestrator.iteration import update_job_status
 
         job_dir = tmp_path / str(uuid4())
@@ -556,12 +556,10 @@ class TestGuardedStatusWrites:
         def _broken_session():
             raise RuntimeError("connection refused")
 
-        assert (
+        with pytest.raises(RuntimeError, match="connection refused"):
             await update_job_status(
                 job_dir, "running", allowed_from=("running",), open_session=_broken_session
             )
-            is False
-        )
 
 
 # ─── increment_ks_iteration ──────────────────────────────────────────

@@ -9,6 +9,7 @@ import asyncio
 import importlib
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import timedelta
@@ -187,8 +188,10 @@ def _register_api_routes(host_app: FastAPI) -> None:
     """Register REST API routes with the host FastAPI app."""
     try:
         from openscientist.api import api_router
+        from openscientist.api.errors import register_database_error_handlers
 
         host_app.include_router(api_router)
+        register_database_error_handlers(host_app)
         logger.info("REST API routes registered at /api/v1")
     except Exception as e:
         logger.warning("Failed to register API routes: %s", e)
@@ -479,7 +482,10 @@ def _initialize_job_manager_runtime(jobs_dir: Path) -> None:
     if _state.job_manager is not None:
         return
     _state.job_manager = _new_job_manager(jobs_dir)
-    _state.job_manager.recover_after_restart()
+    # Recovery waits out a database that is still down, so startup does not.
+    threading.Thread(
+        target=_state.job_manager.recover_after_restart, name="job-recovery", daemon=True
+    ).start()
 
 
 def _register_nicegui_static_files() -> None:

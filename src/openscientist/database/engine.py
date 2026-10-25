@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from openscientist.database.retry import guard_connect
 from openscientist.settings import get_settings
 
 # Load environment variables from .env file
@@ -45,16 +46,19 @@ def get_engine() -> AsyncEngine:
         settings = get_settings()
         database_url = settings.database.effective_database_url
 
-        _engine = create_async_engine(
-            database_url,
-            # Connection pool settings
-            pool_size=20,  # Maximum number of permanent connections
-            max_overflow=10,  # Maximum number of temporary overflow connections
-            pool_timeout=30,  # Seconds to wait before giving up on getting a connection
-            pool_recycle=3600,  # Recycle connections after 1 hour
-            pool_pre_ping=True,  # Verify connections before using them
-            # Echo SQL queries in development
-            echo=settings.database.sql_echo,
+        _engine = guard_connect(
+            create_async_engine(
+                database_url,
+                # Connection pool settings
+                pool_size=20,  # Maximum number of permanent connections
+                max_overflow=10,  # Maximum number of temporary overflow connections
+                pool_timeout=30,  # Seconds to wait before giving up on getting a connection
+                pool_recycle=3600,  # Recycle connections after 1 hour
+                pool_pre_ping=True,  # Verify connections before using them
+                # Echo SQL queries in development
+                echo=settings.database.sql_echo,
+            ),
+            retry_for=settings.database.connect_retry_seconds,
         )
 
     return _engine
@@ -86,12 +90,15 @@ def get_admin_engine() -> AsyncEngine:
         settings = get_settings()
         database_url = settings.database.required_admin_database_url()
 
-        _admin_engine = create_async_engine(
-            database_url,
-            # Use NullPool to avoid event loop conflicts in web frameworks
-            # Each connection is fresh, avoiding pool-related async issues
-            poolclass=NullPool,
-            echo=settings.database.sql_echo,
+        _admin_engine = guard_connect(
+            create_async_engine(
+                database_url,
+                # Use NullPool to avoid event loop conflicts in web frameworks
+                # Each connection is fresh, avoiding pool-related async issues
+                poolclass=NullPool,
+                echo=settings.database.sql_echo,
+            ),
+            retry_for=settings.database.connect_retry_seconds,
         )
 
     return _admin_engine

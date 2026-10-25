@@ -600,7 +600,11 @@ def _submit_feedback_and_continue(
     try:
         resumed = run_sync(
             update_job_status(
-                job_dir, "running", allowed_from=("awaiting_feedback",), open_session=as_user
+                job_dir,
+                "running",
+                allowed_from=("awaiting_feedback",),
+                open_session=as_user,
+                retry_for=0,
             )
         )
     except Exception:

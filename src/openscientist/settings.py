@@ -327,6 +327,12 @@ class DatabaseSettings(BaseSettings):
     # Debug settings
     sql_echo: bool = Field(default=False, alias="SQL_ECHO")
 
+    # Seconds each connect waits for an unreachable database. The job runner
+    # sets it for agent containers, and the web fails fast.
+    connect_retry_seconds: float = Field(
+        default=0, ge=0, alias="OPENSCIENTIST_DB_CONNECT_RETRY_SECONDS"
+    )
+
     @property
     def effective_database_url(self) -> str:
         """Get the database URL."""
