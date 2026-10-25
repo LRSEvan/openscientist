@@ -175,6 +175,18 @@ class Job(UUIDv7Mixin, Base):
         comment="Timestamp when agent_status was last updated",
     )
 
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the job last took a slot, for the balancing scheduler",
+    )
+
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the job last ended, for the balancing scheduler",
+    )
+
     error_message: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,

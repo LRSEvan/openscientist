@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.session import AsyncSessionLocal, SessionOpener
@@ -25,6 +25,9 @@ from openscientist.prompts.common import namespace_tool_mentions
 logger = logging.getLogger(__name__)
 
 FEEDBACK_TIMEOUT_SECONDS = 15 * 60  # 15 minutes
+
+#: Statuses after which a job holds no slot, so the scheduler stops counting it.
+_ENDED_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 # Budgeting the report prompt against the model's context window. We reserve
 # tokens for the system prompt, tool definitions, the model's own output, and
@@ -413,9 +416,11 @@ async def _persist_job_status(
     allowed_from: Collection[str],
     open_session: SessionOpener,
 ) -> bool:
-    values = {"status": status}
+    values: dict[str, object] = {"status": status}
     if error_message:
         values["error_message"] = error_message
+    if status in _ENDED_STATUSES:
+        values["ended_at"] = func.now()
     stmt = (
         update(JobModel)
         .where(JobModel.id == job_uuid, JobModel.status.in_(list(allowed_from)))

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openscientist.container_manager import get_container_manager
@@ -202,11 +202,17 @@ async def _db_update_job_status(
         JobStatusUpdateResult with ``applied`` and the owner's ntfy settings.
     """
     result = JobStatusUpdateResult()
-    values: dict[str, str] = {"status": status.value}
+    values: dict[str, object] = {"status": status.value}
     if error_message:
         values["error_message"] = error_message
     if cancellation_reason:
         values["cancellation_reason"] = cancellation_reason
+    # Only the worker moves a job to running, so this is when it takes a slot.
+    if status == JobStatus.RUNNING:
+        values["started_at"] = func.now()
+        values["ended_at"] = None
+    elif status in _ENDED_STATUSES:
+        values["ended_at"] = func.now()
     stmt = (
         update(JobModel)
         .where(
@@ -252,6 +258,37 @@ async def _db_get_notification_target(job_id: str) -> JobStatusUpdateResult:
         if job:
             await _fill_notification_target(session, job, result)
     return result
+
+
+#: Statuses after which a job holds no slot.
+_ENDED_STATUSES = frozenset({JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED})
+
+
+async def _db_next_queued_job(window: timedelta, exclude: Collection[str]) -> str | None:
+    """The queued job to start next: its owner's jobs held a slot for the fewest
+    seconds in ``window``, running ones up to now, and among equals the oldest
+    job goes first. Jobs in ``exclude`` already have a thread (thread-safe)."""
+    stmt = text(
+        """
+        WITH since AS (SELECT now() - CAST(:window AS interval) AS t),
+        usage AS (
+            SELECT owner_id,
+                   sum(extract(epoch FROM coalesce(ended_at, now()) - greatest(started_at, t)))
+                       AS seconds
+            FROM jobs, since
+            WHERE started_at IS NOT NULL AND coalesce(ended_at, now()) > t
+            GROUP BY owner_id
+        )
+        SELECT j.id FROM jobs j
+        LEFT JOIN usage u ON u.owner_id = j.owner_id
+        WHERE j.status = 'queued' AND NOT (j.id::text = ANY(CAST(:exclude AS text[])))
+        ORDER BY coalesce(u.seconds, 0), j.created_at
+        LIMIT 1
+        """
+    )
+    async with _job_session(None) as session:
+        job_id = await session.scalar(stmt, {"window": window, "exclude": list(exclude)})
+    return None if job_id is None else str(job_id)
 
 
 async def _db_list_jobs(
@@ -317,7 +354,12 @@ class JobManager:
     #: A job whose container has started.
     STARTED_STATUSES = frozenset({JobStatus.RUNNING, JobStatus.AWAITING_FEEDBACK})
 
-    def __init__(self, jobs_dir: Path = Path("jobs"), max_concurrent: int = 1):
+    def __init__(
+        self,
+        jobs_dir: Path = Path("jobs"),
+        max_concurrent: int = 1,
+        scheduler_window: timedelta = timedelta(hours=24),
+    ):
         """
         Initialize job manager. Building one changes no job: only the web's
         startup calls :meth:`recover_after_restart`.
@@ -325,11 +367,14 @@ class JobManager:
         Args:
             jobs_dir: Base directory for jobs
             max_concurrent: Maximum concurrent jobs
+            scheduler_window: How far back each owner's slot use counts when
+                choosing the next queued job
         """
         self.jobs_dir = Path(jobs_dir)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
 
         self.max_concurrent = max_concurrent
+        self.scheduler_window = scheduler_window
         self._running_jobs: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
 
@@ -733,7 +778,7 @@ class JobManager:
             self._start_next_queued_job()
 
     def _start_next_queued_job(self) -> bool:
-        """Start the oldest queued job that has no thread yet, if a slot is free.
+        """Start the queued job the balancing order picks, if a slot is free.
 
         Returns:
             Whether a job was started.
@@ -742,16 +787,13 @@ class JobManager:
             if self._get_active_job_count() >= self.max_concurrent:
                 return False
 
-            # Listed newest first, and the job that has waited longest goes first.
-            queued_jobs = self._list_operational_jobs(status=JobStatus.QUEUED)
-            job_id = next(
-                (
-                    job.job_id
-                    for job in reversed(queued_jobs)
-                    if job.job_id not in self._running_jobs
-                ),
-                None,
-            )
+            try:
+                job_id = _run_async(
+                    _db_next_queued_job(self.scheduler_window, set(self._running_jobs))
+                )
+            except Exception as e:
+                logger.warning("Failed to pick the next queued job: %s", e)
+                return False
             if job_id is None:
                 return False
 

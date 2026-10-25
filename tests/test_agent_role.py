@@ -355,3 +355,24 @@ async def test_container_code_runs_as_the_job_login(
     assert row.version_info == {"agent_harness": "omp"}
     assert row.agent_status == "Working"
     assert await _owners_count(test_engine, "cost_records", jobs.own) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_job_login_records_when_its_job_ends(
+    jobs: _Jobs, test_engine: AsyncEngine, container_database: object, tmp_path: Path
+) -> None:
+    """The scheduler weighs owners by slot-hours, so the container's final write
+    must also record the end of the run."""
+    from openscientist.orchestrator.iteration import update_job_status
+
+    async with test_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE jobs SET status = 'running', started_at = now() WHERE id = :id"),
+            {"id": jobs.own},
+        )
+    assert await update_job_status(tmp_path / str(jobs.own), "completed", allowed_from=("running",))
+    async with test_engine.connect() as conn:
+        ended = await conn.scalar(
+            text("SELECT ended_at FROM jobs WHERE id = :id"), {"id": jobs.own}
+        )
+    assert ended is not None

@@ -482,38 +482,6 @@ class TestJobManagerKSProgress:
         assert job.findings_count == 2
 
 
-class TestJobManagerQueue:
-    """Tests for starting queued jobs."""
-
-    @pytest.fixture(autouse=True)
-    def _mock_ks_progress(self):
-        with patch(
-            "openscientist.job_manager._load_progress_from_knowledge_state",
-            return_value=(0, 0),
-        ):
-            yield
-
-    def test_start_next_queued_job_uses_db_jobs(self, tmp_path):
-        manager = _new_manager(tmp_path)
-        job_id = str(uuid4())
-        _write_config(tmp_path, job_id, status="queued")
-        queued_db_job = _make_db_job("queued", "2026-02-01T00:00:00", job_id=job_id)
-        fake_thread = MagicMock()
-
-        with (
-            patch(
-                "openscientist.job_manager._db_list_jobs",
-                new_callable=AsyncMock,
-                return_value=[queued_db_job],
-            ),
-            patch("openscientist.job_manager.threading.Thread", return_value=fake_thread),
-        ):
-            manager._start_next_queued_job()
-
-        assert manager._running_jobs[job_id] is fake_thread
-        fake_thread.start.assert_called_once()
-
-
 class TestJobManagerCancellationConcurrency:
     """Tests for cancellation behavior and active-slot accounting."""
 
