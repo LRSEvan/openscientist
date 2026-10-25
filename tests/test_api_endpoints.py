@@ -14,10 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openscientist.api.auth import hash_secret
-from openscientist.database.models import APIKey, Job, User
+from openscientist.database.models import Administrator, APIKey, Job, User
+from openscientist.database.rls import use_app_role
 from tests.helpers import enable_rls
 
 
@@ -132,7 +134,8 @@ async def completed_job_db(
 
 
 def _build_authenticated_app(db_session: AsyncSession, user: User):
-    """Create an app with authenticated user + RLS-aware session overrides."""
+    """Create an app with the authenticated user and a session that runs as
+    openscientist_app, as get_session does."""
     from fastapi import FastAPI
 
     from openscientist.api.auth import get_current_user_from_api_key
@@ -143,6 +146,7 @@ def _build_authenticated_app(db_session: AsyncSession, user: User):
     app = FastAPI()
 
     async def override_get_session():
+        await use_app_role(db_session)
         await set_current_user(db_session, user.id)
         yield db_session
 
@@ -905,6 +909,7 @@ class TestJobEndpoints:
         app = FastAPI()
 
         async def override_get_session():
+            await use_app_role(db_session)
             await set_current_user(db_session, test_user_db.id)
             yield db_session
 
@@ -988,6 +993,7 @@ class TestJobEndpoints:
         app = FastAPI()
 
         async def override_get_session():
+            await use_app_role(db_session)
             await set_current_user(db_session, test_user_db.id)
             yield db_session
 
@@ -1084,6 +1090,7 @@ class TestJobEndpoints:
         app = FastAPI()
 
         async def override_get_session():
+            await use_app_role(db_session)
             await set_current_user(db_session, test_user_db.id)
             yield db_session
 
@@ -1200,6 +1207,7 @@ class TestJobEndpoints:
         app = FastAPI()
 
         async def override_get_session():
+            await use_app_role(db_session)
             yield db_session
 
         unapproved_user = MagicMock(spec=User)
@@ -1237,6 +1245,65 @@ class TestJobEndpoints:
         assert response.status_code == 403
         assert "pending administrator approval" in response.json()["detail"]
         mock_get_job_manager.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("approved", "admin", "allowed"),
+        [(True, False, True), (False, True, True), (False, False, False)],
+    )
+    async def test_create_job_follows_the_database_start_rule(
+        self, test_engine: AsyncEngine, approved: bool, admin: bool, allowed: bool
+    ):
+        """POST /jobs admits whoever the jobs INSERT policy admits: approved users
+        and administrators, the approval flag alone deciding nothing for admins."""
+        from fastapi import FastAPI
+
+        from openscientist.api.auth import get_current_user_from_api_key
+        from openscientist.api.router import api_router as router
+        from openscientist.database.session import get_session
+
+        async with AsyncSession(test_engine, expire_on_commit=False) as setup:
+            user = User(email=f"starter-{uuid.uuid4().hex}@example.com", name="Starter")
+            user.is_approved = approved
+            setup.add(user)
+            await setup.flush()
+            if admin:
+                setup.add(Administrator(user_id=user.id))
+            await setup.commit()
+
+        async def app_session():
+            async with AsyncSession(test_engine, expire_on_commit=False) as session:
+                await use_app_role(session)
+                yield session
+
+        async def current_user():
+            return user
+
+        app = FastAPI()
+        app.dependency_overrides[get_session] = app_session
+        app.dependency_overrides[get_current_user_from_api_key] = current_user
+        app.include_router(router)
+        job_manager = MagicMock()
+        job_manager.create_job = MagicMock(side_effect=ValueError("stopped after the gate"))
+        try:
+            with patch(
+                "openscientist.api.endpoints.jobs._get_job_manager", return_value=job_manager
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    response = await client.post(
+                        "/api/v1/jobs",
+                        json={"research_question": "May I start?", "max_iterations": 1},
+                    )
+        finally:
+            async with AsyncSession(test_engine) as cleanup:
+                await cleanup.execute(delete(Administrator).where(Administrator.user_id == user.id))
+                await cleanup.execute(delete(User).where(User.id == user.id))
+                await cleanup.commit()
+
+        assert (response.status_code != 403) is allowed
+        assert job_manager.create_job.called is allowed
 
     @pytest.mark.asyncio
     async def test_filter_jobs_by_status(

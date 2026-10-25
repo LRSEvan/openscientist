@@ -24,7 +24,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
@@ -368,7 +368,8 @@ async def create_job(
     - JSON payload (`application/json`) without file uploads
     - Multipart form-data with optional repeated `data_files` file fields
     """
-    if not user.is_approved:
+    # The same rule the jobs INSERT policy enforces: approved users and administrators.
+    if not await session.scalar(text("SELECT user_can_start_jobs(:id)"), {"id": user.id}):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
