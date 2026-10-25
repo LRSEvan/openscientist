@@ -14,6 +14,7 @@ from functools import lru_cache
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 logger = logging.getLogger(__name__)
 _SIMPLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+$")
@@ -324,9 +325,6 @@ class DatabaseSettings(BaseSettings):
     # Agent containers load these settings without it.
     admin_database_url: str | None = Field(default=None, alias="ADMIN_DATABASE_URL")
 
-    # Password the migrations give openscientist_admin. Only Alembic reads it.
-    postgres_admin_password: SecretStr | None = Field(default=None, alias="POSTGRES_ADMIN_PASSWORD")
-
     # Debug settings
     sql_echo: bool = Field(default=False, alias="SQL_ECHO")
 
@@ -343,6 +341,37 @@ class DatabaseSettings(BaseSettings):
                 "login and do not fall back to DATABASE_URL."
             )
         return self.admin_database_url
+
+
+class MigrationSettings(BaseSettings):
+    """Logins of the migration step (Alembic and the PubMed loader). The web never
+    loads these, so it holds no owner password."""
+
+    model_config = SettingsConfigDict(
+        env_file=(".env", ".env.owner"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    owner_database_url: str | None = Field(default=None, alias="OWNER_DATABASE_URL")
+    # Wins over a password in OWNER_DATABASE_URL, so .env.owner is its only source.
+    postgres_owner_password: SecretStr | None = Field(default=None, alias="POSTGRES_OWNER_PASSWORD")
+    # Password the migrations give openscientist_admin.
+    postgres_admin_password: SecretStr | None = Field(default=None, alias="POSTGRES_ADMIN_PASSWORD")
+
+    def required_owner_database_url(self) -> str:
+        """The openscientist_owner URL, with POSTGRES_OWNER_PASSWORD filled in."""
+        if not self.owner_database_url:
+            raise ValueError(
+                "OWNER_DATABASE_URL is not set. Migrations and the PubMed loader log in "
+                "as openscientist_owner."
+            )
+        url = make_url(self.owner_database_url)
+        if self.postgres_owner_password is not None:
+            password = self.postgres_owner_password.get_secret_value()
+            if password:
+                url = url.set(password=password)
+        return url.render_as_string(hide_password=False)
 
 
 class AuthSettings(BaseSettings):

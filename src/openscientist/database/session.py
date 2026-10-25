@@ -190,8 +190,7 @@ async def get_admin_session() -> AsyncGenerator[AsyncSession, None]:
     Sessions from this factory bypass RLS policies by connecting with
     the openscientist_admin PostgreSQL role which has BYPASSRLS privilege.
 
-    The role is created by docker/postgres/init.sql in production or by
-    the test setup in tests/conftest.py.
+    The role is created by docker/postgres/bootstrap.sql, which conftest also runs.
 
     Use this only for:
     - Background schedulers (no user context available)

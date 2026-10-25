@@ -18,7 +18,7 @@ from sqlalchemy import Connection, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.helpers import ADMIN_TEST_PASSWORD
+from tests.db_logins import ADMIN_PASSWORD
 
 _MIGRATION = (
     Path(__file__).parent.parent
@@ -68,10 +68,10 @@ async def _login_as_admin(database_url: str, password: str) -> str:
 
 @pytest_asyncio.fixture
 async def restores_admin_password(test_engine: AsyncEngine) -> AsyncGenerator[None, None]:
-    """The test changes the admin password. Put back the one conftest set."""
+    """The test changes the admin password. Put back the one conftest bootstrapped."""
     yield
     async with test_engine.begin() as conn:
-        await conn.execute(text(f"ALTER ROLE openscientist_admin PASSWORD '{ADMIN_TEST_PASSWORD}'"))
+        await conn.execute(text(f"ALTER ROLE openscientist_admin PASSWORD '{ADMIN_PASSWORD}'"))
 
 
 @pytest.mark.asyncio

@@ -58,8 +58,11 @@ def test_main_reload_uses_factory_import_target(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr(web_app, "_settings_error", None)
     monkeypatch.setattr(
         "openscientist.settings.get_settings",
-        lambda: SimpleNamespace(dev=SimpleNamespace(dev_mode=True)),
+        lambda: SimpleNamespace(
+            dev=SimpleNamespace(dev_mode=True), database=SimpleNamespace(database_url="unused")
+        ),
     )
+    monkeypatch.setattr(web_app, "_refuse_unsafe_database_login", lambda _url: None)
 
     uvicorn_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
@@ -82,8 +85,11 @@ def test_main_non_reload_runs_with_created_app(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(web_app, "_settings_error", None)
     monkeypatch.setattr(
         "openscientist.settings.get_settings",
-        lambda: SimpleNamespace(dev=SimpleNamespace(dev_mode=False)),
+        lambda: SimpleNamespace(
+            dev=SimpleNamespace(dev_mode=False), database=SimpleNamespace(database_url="unused")
+        ),
     )
+    monkeypatch.setattr(web_app, "_refuse_unsafe_database_login", lambda _url: None)
 
     host_app = FastAPI()
     monkeypatch.setattr(web_app, "create_app", lambda jobs_dir=None: host_app)

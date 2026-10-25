@@ -5,6 +5,7 @@ Provides web UI for job submission, monitoring, and results viewing.
 """
 
 import argparse
+import asyncio
 import importlib
 import logging
 import os
@@ -18,8 +19,14 @@ from fastapi import FastAPI, Response
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from nicegui import app, ui
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from openscientist.database.login_guard import (
+    DATABASE_SECRETS,
+    database_login_problem,
+    leaked_database_secrets,
+)
 from openscientist.job_manager import JobManager
 from openscientist.security import register_scanner_block_middleware
 from openscientist.settings import get_settings
@@ -586,6 +593,25 @@ def create_app(jobs_dir: Path | None = None) -> FastAPI:
     return host_app
 
 
+def _refuse_unsafe_database_login(database_url: str) -> None:
+    """Exit when the web would hold more database rights than openscientist_web."""
+    problems = [
+        f"{name} reached the web's environment. Move it from .env to {DATABASE_SECRETS[name]}."
+        for name in leaked_database_secrets(os.environ)
+    ]
+    try:
+        problem = asyncio.run(database_login_problem(database_url))
+    except (OSError, SQLAlchemyError) as error:
+        logger.warning("Could not check the database login: %s", error)
+        problem = None
+    if problem is not None:
+        problems.append(problem)
+    for message in problems:
+        logger.error("Refusing to start: %s", message)
+    if problems:
+        raise SystemExit(1)
+
+
 def main(
     host: str = "0.0.0.0",
     port: int = 8080,
@@ -633,6 +659,7 @@ def main(
 
     from openscientist.settings import get_settings
 
+    _refuse_unsafe_database_login(get_settings().database.database_url)
     reload = get_settings().dev.dev_mode
     os.environ[JOBS_DIR_ENV] = str(jobs_dir)
 

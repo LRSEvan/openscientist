@@ -1,4 +1,5 @@
-"""Per-container database logins, against the real test database."""
+"""Per-container database logins, against the real test database, created and
+dropped by the web's own login as in production."""
 
 from __future__ import annotations
 
@@ -30,6 +31,11 @@ async def _connect(database_url: str) -> asyncpg.Connection:
         user=url.username,
         password=url.password,
     )
+
+
+@pytest.fixture(autouse=True)
+def _as_the_web_login(web_login: None) -> None:
+    pass
 
 
 @pytest_asyncio.fixture

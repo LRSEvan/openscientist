@@ -9,7 +9,6 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from pydantic import ValidationError
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
@@ -19,7 +18,7 @@ import openscientist.database.models as models
 
 # Import the Base class and all models so Alembic can detect them
 from openscientist.database.base import Base
-from openscientist.settings import DatabaseSettings
+from openscientist.settings import MigrationSettings
 
 # Alembic Config object provides access to alembic.ini values
 config = context.config
@@ -29,14 +28,8 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Set the SQLAlchemy URL from validated settings
-try:
-    database_url: str = DatabaseSettings().database_url
-except ValidationError as exc:
-    raise ValueError(
-        "DATABASE_URL environment variable is required for migrations. "
-        "Example: postgresql+asyncpg://user:pass@localhost:5432/openscientist"
-    ) from exc
+# Migrations run as the schema owner, never as the web login or the superuser
+database_url: str = MigrationSettings().required_owner_database_url()
 
 # Set the sqlalchemy.url in the Alembic config
 config.set_main_option("sqlalchemy.url", database_url)

@@ -13,7 +13,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-from openscientist.settings import DatabaseSettings
+from openscientist.settings import MigrationSettings
 
 revision: str = "admin_password_from_env"
 down_revision: str | None = "add_version_info"
@@ -22,7 +22,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    password = DatabaseSettings().postgres_admin_password
+    password = MigrationSettings().postgres_admin_password
     if password is None or not password.get_secret_value():
         raise RuntimeError(
             "POSTGRES_ADMIN_PASSWORD is not set. It becomes the openscientist_admin "

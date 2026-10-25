@@ -14,9 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from openscientist.providers.base import ClaudeCompatible, CodexCompatible, CostInfo
 
-#: Password conftest gives openscientist_admin, which ADMIN_DATABASE_URL logs in with.
-ADMIN_TEST_PASSWORD = "test-admin-password"
-
 
 class StubClaudeProvider(ClaudeCompatible):
     """Minimal concrete `ClaudeCompatible` for tests that need a provider

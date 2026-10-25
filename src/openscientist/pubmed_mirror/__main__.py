@@ -13,14 +13,12 @@ from pathlib import Path
 
 from openscientist.pubmed_mirror.download import download_baseline
 from openscientist.pubmed_mirror.ingest import ingest_files
-from openscientist.settings import DatabaseSettings, get_settings
+from openscientist.settings import MigrationSettings
 
 
-def loader_dsn(db: DatabaseSettings) -> str:
-    """Ingest drops and rebuilds the search index, which only its owner may do:
-    the DATABASE_URL migration role, not the DML-only admin role.
-    """
-    return db.effective_database_url
+def loader_dsn(settings: MigrationSettings) -> str:
+    """Ingest drops and rebuilds the search index, which only the table owner may do."""
+    return settings.required_owner_database_url()
 
 
 def main() -> None:
@@ -36,7 +34,7 @@ def main() -> None:
     total = asyncio.run(
         ingest_files(
             files,
-            dsn=loader_dsn(get_settings().database),
+            dsn=loader_dsn(MigrationSettings()),
             max_articles=args.max_articles,
         )
     )

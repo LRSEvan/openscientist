@@ -1,14 +1,12 @@
 """The web's system paths (worker threads, notifications) act without a user and
 must not depend on the web login's own rights: they run through the admin login.
 
-Each test points DATABASE_URL at a login with no privileges at all, as the web
-login will be once it stops being a superuser, so a path that still used it
-fails here.
+Each test logs in as the real web login, which reads no table by itself, so a
+path that still used it fails here.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from uuid import UUID, uuid4
@@ -16,11 +14,8 @@ from uuid import UUID, uuid4
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-import openscientist.database.engine as engine_module
-import openscientist.database.session as session_module
 from openscientist.database.models import Job, User
 from openscientist.database.session import thread_safe_admin_session
 from openscientist.job.types import JobStatus
@@ -34,41 +29,6 @@ from openscientist.job_manager import (
 )
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.ntfy import ensure_user_has_topic, get_user_ntfy_settings
-from openscientist.settings import get_settings
-
-_PASSWORD = "system-sessions-test-password"
-
-
-def _reset_database_state() -> None:
-    get_settings.cache_clear()
-    engine_module._engine = None
-    engine_module._admin_engine = None
-    session_module._session_factory = None
-    session_module._admin_session_factory = None
-
-
-@pytest_asyncio.fixture
-async def web_login_without_rights(
-    test_engine: AsyncEngine, test_database_url: str
-) -> AsyncGenerator[None, None]:
-    web_role = f"web_{uuid4().hex}"
-    async with test_engine.begin() as conn:
-        await conn.execute(text(f"CREATE ROLE {web_role} LOGIN PASSWORD '{_PASSWORD}'"))
-    saved = os.environ.get("DATABASE_URL")
-    os.environ["DATABASE_URL"] = (
-        make_url(test_database_url)
-        .set(username=web_role, password=_PASSWORD)
-        .render_as_string(hide_password=False)
-    )
-    _reset_database_state()
-    yield
-    if saved is None:
-        os.environ.pop("DATABASE_URL", None)
-    else:
-        os.environ["DATABASE_URL"] = saved
-    _reset_database_state()
-    async with test_engine.begin() as conn:
-        await conn.execute(text(f"DROP ROLE {web_role}"))
 
 
 @dataclass(frozen=True)
@@ -101,7 +61,7 @@ async def _status(test_engine: AsyncEngine, job_id: str) -> str | None:
 
 @pytest.mark.asyncio
 async def test_worker_paths_reach_a_users_job_without_the_web_login(
-    web_login_without_rights: None, owned_job: _OwnedJob, test_engine: AsyncEngine
+    web_login: None, owned_job: _OwnedJob, test_engine: AsyncEngine
 ) -> None:
     queued = [job.id for job in await _db_list_jobs(status=JobStatus.QUEUED)]
     assert UUID(owned_job.job_id) in queued
@@ -117,7 +77,7 @@ async def test_worker_paths_reach_a_users_job_without_the_web_login(
 
 @pytest.mark.asyncio
 async def test_a_job_is_deleted_without_a_user_or_the_web_login(
-    web_login_without_rights: None, owned_job: _OwnedJob, test_engine: AsyncEngine
+    web_login: None, owned_job: _OwnedJob, test_engine: AsyncEngine
 ) -> None:
     await _db_delete_job(owned_job.job_id)
     assert await _status(test_engine, owned_job.job_id) is None
@@ -125,7 +85,7 @@ async def test_a_job_is_deleted_without_a_user_or_the_web_login(
 
 @pytest.mark.asyncio
 async def test_notification_lookups_work_without_the_web_login(
-    web_login_without_rights: None, owned_job: _OwnedJob, test_engine: AsyncEngine
+    web_login: None, owned_job: _OwnedJob, test_engine: AsyncEngine
 ) -> None:
     assert await get_user_ntfy_settings(owned_job.owner_id) == (True, None)
     topic = await ensure_user_has_topic(owned_job.owner_id)
@@ -137,9 +97,7 @@ async def test_notification_lookups_work_without_the_web_login(
         assert stored.scalar_one() == topic
 
 
-def test_job_progress_is_read_without_the_web_login(
-    web_login_without_rights: None, owned_job: _OwnedJob
-) -> None:
+def test_job_progress_is_read_without_the_web_login(web_login: None, owned_job: _OwnedJob) -> None:
     """A failed progress read returns defaults, so a real finding count proves the read worked."""
     ks = KnowledgeState(owned_job.job_id, "System paths", 3)
     ks.add_finding("A finding", "evidence")

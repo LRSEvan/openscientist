@@ -1,6 +1,6 @@
 """Regression test: the ingest drops and rebuilds the search index, so it must
-run as the owning DATABASE_URL role, not the DML-only ADMIN_DATABASE_URL role
-that docker-compose configures.
+run as the schema owner, not the DML-only ADMIN_DATABASE_URL role that
+docker-compose configures.
 """
 
 from __future__ import annotations
@@ -11,14 +11,15 @@ from pathlib import Path
 import asyncpg  # type: ignore[import-untyped]
 import pytest
 import pytest_asyncio
+from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from openscientist.pubmed_mirror.__main__ import loader_dsn
 from openscientist.pubmed_mirror.ingest import ingest_files
-from openscientist.settings import DatabaseSettings
-from tests.helpers import ADMIN_TEST_PASSWORD
+from openscientist.settings import MigrationSettings
+from tests.db_logins import ADMIN_PASSWORD, OWNER_PASSWORD, login_url
 
 _SAMPLE_XML = """<?xml version="1.0"?>
 <PubmedArticleSet>
@@ -62,10 +63,7 @@ def baseline_file(tmp_path: Path) -> Path:
 @pytest.fixture
 def admin_login_url(test_engine: AsyncEngine, test_database_url: str) -> str:
     """LOGIN DSN for openscientist_admin, as docker-compose configures it."""
-    url = make_url(test_database_url).set(
-        username="openscientist_admin", password=ADMIN_TEST_PASSWORD
-    )
-    return url.render_as_string(hide_password=False)
+    return login_url(test_database_url, "openscientist_admin", ADMIN_PASSWORD)
 
 
 @pytest_asyncio.fixture
@@ -79,16 +77,16 @@ async def clean_pubmed_tables(test_engine: AsyncEngine) -> AsyncGenerator[None, 
 @pytest.mark.asyncio
 async def test_ingest_over_loader_dsn_rebuilds_search_index(
     test_database_url: str,
-    admin_login_url: str,
     baseline_file: Path,
     test_engine: AsyncEngine,
     clean_pubmed_tables: None,
 ) -> None:
-    """The DSN main() hands to ingest_files must drop and rebuild the search
-    index even when ADMIN_DATABASE_URL is the non-owner admin role."""
-    settings = DatabaseSettings(
-        DATABASE_URL=test_database_url,
-        ADMIN_DATABASE_URL=admin_login_url,
+    """The DSN main() hands to ingest_files is the owner login, with the password
+    filled in from POSTGRES_OWNER_PASSWORD as the migration step passes it."""
+    owner_url = make_url(test_database_url).set(username="openscientist_owner", password=None)
+    settings = MigrationSettings(
+        OWNER_DATABASE_URL=owner_url.render_as_string(hide_password=False),
+        POSTGRES_OWNER_PASSWORD=SecretStr(OWNER_PASSWORD),
     )
 
     total = await ingest_files([baseline_file], dsn=loader_dsn(settings))
