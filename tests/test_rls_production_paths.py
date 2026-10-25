@@ -98,7 +98,7 @@ async def test_get_session_query_filters_by_owner(test_engine):
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from openscientist.database.session import _set_app_role
+    from openscientist.database.rls import use_app_role
 
     session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -119,9 +119,9 @@ async def test_get_session_query_filters_by_owner(test_engine):
         alice_id = alice.id
         bob_id = bob.id
 
-    # Simulate get_session() path: SET ROLE openscientist_app + set_current_user
+    # Simulate get_session() path: openscientist_app + set_current_user
     async with session_factory() as user_session:
-        await _set_app_role(user_session)
+        await use_app_role(user_session)
         await set_current_user(user_session, alice_id)
 
         result = await user_session.execute(select(Job).order_by(Job.created_at.desc()))
@@ -132,7 +132,7 @@ async def test_get_session_query_filters_by_owner(test_engine):
 
     # Same path for Bob
     async with session_factory() as user_session:
-        await _set_app_role(user_session)
+        await use_app_role(user_session)
         await set_current_user(user_session, bob_id)
 
         result = await user_session.execute(select(Job).order_by(Job.created_at.desc()))
