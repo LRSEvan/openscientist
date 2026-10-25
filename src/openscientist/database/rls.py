@@ -10,19 +10,45 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import event, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session, SessionTransaction
+
+#: The role user sessions run as. The policies on user data are written for it.
+APP_ROLE = "openscientist_app"
+_ROLE_KEY = "openscientist.rls_app_role"
+_USER_KEY = "openscientist.rls_user_id"
+
+
+@event.listens_for(Session, "after_begin")
+def _apply_rls_to_transaction(
+    session: Session, _transaction: SessionTransaction, connection: Connection
+) -> None:
+    """Give every transaction the session's role and user. Both are transaction-local,
+    so a commit cannot shed them and a pooled connection never keeps them."""
+    if session.info.get(_ROLE_KEY):
+        connection.exec_driver_sql(f"SET LOCAL ROLE {APP_ROLE}")
+    if _USER_KEY in session.info:
+        connection.execute(
+            text("SELECT set_config('app.current_user_id', :user_id, true)"),
+            {"user_id": session.info[_USER_KEY]},
+        )
+
+
+async def use_app_role(session: AsyncSession) -> None:
+    """Run every transaction of ``session`` as ``openscientist_app``, the open one included."""
+    session.info[_ROLE_KEY] = True
+    if session.in_transaction():
+        await session.execute(text(f"SET LOCAL ROLE {APP_ROLE}"))
 
 
 async def set_current_user(session: AsyncSession, user_id: UUID | None) -> None:
     """
-    Set the current user ID in the PostgreSQL session for RLS policies.
+    Set the user that RLS policies see as ``app.current_user_id``.
 
-    This function sets the `app.current_user_id` session variable that RLS
-    policies use to determine row visibility and access control.
-
-    The setting is connection-local and persists across transactions within
-    the same connection/session.
+    The user applies to every transaction of the session, the open one included,
+    and to no other session that later gets the same pooled connection.
 
     Args:
         session: SQLAlchemy async session
@@ -34,14 +60,12 @@ async def set_current_user(session: AsyncSession, user_id: UUID | None) -> None:
         ...     # All queries in this session now respect RLS for this user
         ...     jobs = await session.execute(select(Job))
     """
-    if user_id is None:
-        # Clear the session variable (connection-local, persists across transactions)
-        await session.execute(text("SELECT set_config('app.current_user_id', NULL, false)"))
-    else:
-        # Set the session variable to the user ID (connection-local)
+    value = None if user_id is None else str(user_id)
+    session.info[_USER_KEY] = value
+    if session.in_transaction():
         await session.execute(
-            text("SELECT set_config('app.current_user_id', :user_id, false)"),
-            {"user_id": str(user_id)},
+            text("SELECT set_config('app.current_user_id', :user_id, true)"),
+            {"user_id": value},
         )
 
 

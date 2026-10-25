@@ -16,14 +16,14 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openscientist.container_manager import get_container_manager
 from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.models.job_share import JobShare
-from openscientist.database.rls import set_current_user
+from openscientist.database.rls import set_current_user, use_app_role
 from openscientist.database.session import AsyncSessionLocal
 from openscientist.exceptions import ProviderError
 from openscientist.job.types import JobInfo, JobStatus, JobStatusUpdateResult
@@ -63,7 +63,7 @@ async def _apply_rls_context(session: AsyncSession, user_id: UUID | None) -> Non
     """Apply user-scoped RLS context when a user id is provided."""
     if user_id is None:
         return
-    await session.execute(text("SET ROLE openscientist_app"))
+    await use_app_role(session)
     await set_current_user(session, user_id)
 
 

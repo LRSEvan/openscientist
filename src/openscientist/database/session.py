@@ -4,27 +4,25 @@ Database session management for OpenScientist.
 Provides async session factories and dependency injection for FastAPI/NiceGUI.
 
 Session Types:
-    - get_session(): Standard session with RLS enforced via SET ROLE openscientist_app
+    - get_session(): Standard session with RLS enforced as openscientist_app
     - get_admin_session(): Admin session that bypasses RLS via elevated role
-    - AsyncSessionLocal(): Low-level session factory (also enforces RLS when used
-      without thread_safe, or via SET ROLE in thread-safe mode)
+    - AsyncSessionLocal(): Low-level session factory, with no role or user of its own
 
-For the dual-engine pattern, get_session() connects as the main database user
-then immediately does SET ROLE openscientist_app to drop privileges. The openscientist_app
-role is a non-superuser NOLOGIN role that is subject to RLS policies.
+get_session() connects as the main database user, and every transaction it runs
+switches to openscientist_app, a non-superuser NOLOGIN role subject to RLS.
 """
 
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from openscientist.settings import get_settings
 
 from .engine import get_admin_engine, get_engine
+from .rls import use_app_role
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +104,8 @@ def async_session_local(thread_safe: bool = False) -> AsyncSession:
         A new AsyncSession instance.
 
     Note:
-        The returned session does NOT automatically SET ROLE openscientist_app.
-        Callers must use the session as a context manager and call
-        set_current_user() to set RLS context, or use get_session() instead.
+        The returned session runs as the login role. Callers that act for a user
+        call use_app_role() and set_current_user(), or use get_session() instead.
     """
     if thread_safe:
         return _create_fresh_session_factory()()
@@ -119,39 +116,13 @@ def async_session_local(thread_safe: bool = False) -> AsyncSession:
 AsyncSessionLocal = async_session_local
 
 
-async def _set_app_role(session: AsyncSession) -> None:
-    """Drop privileges to openscientist_app role for RLS enforcement.
-
-    The main database user (openscientist) is typically a superuser that bypasses
-    all RLS policies. By switching to openscientist_app (a non-superuser NOLOGIN role),
-    the session becomes subject to RLS policies.
-
-    This must be called on every new session before user-facing queries.
-    If the openscientist_app role does not exist, this will raise — that's intentional.
-    A silent fallback to superuser would bypass all RLS.
-    """
-    await session.execute(text("SET ROLE openscientist_app"))
-
-
-async def _clear_rls_user_context(session: AsyncSession) -> None:
-    """Clear app.current_user_id to prevent context leakage across pooled connections."""
-    with suppress(Exception):
-        await session.execute(text("SELECT set_config('app.current_user_id', NULL, false)"))
-
-
-async def _reset_role(session: AsyncSession) -> None:
-    """Restore the original database role after session use."""
-    with suppress(Exception):
-        await session.execute(text("RESET ROLE"))
-
-
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency to provide a database session with RLS enforced.
 
-    Connects as the main database user, then drops privileges to openscientist_app
-    via SET ROLE. The openscientist_app role is subject to RLS policies, ensuring
-    that queries only return rows the current user is authorized to see.
+    Connects as the main database user, and runs every transaction as
+    openscientist_app, which is subject to RLS policies, so queries only return
+    rows the current user is authorized to see.
 
     Callers must still call set_current_user(session, user_id) to set the
     RLS context for the specific user.
@@ -172,16 +143,12 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     factory = _get_session_factory()
     async with factory() as session:
         try:
-            # Drop to openscientist_app role so RLS policies are enforced
-            await _set_app_role(session)
-            await _clear_rls_user_context(session)
+            await use_app_role(session)
             yield session
         except Exception:
             await session.rollback()
             raise
         finally:
-            await _clear_rls_user_context(session)
-            await _reset_role(session)
             await session.close()
 
 
@@ -222,11 +189,9 @@ async def get_admin_session() -> AsyncGenerator[AsyncSession, None]:
     factory = _get_admin_session_factory()
     async with factory() as session:
         try:
-            await _clear_rls_user_context(session)
             yield session
         except Exception:
             await session.rollback()
             raise
         finally:
-            await _clear_rls_user_context(session)
             await session.close()
