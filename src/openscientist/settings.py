@@ -320,8 +320,8 @@ class DatabaseSettings(BaseSettings):
 
     database_url: str = Field(alias="DATABASE_URL")
 
-    # Admin database URL for elevated operations (bypasses RLS via DB role).
-    # If not set, falls back to DATABASE_URL.
+    # Login for admin sessions, which bypass RLS. The web process requires it.
+    # Agent containers load these settings without it.
     admin_database_url: str | None = Field(default=None, alias="ADMIN_DATABASE_URL")
 
     # Password the migrations give openscientist_admin. Only Alembic reads it.
@@ -335,10 +335,14 @@ class DatabaseSettings(BaseSettings):
         """Get the database URL."""
         return self.database_url
 
-    @property
-    def effective_admin_database_url(self) -> str:
-        """Get the admin database URL for elevated operations (bypasses RLS)."""
-        return self.admin_database_url or self.database_url
+    def required_admin_database_url(self) -> str:
+        """The admin login URL, for a process that opens admin sessions."""
+        if not self.admin_database_url:
+            raise ValueError(
+                "ADMIN_DATABASE_URL is not set. Admin sessions need the openscientist_admin "
+                "login and do not fall back to DATABASE_URL."
+            )
+        return self.admin_database_url
 
 
 class AuthSettings(BaseSettings):

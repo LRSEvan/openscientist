@@ -22,6 +22,7 @@ from nicegui import app, ui
 
 from openscientist.job_manager import JobManager
 from openscientist.security import register_scanner_block_middleware
+from openscientist.settings import get_settings
 from openscientist.version import get_version_string
 from openscientist.webapp_components.ui_components import (
     _inject_thinking_status_styles,
@@ -70,15 +71,27 @@ if not load_dotenv("/app/.env", override=False):
 
 logger = logging.getLogger(__name__)
 
-# Validate settings at import time (but don't fail yet - defer to main())
-_settings_error: str | None = None
-try:
-    from openscientist.settings import get_settings
 
-    _loaded_settings = get_settings()
-    STORAGE_SECRET = _loaded_settings.auth.storage_secret
-except Exception as e:
-    _settings_error = str(e)
+def _validate_settings() -> str | None:
+    """The configuration error that keeps the web app from starting, if any.
+
+    The admin URL is checked here and not in the settings model, because agent
+    containers load the same settings without it.
+    """
+    try:
+        from openscientist.settings import get_settings
+
+        get_settings().database.required_admin_database_url()
+    except Exception as e:
+        return str(e)
+    return None
+
+
+# Validate settings at import time (but don't fail yet - defer to main())
+_settings_error = _validate_settings()
+if _settings_error is None:
+    STORAGE_SECRET = get_settings().auth.storage_secret
+else:
     # Fallback for import-time usage — app will show config error page
     STORAGE_SECRET = "unconfigured-fallback"
 

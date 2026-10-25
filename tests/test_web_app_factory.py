@@ -209,3 +209,35 @@ def test_configure_host_app_registers_badge_and_thinking_status_head_html_once(
 
     assert len(badge_calls) == 1
     assert len(thinking_calls) == 1
+
+
+def _settings_with_admin_url(admin_url: str | None) -> SimpleNamespace:
+    from openscientist.settings import DatabaseSettings
+
+    database = DatabaseSettings(
+        DATABASE_URL="postgresql+asyncpg://user:pass@host:5432/db",
+        ADMIN_DATABASE_URL=admin_url,
+    )
+    return SimpleNamespace(database=database)
+
+
+def test_web_refuses_to_start_without_the_admin_url(monkeypatch, tmp_path: Path) -> None:
+    """The web opens admin sessions, so a missing admin URL is a configuration
+    error and main() serves the error page instead of the app."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADMIN_DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        "openscientist.settings.get_settings", lambda: _settings_with_admin_url(None)
+    )
+    error = web_app._validate_settings()
+    assert error is not None
+    assert "ADMIN_DATABASE_URL" in error
+
+
+def test_web_starts_with_the_admin_url(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "openscientist.settings.get_settings",
+        lambda: _settings_with_admin_url("postgresql+asyncpg://admin:pass@host:5432/db"),
+    )
+    assert web_app._validate_settings() is None
