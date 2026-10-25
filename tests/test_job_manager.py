@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from openscientist.database.models import Job
 from openscientist.job_manager import JobInfo, JobManager, JobStatus, JobStatusUpdateResult
+from openscientist.settings import ProviderSettings
 
 
 class TestJobStatus:
@@ -869,12 +870,9 @@ class TestEffectiveModel:
     @staticmethod
     def _settings(
         model: str | None = None, anthropic_default: str | None = None
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            provider=SimpleNamespace(
-                model=model,
-                anthropic_default_sonnet_model=anthropic_default,
-            )
+    ) -> ProviderSettings:
+        return ProviderSettings.model_construct(
+            model=model, anthropic_default_sonnet_model=anthropic_default
         )
 
     def test_explicit_model_wins(self) -> None:
