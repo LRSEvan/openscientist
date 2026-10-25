@@ -243,41 +243,26 @@ class TestUpdateJobStatus:
             await update_job_status(job_dir, "running")
 
         assert job.status == "running"
-        mock_session.flush.assert_awaited_once()
         mock_session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_awaiting_feedback_sends_notification(self, tmp_path):
+    async def test_awaiting_feedback_reads_only_the_job_row(self, tmp_path):
+        """The web process sends the notification, so the agent container
+        never queries the owner's row in users."""
         job_id = str(uuid4())
         job_dir = tmp_path / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        owner_id = uuid4()
         job = MagicMock()
         job.status = "running"
-        job.owner_id = owner_id
-        job.short_title = "Short title"
-        job.research_question = "Long title"
-        job.current_iteration = 4
+        job.owner_id = uuid4()
 
         job_result = MagicMock()
         job_result.scalar_one_or_none.return_value = job
 
-        user_row = MagicMock()
-        user_row.ntfy_enabled = True
-        user_row.ntfy_topic = "topic-123"
-        user_result = MagicMock()
-        user_result.first.return_value = user_row
-
-        with (
-            patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls,
-            patch(
-                "openscientist.orchestrator.iteration.notify_job_status_change",
-                new_callable=AsyncMock,
-            ) as mock_notify,
-        ):
+        with patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls:
             mock_session = AsyncMock()
-            mock_session.execute = AsyncMock(side_effect=[job_result, user_result])
+            mock_session.execute = AsyncMock(return_value=job_result)
             mock_cm = AsyncMock()
             mock_cm.__aenter__.return_value = mock_session
             mock_cm.__aexit__.return_value = False
@@ -285,51 +270,9 @@ class TestUpdateJobStatus:
 
             await update_job_status(job_dir, "awaiting_feedback")
 
-        mock_notify.assert_awaited_once()
-        kwargs = mock_notify.await_args.kwargs
-        assert kwargs["job_id"] == job_id
-        assert kwargs["job_title"] == "Short title"
-        assert kwargs["new_status"] == "awaiting_feedback"
-        assert kwargs["iteration"] == 4
-
-    @pytest.mark.asyncio
-    async def test_running_does_not_send_feedback_notification(self, tmp_path):
-        job_id = str(uuid4())
-        job_dir = tmp_path / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        job = MagicMock()
-        job.status = "awaiting_feedback"
-        job.owner_id = uuid4()
-        job.short_title = "Short"
-        job.research_question = "Title"
-
-        job_result = MagicMock()
-        job_result.scalar_one_or_none.return_value = job
-
-        user_row = MagicMock()
-        user_row.ntfy_enabled = True
-        user_row.ntfy_topic = "topic-123"
-        user_result = MagicMock()
-        user_result.first.return_value = user_row
-
-        with (
-            patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls,
-            patch(
-                "openscientist.orchestrator.iteration.notify_job_status_change",
-                new_callable=AsyncMock,
-            ) as mock_notify,
-        ):
-            mock_session = AsyncMock()
-            mock_session.execute = AsyncMock(side_effect=[job_result, user_result])
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_session
-            mock_cm.__aexit__.return_value = False
-            mock_session_cls.return_value = mock_cm
-
-            await update_job_status(job_dir, "running")
-
-        mock_notify.assert_not_awaited()
+        assert job.status == "awaiting_feedback"
+        mock_session.execute.assert_awaited_once()
+        mock_session.commit.assert_awaited_once()
 
 
 # ─── discovery cancellation / failure flow ────────────────────────────

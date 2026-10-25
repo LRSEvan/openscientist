@@ -212,22 +212,34 @@ async def _db_update_job_status(
             if cancellation_reason:
                 job.cancellation_reason = cancellation_reason
             await session.commit()
+            await _fill_notification_target(session, job, result)
 
-            result.owner_id = str(job.owner_id) if job.owner_id else None
-            result.job_title = job.short_title or job.research_question
-            result.current_iteration = job.current_iteration
+    return result
 
-            # Fetch owner's ntfy settings for notifications
-            if job.owner_id:
-                user_stmt = select(User.ntfy_enabled, User.ntfy_topic).where(
-                    User.id == job.owner_id
-                )
-                user_result = await session.execute(user_stmt)
-                user_row = user_result.first()
-                if user_row:
-                    result.ntfy_enabled = user_row.ntfy_enabled
-                    result.ntfy_topic = user_row.ntfy_topic
 
+async def _fill_notification_target(
+    session: AsyncSession, job: JobModel, result: JobStatusUpdateResult
+) -> None:
+    """Copy the job fields a notification shows and the owner's ntfy settings."""
+    result.owner_id = str(job.owner_id) if job.owner_id else None
+    result.job_title = job.short_title or job.research_question
+    result.current_iteration = job.current_iteration
+    if job.owner_id:
+        user_stmt = select(User.ntfy_enabled, User.ntfy_topic).where(User.id == job.owner_id)
+        user_row = (await session.execute(user_stmt)).first()
+        if user_row:
+            result.ntfy_enabled = user_row.ntfy_enabled
+            result.ntfy_topic = user_row.ntfy_topic
+
+
+async def _db_get_notification_target(job_id: str) -> JobStatusUpdateResult:
+    """Notification data for a status the agent container wrote."""
+    result = JobStatusUpdateResult()
+    async with AsyncSessionLocal(thread_safe=True) as session:
+        stmt = select(JobModel).where(JobModel.id == UUID(job_id))
+        job = (await session.execute(stmt)).scalar_one_or_none()
+        if job:
+            await _fill_notification_target(session, job, result)
     return result
 
 
@@ -644,11 +656,15 @@ class JobManager:
             timeout_seconds = get_settings().container.agent_timeout
             timeout_hours = timeout_seconds / 3600
             elapsed = 0
+            last_status = JobStatus.RUNNING
             while elapsed < timeout_seconds:
                 time.sleep(poll_interval)
                 elapsed += poll_interval
                 try:
                     job_info = self._load_job_info(job_id)
+                    if job_info and job_info.status != last_status:
+                        last_status = job_info.status
+                        self._notify_container_transition(job_info)
                     if job_info and job_info.status.value in terminal_statuses:
                         logger.info(
                             "Container job %s reached terminal status: %s",
@@ -965,29 +981,63 @@ class JobManager:
         cancellation_reason: str | None = None,
     ) -> None:
         """Update job status in the database."""
-        ntfy_result: JobStatusUpdateResult | None = None
+        target: JobStatusUpdateResult | None = None
         try:
-            ntfy_result = _run_async(
+            target = _run_async(
                 _db_update_job_status(job_id, status, error_message, None, cancellation_reason)
             )
         except Exception as e:
             logger.error("Failed to update job status in database: %s", e)
+        self._send_status_notification(
+            job_id,
+            status,
+            target,
+            error_message=error_message,
+            cancellation_reason=cancellation_reason,
+        )
 
-        if not ntfy_result or not ntfy_result.ntfy_enabled or not ntfy_result.owner_id:
+    #: Statuses the agent container writes that the owner is told about. The web
+    #: process notifies the ones it writes itself in ``_update_job_status``.
+    _CONTAINER_NOTIFIED_STATUSES: frozenset[JobStatus] = frozenset(
+        {JobStatus.AWAITING_FEEDBACK, JobStatus.COMPLETED, JobStatus.FAILED}
+    )
+
+    def _notify_container_transition(self, job_info: JobInfo) -> None:
+        """Notify a status change the poll saw the agent container write."""
+        if job_info.status not in self._CONTAINER_NOTIFIED_STATUSES:
             return
+        try:
+            target = _run_async(_db_get_notification_target(job_info.job_id))
+        except Exception as e:
+            logger.warning("Failed to load notification target for %s: %s", job_info.job_id, e)
+            return
+        self._send_status_notification(
+            job_info.job_id, job_info.status, target, error_message=job_info.error
+        )
 
-        iterations_completed = _derive_progress_from_db(status.value, ntfy_result.current_iteration)
+    @staticmethod
+    def _send_status_notification(
+        job_id: str,
+        status: JobStatus,
+        target: JobStatusUpdateResult | None,
+        *,
+        error_message: str | None = None,
+        cancellation_reason: str | None = None,
+    ) -> None:
+        if not target or not target.ntfy_enabled or not target.owner_id:
+            return
+        iterations_completed = _derive_progress_from_db(status.value, target.current_iteration)
         try:
             _run_async(
                 notify_job_status_change(
-                    user_id=UUID(ntfy_result.owner_id),
+                    user_id=UUID(target.owner_id),
                     job_id=job_id,
-                    job_title=ntfy_result.job_title or "",
+                    job_title=target.job_title or "",
                     new_status=status.value,
                     error_message=error_message,
                     cancellation_reason=cancellation_reason,
                     iteration=iterations_completed,
-                    ntfy_topic=ntfy_result.ntfy_topic,
+                    ntfy_topic=target.ntfy_topic,
                 )
             )
         except Exception as e:
