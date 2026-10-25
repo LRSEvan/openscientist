@@ -66,7 +66,9 @@ async def test_worker_paths_reach_a_users_job_without_the_web_login(
     queued = [job.id for job in await _db_list_jobs(status=JobStatus.QUEUED)]
     assert UUID(owned_job.job_id) in queued
 
-    target = await _db_update_job_status(owned_job.job_id, JobStatus.RUNNING)
+    target = await _db_update_job_status(
+        owned_job.job_id, JobStatus.RUNNING, allowed_from={JobStatus.QUEUED}
+    )
     assert target.owner_id == str(owned_job.owner_id)
     assert await _status(test_engine, owned_job.job_id) == "running"
 

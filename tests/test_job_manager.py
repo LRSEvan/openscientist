@@ -148,36 +148,6 @@ class TestJobManagerInit:
         _new_manager(d)
         assert d.exists()
 
-    def test_cleans_stale_running_jobs(self, tmp_path):
-        stale1 = str(uuid4())
-        stale2 = str(uuid4())
-        ok = str(uuid4())
-
-        _write_config(tmp_path, stale1, status="running")
-        _write_config(tmp_path, stale2, status="queued")
-        _write_config(tmp_path, ok, status="completed")
-
-        db_jobs = [
-            _make_db_job("running", "2026-02-01T00:00:00", job_id=stale1),
-            _make_db_job("queued", "2026-02-01T00:00:00", job_id=stale2),
-            _make_db_job("completed", "2026-02-01T00:00:00", job_id=ok),
-        ]
-
-        with (
-            patch(
-                "openscientist.job_manager._db_list_jobs",
-                new_callable=AsyncMock,
-                return_value=db_jobs,
-            ),
-            patch(
-                "openscientist.job_manager._db_update_job_status",
-                new_callable=AsyncMock,
-            ) as mock_update,
-        ):
-            JobManager(jobs_dir=tmp_path)
-
-        assert mock_update.await_count == 2
-
 
 class TestJobManagerListAndGet:
     """Tests for listing and getting jobs."""
@@ -399,62 +369,6 @@ class TestJobManagerDelete:
         assert (tmp_path / job_id).exists()
 
 
-class TestJobManagerStatusUpdate:
-    """Tests for status update logic."""
-
-    @pytest.fixture(autouse=True)
-    def _mock_ks_progress(self):
-        with patch(
-            "openscientist.job_manager._load_progress_from_knowledge_state",
-            return_value=(0, 0),
-        ):
-            yield
-
-    def test_update_status_calls_database(self, tmp_path):
-        manager = _new_manager(tmp_path)
-        job_id = str(uuid4())
-        _write_config(tmp_path, job_id, status="pending")
-
-        with patch(
-            "openscientist.job_manager._db_update_job_status",
-            new_callable=AsyncMock,
-            return_value=JobStatusUpdateResult(),
-        ) as mock_update:
-            manager._update_job_status(job_id, JobStatus.RUNNING)
-
-        mock_update.assert_awaited_once()
-        assert mock_update.await_args.args[0] == job_id
-        assert mock_update.await_args.args[1] == JobStatus.RUNNING
-
-    def test_completed_passes_status_to_database(self, tmp_path):
-        manager = _new_manager(tmp_path)
-        job_id = str(uuid4())
-        _write_config(tmp_path, job_id, status="pending")
-
-        with patch(
-            "openscientist.job_manager._db_update_job_status",
-            new_callable=AsyncMock,
-            return_value=JobStatusUpdateResult(),
-        ) as mock_update:
-            manager._update_job_status(job_id, JobStatus.COMPLETED)
-
-        assert mock_update.await_args.args[1] == JobStatus.COMPLETED
-
-    def test_failed_passes_status_to_database(self, tmp_path):
-        manager = _new_manager(tmp_path)
-        job_id = str(uuid4())
-        _write_config(tmp_path, job_id, status="pending")
-
-        with patch(
-            "openscientist.job_manager._db_update_job_status",
-            new_callable=AsyncMock,
-            return_value=JobStatusUpdateResult(),
-        ) as mock_update:
-            manager._update_job_status(job_id, JobStatus.FAILED)
-
-        assert mock_update.await_args.args[1] == JobStatus.FAILED
-
-
 class TestContainerStatusNotifications:
     """The web poll of a running container sends the notifications for the
     transitions the container writes, so the container never reads users."""
@@ -478,6 +392,7 @@ class TestContainerStatusNotifications:
             for status, error in statuses
         ]
         target = JobStatusUpdateResult(
+            applied=True,
             ntfy_enabled=True,
             ntfy_topic="topic-1",
             owner_id=str(owner_id),

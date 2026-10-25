@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Collection
 from functools import partial
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.session import AsyncSessionLocal, SessionOpener
@@ -409,21 +410,30 @@ async def _persist_job_status(
     job_uuid: UUID,
     status: str,
     error_message: str | None,
+    allowed_from: Collection[str],
     open_session: SessionOpener,
-) -> None:
+) -> bool:
+    values = {"status": status}
+    if error_message:
+        values["error_message"] = error_message
+    stmt = (
+        update(JobModel)
+        .where(JobModel.id == job_uuid, JobModel.status.in_(list(allowed_from)))
+        .values(**values)
+        .returning(JobModel.id)
+    )
     try:
         async with open_session() as session:
-            job_result = await session.execute(select(JobModel).where(JobModel.id == job_uuid))
-            job = job_result.scalar_one_or_none()
-            if job is None:
-                logger.warning("Cannot update status for missing job %s", job_id)
-                return
-            job.status = status
-            if error_message:
-                job.error_message = error_message
+            if (await session.execute(stmt)).scalar_one_or_none() is None:
+                logger.info(
+                    "Job %s is not in %s, so it stays as it is", job_id, sorted(allowed_from)
+                )
+                return False
             await session.commit()
+            return True
     except Exception as e:
         logger.warning("Failed to update status for job %s: %s", job_id, e)
+        return False
 
 
 async def update_job_status(
@@ -431,20 +441,23 @@ async def update_job_status(
     status: str,
     error_message: str | None = None,
     *,
+    allowed_from: Collection[str],
     open_session: SessionOpener | None = None,
-) -> None:
-    """Update job status in ``open_session``, else the process's own login, and notify the owner."""
+) -> bool:
+    """Move the job to ``status`` if it is in one of ``allowed_from``, in
+    ``open_session``, else the process's own login. Returns whether it applied."""
     job_id = job_dir.name
 
     job_uuid = _parse_job_uuid(job_id)
     if job_uuid is None:
-        return
+        return False
 
-    await _persist_job_status(
+    return await _persist_job_status(
         job_id,
         job_uuid,
         status,
         error_message,
+        allowed_from,
         open_session or partial(AsyncSessionLocal, thread_safe=True),
     )
 

@@ -475,6 +475,7 @@ def _initialize_job_manager_runtime(jobs_dir: Path) -> None:
         jobs_dir=jobs_dir,
         max_concurrent=get_settings().max_concurrent_jobs,
     )
+    _state.job_manager.recover_after_restart()
 
 
 def _register_nicegui_static_files() -> None:

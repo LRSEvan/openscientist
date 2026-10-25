@@ -10,14 +10,14 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Collection, Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openscientist.container_manager import get_container_manager
@@ -190,30 +190,40 @@ async def _db_get_share_permission(job_id: str, user_id: UUID) -> str | None:
 async def _db_update_job_status(
     job_id: str,
     status: JobStatus,
+    *,
+    allowed_from: Collection[JobStatus],
     error_message: str | None = None,
     user_id: UUID | None = None,
     cancellation_reason: str | None = None,
 ) -> JobStatusUpdateResult:
-    """Update job status in the database (thread-safe for worker threads).
+    """Move the job to ``status`` if it is in one of ``allowed_from`` (thread-safe).
 
     Returns:
-        JobStatusUpdateResult with the job owner's ntfy settings for notifications.
+        JobStatusUpdateResult with ``applied`` and the owner's ntfy settings.
     """
     result = JobStatusUpdateResult()
+    values: dict[str, str] = {"status": status.value}
+    if error_message:
+        values["error_message"] = error_message
+    if cancellation_reason:
+        values["cancellation_reason"] = cancellation_reason
+    stmt = (
+        update(JobModel)
+        .where(
+            JobModel.id == UUID(job_id),
+            JobModel.status.in_([allowed.value for allowed in allowed_from]),
+        )
+        .values(**values)
+        .returning(JobModel)
+    )
 
     async with _job_session(user_id) as session:
-        stmt = select(JobModel).where(JobModel.id == UUID(job_id))
-        db_result = await session.execute(stmt)
-        job = db_result.scalar_one_or_none()
-
-        if job:
-            job.status = status.value
-            if error_message:
-                job.error_message = error_message
-            if cancellation_reason:
-                job.cancellation_reason = cancellation_reason
-            await session.commit()
-            await _fill_notification_target(session, job, result)
+        job = (await session.execute(stmt)).scalar_one_or_none()
+        if job is None:
+            return result
+        result.applied = True
+        await session.commit()
+        await _fill_notification_target(session, job, result)
 
     return result
 
@@ -298,9 +308,19 @@ class JobManager:
     - Clean up old jobs
     """
 
+    #: A job that has not ended, so it may still fail or be cancelled.
+    ACTIVE_STATUSES = frozenset(
+        {JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.AWAITING_FEEDBACK}
+    )
+    #: A job waiting for its worker thread.
+    WAITING_STATUSES = frozenset({JobStatus.PENDING, JobStatus.QUEUED})
+    #: A job whose container has started.
+    STARTED_STATUSES = frozenset({JobStatus.RUNNING, JobStatus.AWAITING_FEEDBACK})
+
     def __init__(self, jobs_dir: Path = Path("jobs"), max_concurrent: int = 1):
         """
-        Initialize job manager.
+        Initialize job manager. Building one changes no job: only the web's
+        startup calls :meth:`recover_after_restart`.
 
         Args:
             jobs_dir: Base directory for jobs
@@ -313,62 +333,46 @@ class JobManager:
         self._running_jobs: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
 
-        # Clean up any stale running/queued jobs from previous restart
-        self._cleanup_stale_jobs()
-
         logger.info(
             "JobManager initialized: %s, max_concurrent=%d",
             self.jobs_dir,
             max_concurrent,
         )
 
-    def _cleanup_stale_jobs(self) -> None:
-        """
-        Mark any running/queued/awaiting_feedback jobs as cancelled on startup.
-
-        This handles the case where the server restarts while jobs are in progress.
-        Since the orchestrator process died, these jobs will never complete.
-        """
-        stale_count = 0
+    def recover_after_restart(self) -> None:
+        """End the jobs whose container the previous web process lost, and start
+        the jobs still waiting for a slot."""
+        lost_container = self.STARTED_STATUSES | {JobStatus.GENERATING_REPORT}
         for job_info in self._list_operational_jobs():
             job_id = job_info.job_id
-            if job_info.status in [
-                JobStatus.RUNNING,
-                JobStatus.QUEUED,
-                JobStatus.AWAITING_FEEDBACK,
-                JobStatus.GENERATING_REPORT,
-            ]:
-                logger.warning(
-                    "Marking stale job %s as cancelled (was %s)",
-                    job_id,
-                    job_info.status.value,
+            if job_info.status == JobStatus.PENDING:
+                self._update_job_status(
+                    job_id, JobStatus.QUEUED, allowed_from={JobStatus.PENDING}, notify=False
                 )
-                # Update database
-                try:
-                    owner_id = UUID(job_info.owner_id) if job_info.owner_id else None
-                    _run_async(
-                        _db_update_job_status(
-                            job_id,
-                            JobStatus.CANCELLED,
-                            user_id=owner_id,
-                            cancellation_reason="Server restarted while job was running",
-                        )
-                    )
-                except Exception as e:
-                    logger.error("Failed to update job %s in database: %s", job_id, e)
+                continue
+            if job_info.status not in lost_container:
+                continue
+            logger.warning(
+                "Cancelling job %s, whose container the restart lost (was %s)",
+                job_id,
+                job_info.status.value,
+            )
+            self._update_job_status(
+                job_id,
+                JobStatus.CANCELLED,
+                allowed_from=lost_container,
+                cancellation_reason="Server restarted while job was running",
+                notify=False,
+            )
+            try:
+                from openscientist.job_container import JobContainerRunner
 
-                # Stop any orphaned agent container for this stale job.
-                try:
-                    from openscientist.job_container import JobContainerRunner
+                JobContainerRunner().cleanup(job_id)
+            except Exception as e:
+                logger.warning("Failed to cleanup container for stale job %s: %s", job_id, e)
 
-                    JobContainerRunner().cleanup(job_id)
-                except Exception as e:
-                    logger.warning("Failed to cleanup container for stale job %s: %s", job_id, e)
-
-                stale_count += 1
-
-        if stale_count > 0:
-            logger.info("Cleaned up %d stale job(s) from previous run", stale_count)
+        while self._start_next_queued_job():
+            pass
 
     def _ensure_job_not_exists(self, job_id: str) -> None:
         if self.get_job(job_id) is not None:
@@ -563,7 +567,7 @@ class JobManager:
             job_id: Job ID
 
         Raises:
-            ValueError: If job not found or already running
+            ValueError: If job not found, already running, or no longer waiting to start
         """
         with self._lock:
             # Check job exists
@@ -575,10 +579,17 @@ class JobManager:
             if job_id in self._running_jobs:
                 raise ValueError(f"Job {job_id} is already running")
 
+            if job_info.status not in self.WAITING_STATUSES:
+                raise ValueError(
+                    f"Job {job_id} cannot be started from status {job_info.status.value}"
+                )
+
             # Check concurrent limit
             if self._get_active_job_count() >= self.max_concurrent:
-                # Queue the job
-                self._update_job_status(job_id, JobStatus.QUEUED)
+                if not self._update_job_status(
+                    job_id, JobStatus.QUEUED, allowed_from=self.WAITING_STATUSES
+                ):
+                    raise ValueError(f"Job {job_id} cannot be started: it stopped waiting")
                 logger.info("Job %s queued (max concurrent reached)", job_id)
                 return
 
@@ -640,9 +651,14 @@ class JobManager:
 
         job_dir = self.jobs_dir / job_id
         runner = JobContainerRunner()
+        running_from = {JobStatus.COMPLETED} if run_mode == "report_only" else self.WAITING_STATUSES
+        launched = False
 
         try:
-            self._update_job_status(job_id, JobStatus.RUNNING)
+            if not self._update_job_status(job_id, JobStatus.RUNNING, allowed_from=running_from):
+                logger.info("Job %s stopped waiting to start, so it is not launched", job_id)
+                return
+            launched = True
             runner.launch(job_id, job_dir, run_mode=run_mode)
             logger.info("Agent container launched for job %s (mode=%s)", job_id, run_mode)
 
@@ -687,6 +703,7 @@ class JobManager:
                     self._update_job_status(
                         job_id,
                         JobStatus.FAILED,
+                        allowed_from=self.STARTED_STATUSES,
                         error_message=f"Agent container exited with code {exit_code}",
                     )
                     return
@@ -696,6 +713,7 @@ class JobManager:
             self._update_job_status(
                 job_id,
                 JobStatus.FAILED,
+                allowed_from=self.STARTED_STATUSES,
                 error_message=f"Job timed out after {timeout_hours:.1f} hours",
             )
 
@@ -703,61 +721,74 @@ class JobManager:
             logger.error(
                 "Container job %s failed [%s]: %s", job_id, get_version_string(), e, exc_info=True
             )
-            self._update_job_status(job_id, JobStatus.FAILED, error_message=str(e))
+            self._update_job_status(
+                job_id, JobStatus.FAILED, allowed_from=self.ACTIVE_STATUSES, error_message=str(e)
+            )
 
         finally:
-            runner.cleanup(job_id, log_dir=job_dir)
+            if launched:
+                runner.cleanup(job_id, log_dir=job_dir)
             with self._lock:
                 self._running_jobs.pop(job_id, None)
             self._start_next_queued_job()
 
-    def _start_next_queued_job(self) -> None:
-        """Start the next queued job if slots available."""
+    def _start_next_queued_job(self) -> bool:
+        """Start the oldest queued job that has no thread yet, if a slot is free.
+
+        Returns:
+            Whether a job was started.
+        """
         with self._lock:
             if self._get_active_job_count() >= self.max_concurrent:
-                return
+                return False
 
-            queued_jobs = self._list_operational_jobs(status=JobStatus.QUEUED, limit=1)
-            if not queued_jobs:
-                return
+            # Listed newest first, and the job that has waited longest goes first.
+            queued_jobs = self._list_operational_jobs(status=JobStatus.QUEUED)
+            job_id = next(
+                (
+                    job.job_id
+                    for job in reversed(queued_jobs)
+                    if job.job_id not in self._running_jobs
+                ),
+                None,
+            )
+            if job_id is None:
+                return False
 
-            job_id = queued_jobs[0].job_id
             logger.info("Starting queued job %s", job_id)
             thread = threading.Thread(target=self._run_job, args=(job_id,), daemon=True)
             self._running_jobs[job_id] = thread
             thread.start()
+            return True
 
     def cancel_job(self, job_id: str) -> None:
         """
-        Cancel a pending, running, or queued job.
+        Cancel a job that has not ended, stopping its container if it has one.
 
         Args:
             job_id: Job ID
 
         Raises:
-            ValueError: If job not found
+            ValueError: If job not found or already ended
         """
-        job_info = self.get_job(job_id)
-        if job_info is None:
+        if self.get_job(job_id) is None:
             raise ValueError(f"Job {job_id} not found")
 
-        if job_info.status not in [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.QUEUED]:
-            raise ValueError(f"Job {job_id} is not pending, running, or queued")
+        if not self._update_job_status(
+            job_id,
+            JobStatus.CANCELLED,
+            allowed_from=self.ACTIVE_STATUSES,
+            cancellation_reason="Cancelled by user",
+        ):
+            raise ValueError(f"Job {job_id} has already ended")
 
-        # Update status with reason
-        self._update_job_status(
-            job_id, JobStatus.CANCELLED, cancellation_reason="Cancelled by user"
-        )
-
-        # For running jobs, keep the thread tracked until it exits so
-        # active-slot accounting stays accurate.
+        # The worker thread stays tracked until it exits, so slots stay counted.
+        # A thread that has not launched yet sees the cancel and does not launch.
         with self._lock:
-            if job_info.status in [JobStatus.PENDING, JobStatus.QUEUED]:
-                self._running_jobs.pop(job_id, None)
+            has_worker = job_id in self._running_jobs
 
-        # Send SIGTERM to the agent container immediately so it doesn't
-        # keep burning resources until the polling loop notices the DB change.
-        if job_info.status == JobStatus.RUNNING:
+        # Stop the container now rather than when the worker's poll sees the cancel.
+        if has_worker:
             try:
                 from openscientist.job_container import JobContainerRunner
 
@@ -974,24 +1005,38 @@ class JobManager:
         self,
         job_id: str,
         status: JobStatus,
+        *,
+        allowed_from: Collection[JobStatus],
         error_message: str | None = None,
         cancellation_reason: str | None = None,
-    ) -> None:
-        """Update job status in the database."""
-        target: JobStatusUpdateResult | None = None
+        notify: bool = True,
+    ) -> bool:
+        """Move the job to ``status`` if it is in one of ``allowed_from``, and tell
+        the owner when ``notify`` is set. Returns whether the write applied."""
         try:
             target = _run_async(
-                _db_update_job_status(job_id, status, error_message, None, cancellation_reason)
+                _db_update_job_status(
+                    job_id,
+                    status,
+                    allowed_from=allowed_from,
+                    error_message=error_message,
+                    cancellation_reason=cancellation_reason,
+                )
             )
         except Exception as e:
             logger.error("Failed to update job status in database: %s", e)
-        self._send_status_notification(
-            job_id,
-            status,
-            target,
-            error_message=error_message,
-            cancellation_reason=cancellation_reason,
-        )
+            return False
+        if not target.applied:
+            return False
+        if notify:
+            self._send_status_notification(
+                job_id,
+                status,
+                target,
+                error_message=error_message,
+                cancellation_reason=cancellation_reason,
+            )
+        return True
 
     #: Statuses the agent container writes that the owner is told about. The web
     #: process notifies the ones it writes itself in ``_update_job_status``.

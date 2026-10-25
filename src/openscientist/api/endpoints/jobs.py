@@ -37,6 +37,7 @@ from openscientist.database.models import Job, User
 from openscientist.database.rls import set_current_user
 from openscientist.database.session import get_session
 from openscientist.file_loader import FileTooBigError, validate_uploaded_file
+from openscientist.job.types import JobStatus
 from openscientist.job_manager import JobManager
 
 logger = logging.getLogger(__name__)
@@ -565,7 +566,7 @@ async def cancel_job(
             detail="Only the job owner can cancel a job",
         )
 
-    if job.status not in ["pending", "running", "queued"]:
+    if JobStatus(job.status) not in JobManager.ACTIVE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel job with status '{job.status}'",

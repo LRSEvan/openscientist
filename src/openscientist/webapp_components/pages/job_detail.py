@@ -598,9 +598,17 @@ def _submit_feedback_and_continue(
         ks.save_to_database_sync(job_id, open_session=as_user)
 
     try:
-        run_sync(update_job_status(job_dir, "running", open_session=as_user))
+        resumed = run_sync(
+            update_job_status(
+                job_dir, "running", allowed_from=("awaiting_feedback",), open_session=as_user
+            )
+        )
     except Exception:
         ui.notify("Failed to continue job. Please try again.", type="negative")
+        return
+    if not resumed:
+        ui.notify("This job is no longer waiting for feedback.", type="warning")
+        ui.navigate.to(f"/job/{job_id}")
         return
     ui.notify("Continuing to next iteration", type="positive")
     ui.navigate.to(f"/job/{job_id}")

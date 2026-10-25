@@ -20,7 +20,6 @@ from openscientist.agent.base import TurnOutcome
 from openscientist.orchestrator import (
     get_version_metadata,
     increment_ks_iteration,
-    update_job_status,
 )
 from openscientist.settings import clear_settings_cache
 
@@ -209,70 +208,6 @@ class TestVersionMetadataHarness:
         info = get_version_metadata()
         assert info["agent_harness"] == "omp"
         assert "agent_harness_version" not in info
-
-
-# ─── update_job_status ────────────────────────────────────────────────
-
-
-class TestUpdateJobStatus:
-    """Tests for DB-backed job status updates."""
-
-    @pytest.mark.asyncio
-    async def test_update_status(self, tmp_path):
-        job_id = str(uuid4())
-        job_dir = tmp_path / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        job = MagicMock()
-        job.status = "pending"
-        job.owner_id = None
-        job.short_title = None
-        job.research_question = "Test job"
-
-        job_result = MagicMock()
-        job_result.scalar_one_or_none.return_value = job
-
-        with patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls:
-            mock_session = AsyncMock()
-            mock_session.execute = AsyncMock(return_value=job_result)
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_session
-            mock_cm.__aexit__.return_value = False
-            mock_session_cls.return_value = mock_cm
-
-            await update_job_status(job_dir, "running")
-
-        assert job.status == "running"
-        mock_session.commit.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_awaiting_feedback_reads_only_the_job_row(self, tmp_path):
-        """The web process sends the notification, so the agent container
-        never queries the owner's row in users."""
-        job_id = str(uuid4())
-        job_dir = tmp_path / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        job = MagicMock()
-        job.status = "running"
-        job.owner_id = uuid4()
-
-        job_result = MagicMock()
-        job_result.scalar_one_or_none.return_value = job
-
-        with patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls:
-            mock_session = AsyncMock()
-            mock_session.execute = AsyncMock(return_value=job_result)
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_session
-            mock_cm.__aexit__.return_value = False
-            mock_session_cls.return_value = mock_cm
-
-            await update_job_status(job_dir, "awaiting_feedback")
-
-        assert job.status == "awaiting_feedback"
-        mock_session.execute.assert_awaited_once()
-        mock_session.commit.assert_awaited_once()
 
 
 # ─── discovery cancellation / failure flow ────────────────────────────

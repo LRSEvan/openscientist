@@ -2003,10 +2003,7 @@ def render_delete_dialog(
         def render_dialog_content() -> None:
             content_container.clear()
             job_info = job_manager.get_job(job_id)
-            is_active = job_info and job_info.status in [
-                JobStatus.RUNNING,
-                JobStatus.QUEUED,
-            ]
+            is_active = job_info and job_info.status in job_manager.ACTIVE_STATUSES
 
             with content_container:
                 ui.label("Delete Job").classes("text-h6 font-bold")
@@ -2042,10 +2039,7 @@ def render_delete_dialog(
 
                 # Check if job needs to be cancelled first
                 job_info = job_manager.get_job(job_id)
-                if job_info and job_info.status in [
-                    JobStatus.RUNNING,
-                    JobStatus.QUEUED,
-                ]:
+                if job_info and job_info.status in job_manager.ACTIVE_STATUSES:
                     job_manager.cancel_job(job_id)
 
                 job_manager.delete_job(job_id)

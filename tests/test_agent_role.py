@@ -306,7 +306,7 @@ async def test_container_code_runs_as_the_job_login(
     ks.set_agent_status("Working")
     await ks.save_to_database(str(jobs.own))
 
-    await update_job_status(tmp_path / str(jobs.own), "running")
+    await update_job_status(tmp_path / str(jobs.own), "running", allowed_from=("pending",))
     await _persist_job_cost_record(str(jobs.own), TokenUsage(input_tokens=5), "vllm", "m")
     with patch(
         "openscientist.orchestrator.discovery.get_version_metadata",

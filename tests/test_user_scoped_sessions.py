@@ -106,11 +106,17 @@ async def test_continuing_after_feedback_changes_only_the_users_own_job(
 ) -> None:
     job_dir = tmp_path / alices_job.job_id
     await update_job_status(
-        job_dir, "running", open_session=partial(thread_safe_user_session, alices_job.stranger)
+        job_dir,
+        "running",
+        allowed_from=("awaiting_feedback",),
+        open_session=partial(thread_safe_user_session, alices_job.stranger),
     )
     assert await _status(test_engine, alices_job.job_id) == "awaiting_feedback"
     await update_job_status(
-        job_dir, "running", open_session=partial(thread_safe_user_session, alices_job.owner)
+        job_dir,
+        "running",
+        allowed_from=("awaiting_feedback",),
+        open_session=partial(thread_safe_user_session, alices_job.owner),
     )
     assert await _status(test_engine, alices_job.job_id) == "running"
 

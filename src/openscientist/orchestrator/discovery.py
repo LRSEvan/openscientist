@@ -196,10 +196,14 @@ async def _wait_for_coinvestigate_feedback(
     """Pause for user feedback between iterations in co-investigation mode."""
     if investigation_mode != "coinvestigate" or current_iteration >= max_iterations:
         return None
-    await update_job_status(job_dir, "awaiting_feedback")
+    if not await update_job_status(job_dir, "awaiting_feedback", allowed_from=("running",)):
+        raise _DiscoveryCancelledError(f"Job {job_dir.name} is no longer running")
     wait_result = await wait_for_feedback_or_timeout(job_dir)
-    if wait_result["outcome"] != "cancelled":
-        await update_job_status(job_dir, "running")
+    if wait_result["outcome"] != "cancelled" and not await update_job_status(
+        job_dir, "running", allowed_from=("awaiting_feedback",)
+    ):
+        # The feedback panel resumed the job first, or the job ended while it waited.
+        await _assert_job_running(job_dir.name)
     return wait_result
 
 
@@ -208,6 +212,13 @@ async def _assert_job_not_cancelled(job_id: str) -> None:
     status = await _get_job_status(job_id)
     if status == "cancelled":
         raise _DiscoveryCancelledError(f"Job {job_id} was cancelled")
+
+
+async def _assert_job_running(job_id: str) -> None:
+    """Raise if the job is no longer running, so the container stops."""
+    status = await _get_job_status(job_id)
+    if status != "running":
+        raise _DiscoveryCancelledError(f"Job {job_id} is {status}")
 
 
 async def _run_primary_discovery_loop(
@@ -562,12 +573,13 @@ async def _persist_final_status(
     """Persist final job status based on report generation outcome."""
     final_status = "completed" if report_outcome.success else "failed"
     if final_status == "completed":
-        await update_job_status(job_dir, "completed")
+        await update_job_status(job_dir, "completed", allowed_from=("running",))
     else:
         await update_job_status(
             job_dir,
             "failed",
             error_message=f"Report generation failed: {report_outcome.error}",
+            allowed_from=("running",),
         )
     return final_status
 
@@ -781,7 +793,8 @@ async def _build_and_prepare_executor(
         data_files=all_data_files,
     )
     executor.apply_runtime_environment()
-    await update_job_status(job_dir, "running")
+    if not await update_job_status(job_dir, "running", allowed_from=("running",)):
+        raise _DiscoveryCancelledError(f"Job {job_dir.name} is no longer running")
     await executor.prepare_job_workspace(use_hypotheses=use_hypotheses)
     # Resolve the model's context window once per job, off the event loop (the
     # Ollama probe is blocking I/O). Cached on the agent for the report budget.
@@ -823,7 +836,9 @@ async def regenerate_report_async(job_dir: Path) -> dict[str, Any]:
     except Exception as e:
         logger.error("Report regeneration failed [%s]: %s", get_version_string(), e, exc_info=True)
         try:
-            await update_job_status(job_dir, "failed", error_message=str(e))
+            await update_job_status(
+                job_dir, "failed", error_message=str(e), allowed_from=("running",)
+            )
         except Exception as status_error:
             logger.warning("Failed to persist failure status for job %s: %s", job_id, status_error)
         try:
@@ -905,7 +920,12 @@ async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
     except Exception as e:
         logger.error("Discovery failed [%s]: %s", get_version_string(), e, exc_info=True)
         try:
-            await update_job_status(job_dir, "failed", error_message=str(e))
+            await update_job_status(
+                job_dir,
+                "failed",
+                error_message=str(e),
+                allowed_from=("running", "awaiting_feedback"),
+            )
         except Exception as status_error:
             logger.warning("Failed to persist failure status for job %s: %s", job_id, status_error)
         try:
