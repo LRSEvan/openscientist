@@ -165,6 +165,24 @@ class TestContainerDatabaseLogin:
         agent_login.opened.assert_called_once_with("job-123", lifetime_seconds=300)
         agent_login.closed.assert_called_once_with(_LOGIN.role)
 
+    def test_live_logins_are_the_labels_of_every_listed_container(self) -> None:
+        """Exited containers count too, since their teardown has yet to run."""
+        running, exited = MagicMock(), MagicMock()
+        running.labels = {AGENT_LOGIN_LABEL: "agent_" + "1" * 32}
+        exited.labels = {AGENT_LOGIN_LABEL: "agent_" + "2" * 32}
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = [running, exited]
+        assert self._runner(mock_client).live_login_roles() == {
+            "agent_" + "1" * 32,
+            "agent_" + "2" * 32,
+        }
+        assert mock_client.containers.list.call_args.kwargs["all"] is True
+
+    def test_live_logins_are_unknown_when_docker_fails(self) -> None:
+        mock_client = MagicMock()
+        mock_client.containers.list.side_effect = docker_errors.DockerException("down")
+        assert self._runner(mock_client).live_login_roles() is None
+
 
 class TestJobContainerRunner:
     """Tests for JobContainerRunner."""

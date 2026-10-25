@@ -465,6 +465,20 @@ class JobContainerRunner:
             logger.warning("Failed to get exit code for job %s: %s", job_id, error)
         return None
 
+    def live_login_roles(self) -> set[str] | None:
+        """Database logins of every agent and chat container Docker lists,
+        running or exited, or None when Docker cannot be asked."""
+        try:
+            containers = self._docker.containers.list(
+                all=True, filters={"label": AGENT_LOGIN_LABEL}
+            )
+        except docker_errors.DockerException as error:
+            logger.warning("Failed to list agent containers: %s", error)
+            return None
+        return {
+            role for container in containers if (role := container.labels.get(AGENT_LOGIN_LABEL))
+        }
+
     def _find_container(self, job_id: str) -> Container | None:
         """Find the agent container for a job by labels."""
         try:

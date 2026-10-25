@@ -11,7 +11,6 @@ import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
-from typing import Any
 
 import uvicorn
 from dotenv import load_dotenv
@@ -19,6 +18,7 @@ from fastapi import FastAPI, Response
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from nicegui import app, ui
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from openscientist.job_manager import JobManager
 from openscientist.security import register_scanner_block_middleware
@@ -313,7 +313,7 @@ def get_job_manager() -> JobManager:
     return _state.job_manager
 
 
-async def _verify_db_connection_and_rls(engine: Any) -> None:
+async def _verify_db_connection_and_rls(engine: AsyncEngine) -> None:
     """Verify database connection, tables, and RLS configuration."""
     from sqlalchemy import text
 
@@ -416,7 +416,7 @@ async def _ensure_default_skill_sources() -> None:
         logger.warning("Failed to seed default skill sources: %s", e)
 
 
-async def _start_background_tasks(engine: Any) -> None:
+async def _start_background_tasks(engine: AsyncEngine) -> None:
     """Start background tasks after database verification."""
     await _verify_db_connection_and_rls(engine)
     await _ensure_default_skill_sources()
@@ -446,6 +446,13 @@ async def _start_background_tasks(engine: Any) -> None:
         logger.info("Execution broker started")
     except Exception as e:
         logger.warning("Failed to start execution broker: %s", e)
+
+    # Drop database logins that agent containers left behind. The first run
+    # follows JobManager's startup cleanup of stale containers.
+    from openscientist.async_tasks import create_background_task
+    from openscientist.job_container.db_login import run_agent_login_reaper
+
+    create_background_task(run_agent_login_reaper(), name="agent-login-reaper", logger=logger)
 
 
 def _initialize_job_manager_runtime(jobs_dir: Path) -> None:
