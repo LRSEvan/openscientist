@@ -10,7 +10,8 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import Coroutine
+from collections.abc import AsyncIterator, Coroutine
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,20 +24,20 @@ from openscientist.container_manager import get_container_manager
 from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.models.job_share import JobShare
-from openscientist.database.rls import set_current_user, use_app_role
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import thread_safe_admin_session, thread_safe_user_session
 from openscientist.exceptions import ProviderError
 from openscientist.job.types import JobInfo, JobStatus, JobStatusUpdateResult
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.ntfy import notify_job_status_change
 from openscientist.orchestrator import create_job
 from openscientist.providers import get_provider
+from openscientist.settings import Settings
 from openscientist.version import get_version_string
 
 logger = logging.getLogger(__name__)
 
 
-def _effective_model(settings: Any) -> str | None:
+def _effective_model(settings: Settings) -> str | None:
     """Resolve the model the active provider will actually use, for recording
     on the job so the UI can show a model badge.
 
@@ -59,12 +60,19 @@ def _effective_model(settings: Any) -> str | None:
 # Database helper functions for async operations
 
 
-async def _apply_rls_context(session: AsyncSession, user_id: UUID | None) -> None:
-    """Apply user-scoped RLS context when a user id is provided."""
+@asynccontextmanager
+async def _job_session(user_id: UUID | None) -> AsyncIterator[AsyncSession]:
+    """The user's session when a user is given, else an admin session.
+
+    Work for no user is system work (worker threads, queue, polls), so it runs
+    through the admin login and never on the web login's own rights.
+    """
     if user_id is None:
+        async with thread_safe_admin_session() as session:
+            yield session
         return
-    await use_app_role(session)
-    await set_current_user(session, user_id)
+    async with thread_safe_user_session(user_id) as session:
+        yield session
 
 
 def _derive_progress_from_db(status: str, current_iteration: int) -> int:
@@ -80,9 +88,11 @@ def _load_progress_from_knowledge_state(
     default_iterations: int,
     default_findings: int,
 ) -> tuple[int, int]:
-    """Load iteration and findings progress from persisted knowledge state."""
+    """Load progress as the admin login, since job lists and polls read it for no user."""
     try:
-        ks = KnowledgeState.load_from_database_sync(job_id).data
+        ks = KnowledgeState.load_from_database_sync(
+            job_id, open_session=thread_safe_admin_session
+        ).data
         findings_count = len(ks.get("findings", []))
         ks_iteration = int(ks.get("iteration", 1))
 
@@ -128,9 +138,7 @@ async def _db_create_job(
     Returns:
         The created JobModel instance
     """
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, owner_id)
-
+    async with _job_session(owner_id) as session:
         job = JobModel(
             id=UUID(job_id),
             owner_id=owner_id,
@@ -156,13 +164,10 @@ async def _db_create_job(
 async def _db_get_job(job_id: str, user_id: UUID | None = None) -> JobModel | None:
     """Get a job from the database (thread-safe for worker threads).
 
-    When user_id is provided, drops to openscientist_app role so RLS policies
-    are enforced. Without user_id, runs as the connection user (superuser)
-    which bypasses RLS — use only for internal/system operations.
+    With user_id, RLS limits the result to what that user may see. Without it,
+    this is system work and runs as the admin login.
     """
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).where(JobModel.id == UUID(job_id))
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
@@ -173,9 +178,7 @@ async def _db_get_share_permission(job_id: str, user_id: UUID) -> str | None:
 
     Returns 'view', 'edit', or None if the user has no share.
     """
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobShare.permission_level).where(
             JobShare.job_id == UUID(job_id),
             JobShare.shared_with_user_id == user_id,
@@ -198,9 +201,7 @@ async def _db_update_job_status(
     """
     result = JobStatusUpdateResult()
 
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).where(JobModel.id == UUID(job_id))
         db_result = await session.execute(stmt)
         job = db_result.scalar_one_or_none()
@@ -212,22 +213,34 @@ async def _db_update_job_status(
             if cancellation_reason:
                 job.cancellation_reason = cancellation_reason
             await session.commit()
+            await _fill_notification_target(session, job, result)
 
-            result.owner_id = str(job.owner_id) if job.owner_id else None
-            result.job_title = job.short_title or job.research_question
-            result.current_iteration = job.current_iteration
+    return result
 
-            # Fetch owner's ntfy settings for notifications
-            if job.owner_id:
-                user_stmt = select(User.ntfy_enabled, User.ntfy_topic).where(
-                    User.id == job.owner_id
-                )
-                user_result = await session.execute(user_stmt)
-                user_row = user_result.first()
-                if user_row:
-                    result.ntfy_enabled = user_row.ntfy_enabled
-                    result.ntfy_topic = user_row.ntfy_topic
 
+async def _fill_notification_target(
+    session: AsyncSession, job: JobModel, result: JobStatusUpdateResult
+) -> None:
+    """Copy the job fields a notification shows and the owner's ntfy settings."""
+    result.owner_id = str(job.owner_id) if job.owner_id else None
+    result.job_title = job.short_title or job.research_question
+    result.current_iteration = job.current_iteration
+    if job.owner_id:
+        user_stmt = select(User.ntfy_enabled, User.ntfy_topic).where(User.id == job.owner_id)
+        user_row = (await session.execute(user_stmt)).first()
+        if user_row:
+            result.ntfy_enabled = user_row.ntfy_enabled
+            result.ntfy_topic = user_row.ntfy_topic
+
+
+async def _db_get_notification_target(job_id: str) -> JobStatusUpdateResult:
+    """Notification data for a status the agent container wrote."""
+    result = JobStatusUpdateResult()
+    async with _job_session(None) as session:
+        stmt = select(JobModel).where(JobModel.id == UUID(job_id))
+        job = (await session.execute(stmt)).scalar_one_or_none()
+        if job:
+            await _fill_notification_target(session, job, result)
     return result
 
 
@@ -237,9 +250,7 @@ async def _db_list_jobs(
     user_id: UUID | None = None,
 ) -> list[JobModel]:
     """List jobs from the database (thread-safe for worker threads)."""
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).order_by(JobModel.created_at.desc())
 
         if status:
@@ -254,9 +265,7 @@ async def _db_list_jobs(
 
 async def _db_delete_job(job_id: str, user_id: UUID | None = None) -> None:
     """Delete a job from the database (thread-safe for worker threads)."""
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).where(JobModel.id == UUID(job_id))
         result = await session.execute(stmt)
         job = result.scalar_one_or_none()
@@ -644,11 +653,15 @@ class JobManager:
             timeout_seconds = get_settings().container.agent_timeout
             timeout_hours = timeout_seconds / 3600
             elapsed = 0
+            last_status = JobStatus.RUNNING
             while elapsed < timeout_seconds:
                 time.sleep(poll_interval)
                 elapsed += poll_interval
                 try:
                     job_info = self._load_job_info(job_id)
+                    if job_info and job_info.status != last_status:
+                        last_status = job_info.status
+                        self._notify_container_transition(job_info)
                     if job_info and job_info.status.value in terminal_statuses:
                         logger.info(
                             "Container job %s reached terminal status: %s",
@@ -965,29 +978,63 @@ class JobManager:
         cancellation_reason: str | None = None,
     ) -> None:
         """Update job status in the database."""
-        ntfy_result: JobStatusUpdateResult | None = None
+        target: JobStatusUpdateResult | None = None
         try:
-            ntfy_result = _run_async(
+            target = _run_async(
                 _db_update_job_status(job_id, status, error_message, None, cancellation_reason)
             )
         except Exception as e:
             logger.error("Failed to update job status in database: %s", e)
+        self._send_status_notification(
+            job_id,
+            status,
+            target,
+            error_message=error_message,
+            cancellation_reason=cancellation_reason,
+        )
 
-        if not ntfy_result or not ntfy_result.ntfy_enabled or not ntfy_result.owner_id:
+    #: Statuses the agent container writes that the owner is told about. The web
+    #: process notifies the ones it writes itself in ``_update_job_status``.
+    _CONTAINER_NOTIFIED_STATUSES: frozenset[JobStatus] = frozenset(
+        {JobStatus.AWAITING_FEEDBACK, JobStatus.COMPLETED, JobStatus.FAILED}
+    )
+
+    def _notify_container_transition(self, job_info: JobInfo) -> None:
+        """Notify a status change the poll saw the agent container write."""
+        if job_info.status not in self._CONTAINER_NOTIFIED_STATUSES:
             return
+        try:
+            target = _run_async(_db_get_notification_target(job_info.job_id))
+        except Exception as e:
+            logger.warning("Failed to load notification target for %s: %s", job_info.job_id, e)
+            return
+        self._send_status_notification(
+            job_info.job_id, job_info.status, target, error_message=job_info.error
+        )
 
-        iterations_completed = _derive_progress_from_db(status.value, ntfy_result.current_iteration)
+    @staticmethod
+    def _send_status_notification(
+        job_id: str,
+        status: JobStatus,
+        target: JobStatusUpdateResult | None,
+        *,
+        error_message: str | None = None,
+        cancellation_reason: str | None = None,
+    ) -> None:
+        if not target or not target.ntfy_enabled or not target.owner_id:
+            return
+        iterations_completed = _derive_progress_from_db(status.value, target.current_iteration)
         try:
             _run_async(
                 notify_job_status_change(
-                    user_id=UUID(ntfy_result.owner_id),
+                    user_id=UUID(target.owner_id),
                     job_id=job_id,
-                    job_title=ntfy_result.job_title or "",
+                    job_title=target.job_title or "",
                     new_status=status.value,
                     error_message=error_message,
                     cancellation_reason=cancellation_reason,
                     iteration=iterations_completed,
-                    ntfy_topic=ntfy_result.ntfy_topic,
+                    ntfy_topic=target.ntfy_topic,
                 )
             )
         except Exception as e:

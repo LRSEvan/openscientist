@@ -13,8 +13,9 @@ switches to openscientist_app, a non-superuser NOLOGIN role subject to RLS.
 """
 
 import logging
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -22,7 +23,7 @@ from sqlalchemy.pool import NullPool
 from openscientist.settings import get_settings
 
 from .engine import get_admin_engine, get_engine
-from .rls import use_app_role
+from .rls import set_current_user, use_app_role
 
 logger = logging.getLogger(__name__)
 
@@ -63,22 +64,24 @@ def _get_admin_session_factory() -> async_sessionmaker[AsyncSession]:
     return _admin_session_factory
 
 
-def _create_fresh_session_factory() -> async_sessionmaker[AsyncSession]:
+def _create_fresh_session_factory(
+    database_url: str | None = None,
+) -> async_sessionmaker[AsyncSession]:
     """Create a fresh session factory for the current event loop.
 
     This creates a new engine with NullPool (no connection pooling)
     for use in worker threads or contexts with different event loops.
     The engine and factory are NOT cached because asyncpg connections
     are bound to the event loop they were created in, and asyncio.run()
-    creates a new event loop each time.
+    creates a new event loop each time. ``database_url`` defaults to the
+    web login's.
     """
     settings = get_settings()
-    database_url = settings.database.effective_database_url
 
     # Create a fresh engine with NullPool - no caching since each
     # asyncio.run() creates a new event loop and connections are loop-bound
     thread_engine = create_async_engine(
-        database_url,
+        database_url or settings.database.effective_database_url,
         poolclass=NullPool,  # No pooling - each connection is fresh
         echo=settings.database.sql_echo,
     )
@@ -89,6 +92,28 @@ def _create_fresh_session_factory() -> async_sessionmaker[AsyncSession]:
         autocommit=False,
         autoflush=False,
     )
+
+
+def thread_safe_admin_session() -> AsyncSession:
+    """An admin session safe for worker threads and their own event loops.
+
+    Connects with ``ADMIN_DATABASE_URL`` (``openscientist_admin``, BYPASSRLS),
+    for system work in the web process that acts for no user.
+    """
+    return _create_fresh_session_factory(get_settings().database.required_admin_database_url())()
+
+
+@asynccontextmanager
+async def thread_safe_user_session(user_id: UUID) -> AsyncIterator[AsyncSession]:
+    """A user's RLS session for worker threads, on its own unpooled engine."""
+    async with _create_fresh_session_factory()() as session:
+        await use_app_role(session)
+        await set_current_user(session, user_id)
+        yield session
+
+
+#: Opens the caller's session inside the coroutine that uses it.
+SessionOpener = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 def async_session_local(thread_safe: bool = False) -> AsyncSession:
@@ -165,8 +190,7 @@ async def get_admin_session() -> AsyncGenerator[AsyncSession, None]:
     Sessions from this factory bypass RLS policies by connecting with
     the openscientist_admin PostgreSQL role which has BYPASSRLS privilege.
 
-    The role is created by docker/postgres/init.sql in production or by
-    the test setup in tests/conftest.py.
+    The role is created by docker/postgres/bootstrap.sql, which conftest also runs.
 
     Use this only for:
     - Background schedulers (no user context available)

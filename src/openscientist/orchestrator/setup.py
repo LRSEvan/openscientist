@@ -11,19 +11,33 @@ import asyncio
 import logging
 import shutil
 import subprocess
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
 from openscientist.async_tasks import create_background_task
 from openscientist.database.models import JobDataFile
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import (
+    SessionOpener,
+    thread_safe_admin_session,
+    thread_safe_user_session,
+)
 from openscientist.file_loader import get_file_info
 from openscientist.knowledge_state import KnowledgeState
 
 logger = logging.getLogger(__name__)
 
 
-def _persist_data_files_to_db(job_id: str, data_paths: list[Path]) -> None:
+def _owner_session(owner_id: str | None) -> SessionOpener:
+    """The owner's session, or the admin login's for a job without an owner."""
+    if owner_id:
+        return partial(thread_safe_user_session, UUID(owner_id))
+    return thread_safe_admin_session
+
+
+def _persist_data_files_to_db(
+    job_id: str, data_paths: list[Path], open_session: SessionOpener
+) -> None:
     """
     Persist copied job data files into ``job_data_files``.
 
@@ -33,11 +47,12 @@ def _persist_data_files_to_db(job_id: str, data_paths: list[Path]) -> None:
     Args:
         job_id: UUID string for the job owning the files.
         data_paths: Absolute paths to files already copied into the job folder.
+        open_session: Opens the session the rows are written in.
     """
     try:
 
         async def _save_data_files() -> None:
-            async with AsyncSessionLocal(thread_safe=True) as session:
+            async with open_session() as session:
                 for data_path in data_paths:
                     file_info = get_file_info(data_path)
                     relative_path = f"data/{data_path.name}"
@@ -93,13 +108,13 @@ def create_job(
         data_files: List of uploaded data file paths
         max_iterations: Maximum number of iterations
         jobs_dir: Base directory for jobs
-        owner_id: UUID string of the job owner. Kept for signature compatibility;
-            ownership is persisted by higher-level DB job creation.
+        owner_id: UUID string of the job owner. The job's rows are written in
+            the owner's session, or as the admin login when there is no owner.
 
     Returns:
         Path to job directory
     """
-    _ = owner_id
+    open_session = _owner_session(owner_id)
     job_dir = jobs_dir / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     # chmod after mkdir because mode= is masked by the process umask.
@@ -141,7 +156,7 @@ def create_job(
             data_paths.append(dest)
 
     if data_paths:
-        _persist_data_files_to_db(job_id, data_paths)
+        _persist_data_files_to_db(job_id, data_paths, open_session)
 
     ks = KnowledgeState(
         job_id=job_id,
@@ -162,8 +177,7 @@ def create_job(
     else:
         ks.set_data_summary({"files": [], "file_type": "none", "file_size_mb": 0})
 
-    owner_uuid = UUID(owner_id) if owner_id else None
-    ks.save_to_database_sync(job_id, owner_uuid)
+    ks.save_to_database_sync(job_id, open_session=open_session)
 
     logger.info("Created job %s at %s", job_id, job_dir)
     return job_dir

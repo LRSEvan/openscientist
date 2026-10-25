@@ -1,5 +1,6 @@
 """Tests for job_manager module."""
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -451,6 +452,89 @@ class TestJobManagerStatusUpdate:
             manager._update_job_status(job_id, JobStatus.FAILED)
 
         assert mock_update.await_args.args[1] == JobStatus.FAILED
+
+
+class TestContainerStatusNotifications:
+    """The web poll of a running container sends the notifications for the
+    transitions the container writes, so the container never reads users."""
+
+    def _run(
+        self,
+        tmp_path: Path,
+        statuses: list[tuple[JobStatus, str | None]],
+    ) -> list[Mapping[str, object]]:
+        manager = _new_manager(tmp_path)
+        job_id = str(uuid4())
+        owner_id = uuid4()
+        polls = [
+            JobInfo(
+                job_id=job_id,
+                research_question="Q?",
+                status=status,
+                created_at="2026-02-01T00:00:00+00:00",
+                error=error,
+            )
+            for status, error in statuses
+        ]
+        target = JobStatusUpdateResult(
+            ntfy_enabled=True,
+            ntfy_topic="topic-1",
+            owner_id=str(owner_id),
+            job_title="Boiling water",
+            current_iteration=3,
+        )
+        runner = MagicMock()
+        runner.get_exit_code.return_value = None
+        notify = AsyncMock(return_value=True)
+        with (
+            patch("openscientist.job_container.JobContainerRunner", return_value=runner),
+            patch("openscientist.job_manager.time.sleep"),
+            patch(
+                "openscientist.settings.get_settings",
+                return_value=SimpleNamespace(container=SimpleNamespace(agent_timeout=3600)),
+            ),
+            patch.object(manager, "_load_job_info", side_effect=polls),
+            patch.object(manager, "_start_next_queued_job"),
+            patch(
+                "openscientist.job_manager._db_update_job_status",
+                new_callable=AsyncMock,
+                return_value=target,
+            ),
+            patch(
+                "openscientist.job_manager._db_get_notification_target",
+                new_callable=AsyncMock,
+                return_value=target,
+            ),
+            patch("openscientist.job_manager.notify_job_status_change", notify),
+        ):
+            manager._run_job_in_container(job_id)
+        return [call.kwargs for call in notify.await_args_list]
+
+    def test_feedback_wait_and_completion_notify_once_each(self, tmp_path):
+        sent = self._run(
+            tmp_path,
+            [
+                (JobStatus.RUNNING, None),
+                (JobStatus.AWAITING_FEEDBACK, None),
+                (JobStatus.AWAITING_FEEDBACK, None),
+                (JobStatus.RUNNING, None),
+                (JobStatus.COMPLETED, None),
+            ],
+        )
+        assert [s["new_status"] for s in sent] == ["running", "awaiting_feedback", "completed"]
+        # Iteration 3 is already current while the loop waits after iteration 2.
+        assert sent[1]["iteration"] == 2
+        assert sent[1]["ntfy_topic"] == "topic-1"
+
+    def test_a_failure_written_by_the_container_notifies_with_its_error(self, tmp_path):
+        sent = self._run(tmp_path, [(JobStatus.FAILED, "Report generation failed: boom")])
+        assert [s["new_status"] for s in sent] == ["running", "failed"]
+        assert sent[1]["error_message"] == "Report generation failed: boom"
+
+    def test_a_cancellation_is_not_notified_twice(self, tmp_path):
+        """cancel_job already notified when it wrote the status."""
+        sent = self._run(tmp_path, [(JobStatus.CANCELLED, None)])
+        assert [s["new_status"] for s in sent] == ["running"]
 
 
 class TestJobManagerKSProgress:

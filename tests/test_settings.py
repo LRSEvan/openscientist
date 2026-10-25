@@ -560,12 +560,15 @@ class TestDatabaseSettings:
         settings = DatabaseSettings(DATABASE_URL="postgresql+asyncpg://user:pass@host:5432/db")
         assert settings.effective_database_url == "postgresql+asyncpg://user:pass@host:5432/db"
 
-    def test_admin_url_falls_back_to_database_url(self, monkeypatch, tmp_path):
-        """Admin URL falls back to DATABASE_URL when not set."""
+    def test_missing_admin_url_is_refused(self, monkeypatch, tmp_path):
+        """Admin sessions bypass RLS, so falling back to DATABASE_URL would run
+        them under the app login. Agent containers load these settings without
+        the admin URL, so only asking for it fails."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("ADMIN_DATABASE_URL", raising=False)
         settings = DatabaseSettings(DATABASE_URL="postgresql+asyncpg://user:pass@host:5432/db")
-        assert settings.effective_admin_database_url == settings.database_url
+        with pytest.raises(ValueError, match="ADMIN_DATABASE_URL"):
+            settings.required_admin_database_url()
 
     def test_admin_url_used_when_set(self, monkeypatch, tmp_path):
         """Admin URL is used when explicitly set."""
@@ -575,7 +578,7 @@ class TestDatabaseSettings:
             ADMIN_DATABASE_URL="postgresql+asyncpg://admin:pass@host:5432/db",
         )
         assert (
-            settings.effective_admin_database_url == "postgresql+asyncpg://admin:pass@host:5432/db"
+            settings.required_admin_database_url() == "postgresql+asyncpg://admin:pass@host:5432/db"
         )
 
     def test_sql_echo_default_false(self):

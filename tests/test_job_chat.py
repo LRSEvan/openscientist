@@ -299,7 +299,7 @@ async def test_load_job_context_empty_dir():
     """Test loading context when no knowledge state exists in the DB."""
     job_id = "not-a-valid-uuid"
 
-    context = await load_job_context(job_id)
+    context = await load_job_context(job_id, AsyncMock())
 
     # Should return empty or minimal context
     assert isinstance(context, str)
@@ -316,10 +316,10 @@ async def test_load_job_context_with_knowledge_state_config():
     ks = KnowledgeState(job_id, "What is the crystal structure?", 10)
 
     with patch(
-        "openscientist.job_chat.KnowledgeState.load_from_database_sync",
-        return_value=ks,
+        "openscientist.job_chat.KnowledgeState.load_from_database",
+        AsyncMock(return_value=ks),
     ):
-        context = await load_job_context(job_id)
+        context = await load_job_context(job_id, AsyncMock())
 
     assert "What is the crystal structure?" in context
     assert "Research Question" in context
@@ -370,10 +370,10 @@ async def test_load_job_context_with_knowledge_state():
     ]
 
     with patch(
-        "openscientist.job_chat.KnowledgeState.load_from_database_sync",
-        return_value=ks,
+        "openscientist.job_chat.KnowledgeState.load_from_database",
+        AsyncMock(return_value=ks),
     ):
-        context = await load_job_context(job_id)
+        context = await load_job_context(job_id, AsyncMock())
 
     # Check findings are included
     assert "The protein shows high binding affinity" in context
@@ -414,10 +414,10 @@ async def test_load_job_context_supports_modern_knowledge_state_keys():
     ]
 
     with patch(
-        "openscientist.job_chat.KnowledgeState.load_from_database_sync",
-        return_value=ks,
+        "openscientist.job_chat.KnowledgeState.load_from_database",
+        AsyncMock(return_value=ks),
     ):
-        context = await load_job_context(job_id)
+        context = await load_job_context(job_id, AsyncMock())
     assert "Modern finding title" in context
     assert "Modern hypothesis statement" in context
 
@@ -606,8 +606,8 @@ async def test_build_chat_request_keeps_system_prompt_small(
     with (
         patch("openscientist.providers.get_provider", return_value=_ChatProvider()),
         patch(
-            "openscientist.job_chat.KnowledgeState.load_from_database_sync",
-            return_value=large_ks,
+            "openscientist.job_chat.KnowledgeState.load_from_database",
+            AsyncMock(return_value=large_ks),
         ),
     ):
         request = await _build_chat_request(db_session, test_job.id, "Summarize findings")

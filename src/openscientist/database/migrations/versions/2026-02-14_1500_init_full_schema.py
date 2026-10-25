@@ -1701,7 +1701,7 @@ def upgrade() -> None:
         DO $$
         BEGIN
             IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'openscientist_admin') THEN
-                CREATE ROLE openscientist_admin WITH LOGIN PASSWORD 'openscientist_dev_password' BYPASSRLS;
+                CREATE ROLE openscientist_admin WITH LOGIN BYPASSRLS;
             END IF;
         END
         $$

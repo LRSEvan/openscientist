@@ -93,15 +93,7 @@ reset-db:
 		set -e; \
 		echo "Stopping containers and removing volumes..."; \
 		docker compose -f $(COMPOSE_FILE) down -v --remove-orphans; \
-		echo "Starting postgres..."; \
-		docker compose -f $(COMPOSE_FILE) up -d postgres; \
-		echo "Waiting for postgres to be ready..."; \
-		until docker compose -f $(COMPOSE_FILE) exec -T postgres pg_isready -U $${POSTGRES_USER:-openscientist} -d $${POSTGRES_DB:-openscientist} >/dev/null 2>&1; do \
-			sleep 1; \
-		done; \
-		echo "Running migrations..."; \
-		docker compose -f $(COMPOSE_FILE) run --rm --no-deps openscientist alembic upgrade head; \
-		echo "Starting application..."; \
+		echo "Starting the database, its logins, the migrations and the application..."; \
 		docker compose -f $(COMPOSE_FILE) up -d --remove-orphans openscientist; \
 		echo "Database reset complete!"; \
 	else \
@@ -143,11 +135,8 @@ deploy:
 		echo '.env already exists - preserving existing configuration'; \
 	fi"
 	@echo ""
-	@echo "Step 3: Building and restarting application on $(DEPLOY_HOST)..."
+	@echo "Step 3: Building, migrating and restarting application on $(DEPLOY_HOST)..."
 	@ssh $(DEPLOY_HOST) "cd $(DEPLOY_DIR) && make rebuild"
-	@echo ""
-	@echo "Step 4: Running database migrations on $(DEPLOY_HOST)..."
-	@ssh $(DEPLOY_HOST) "cd $(DEPLOY_DIR) && docker compose exec openscientist alembic upgrade head"
 	@echo ""
 	@echo "========================================="
 	@echo "Deployment complete!"

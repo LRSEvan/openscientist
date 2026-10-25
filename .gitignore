@@ -38,6 +38,8 @@ env/
 
 # Environment variables
 .env
+.env.db
+.env.owner
 .env.backup-*
 
 # Locally built codex binary for ad-hoc validation. The images build codex

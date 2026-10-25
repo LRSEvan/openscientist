@@ -10,18 +10,18 @@
 
 ⚠️ **Required before running tests or the application**
 
-Create a `.env` file with database configuration:
+Create the env files with database configuration:
 
 ```bash
-# Copy the example environment file
+# Copy the example environment files, then fill in every password
 cp .env.example .env
+cp .env.db.example .env.db        # superuser, read only by postgres and db-bootstrap
+cp .env.owner.example .env.owner  # schema owner, read only by db-bootstrap and migrate
 
-# Edit .env and uncomment the DATABASE_URL line
-# For local development, use:
-# DATABASE_URL=postgresql+asyncpg://openscientist:openscientist_dev_password@localhost:5434/openscientist
-
-# Start the database with Docker
+# Start the database, create its logins and migrate as the owner
 docker compose -f docker-compose.yml up -d postgres
+docker compose -f docker-compose.yml run --rm db-bootstrap
+uv run alembic upgrade head
 ```
 
 See the README for provider-specific settings if you need to configure Claude API access.

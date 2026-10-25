@@ -9,18 +9,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from functools import partial
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
 
 from sqlalchemy import select
 
-from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
-from openscientist.database.session import AsyncSessionLocal
-from openscientist.job.types import JobStatus
+from openscientist.database.session import AsyncSessionLocal, SessionOpener
 from openscientist.knowledge_state import KnowledgeState
-from openscientist.ntfy import notify_job_status_change
 from openscientist.prompts.common import namespace_tool_mentions
 
 logger = logging.getLogger(__name__)
@@ -411,108 +409,44 @@ async def _persist_job_status(
     job_uuid: UUID,
     status: str,
     error_message: str | None,
-) -> tuple[str | None, UUID | None, str | None, int, bool, str | None] | None:
-    old_status: str | None = None
-    owner_id: UUID | None = None
-    job_title: str | None = None
-    current_iteration = 1
-    ntfy_enabled = False
-    ntfy_topic: str | None = None
-
+    open_session: SessionOpener,
+) -> None:
     try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+        async with open_session() as session:
             job_result = await session.execute(select(JobModel).where(JobModel.id == job_uuid))
             job = job_result.scalar_one_or_none()
             if job is None:
                 logger.warning("Cannot update status for missing job %s", job_id)
-                return None
-
-            old_status = job.status
-            if old_status != status:
-                job.status = status
-                await session.flush()
+                return
+            job.status = status
             if error_message:
                 job.error_message = error_message
-
-            owner_id = job.owner_id
-            job_title = job.short_title or job.research_question
-            try:
-                current_iteration = int(job.current_iteration)
-                if current_iteration < 1:
-                    current_iteration = 1
-            except (TypeError, ValueError):
-                current_iteration = 1
-
-            if owner_id is not None:
-                user_result = await session.execute(
-                    select(User.ntfy_enabled, User.ntfy_topic).where(User.id == owner_id)
-                )
-                user_row = user_result.first()
-                if user_row:
-                    ntfy_enabled = bool(user_row.ntfy_enabled)
-                    ntfy_topic = user_row.ntfy_topic
-
             await session.commit()
     except Exception as e:
         logger.warning("Failed to update status for job %s: %s", job_id, e)
-        return None
-
-    return old_status, owner_id, job_title, current_iteration, ntfy_enabled, ntfy_topic
-
-
-def _should_notify_awaiting_feedback(
-    *,
-    status: str,
-    old_status: str | None,
-    owner_id: UUID | None,
-    ntfy_enabled: bool,
-    job_title: str | None,
-) -> bool:
-    if status != JobStatus.AWAITING_FEEDBACK or old_status == JobStatus.AWAITING_FEEDBACK:
-        return False
-    return bool(owner_id and ntfy_enabled and job_title)
 
 
 async def update_job_status(
     job_dir: Path,
     status: str,
     error_message: str | None = None,
+    *,
+    open_session: SessionOpener | None = None,
 ) -> None:
-    """Update job status in the database and notify on feedback wait transitions."""
+    """Update job status in ``open_session``, else the process's own login, and notify the owner."""
     job_id = job_dir.name
 
     job_uuid = _parse_job_uuid(job_id)
     if job_uuid is None:
         return
 
-    db_result = await _persist_job_status(job_id, job_uuid, status, error_message)
-    if db_result is None:
-        return
-
-    old_status, owner_id, job_title, current_iteration, ntfy_enabled, ntfy_topic = db_result
-    if not _should_notify_awaiting_feedback(
-        status=status,
-        old_status=old_status,
-        owner_id=owner_id,
-        ntfy_enabled=ntfy_enabled,
-        job_title=job_title,
-    ):
-        return
-
-    if owner_id is None or not job_title:
-        return
-
-    try:
-        await notify_job_status_change(
-            user_id=owner_id,
-            job_id=job_id,
-            job_title=job_title,
-            new_status="awaiting_feedback",
-            iteration=current_iteration,
-            ntfy_topic=ntfy_topic,
-        )
-    except Exception as e:
-        logger.warning("Failed to send awaiting_feedback notification for %s: %s", job_id, e)
+    await _persist_job_status(
+        job_id,
+        job_uuid,
+        status,
+        error_message,
+        open_session or partial(AsyncSessionLocal, thread_safe=True),
+    )
 
 
 async def wait_for_feedback_or_timeout(

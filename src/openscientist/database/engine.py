@@ -7,9 +7,9 @@ Engine Types:
     - app_engine: Standard connection with limited privileges, subject to RLS policies
     - admin_engine: Elevated connection that bypasses RLS (via PostgreSQL role)
 
-For the dual-engine pattern to work properly, ADMIN_DATABASE_URL should connect
-with a PostgreSQL role that has elevated privileges (table owner or role with
-BYPASSRLS). If not configured, falls back to the regular DATABASE_URL.
+ADMIN_DATABASE_URL must connect with a PostgreSQL role that has elevated
+privileges (table owner or role with BYPASSRLS). The admin engine refuses to
+start without it.
 """
 
 from dotenv import load_dotenv
@@ -84,7 +84,7 @@ def get_admin_engine() -> AsyncEngine:
 
     if _admin_engine is None:
         settings = get_settings()
-        database_url = settings.database.effective_admin_database_url
+        database_url = settings.database.required_admin_database_url()
 
         _admin_engine = create_async_engine(
             database_url,

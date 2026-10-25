@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from docker import errors as docker_errors
+from openscientist.job_container.db_login import AGENT_LOGIN_LABEL, AgentLogin
 from openscientist.job_container.runner import (
     AGENT_APP_DIR,
     AGENT_GCP_CREDENTIALS_PATH,
@@ -49,6 +50,140 @@ def _fake_provider():
         yield
 
 
+_LOGIN = AgentLogin(
+    role="agent_" + "0" * 32,
+    database_url="postgresql+asyncpg://agent_x:login-pw@postgres:5432/db",
+)
+
+
+@pytest.fixture(autouse=True)
+def agent_login():
+    """Stand in for the database: every launch gets ``_LOGIN``."""
+    with (
+        patch("openscientist.job_container.runner.open_agent_login", return_value=_LOGIN) as opened,
+        patch("openscientist.job_container.runner.close_agent_login") as closed,
+    ):
+        yield SimpleNamespace(opened=opened, closed=closed)
+
+
+class TestContainerDatabaseLogin:
+    """Each agent container reaches the database through its own login, which
+    is given back when that container ends."""
+
+    @staticmethod
+    def _settings() -> SimpleNamespace:
+        provider = MagicMock()
+        provider.get_container_env_vars.return_value = {}
+        provider.codex_auth_host_path = None
+        provider.gcp_credentials_host_path = None
+        provider.provider_id = "anthropic"
+        return SimpleNamespace(
+            container=SimpleNamespace(
+                host_project_dir=None,
+                container_app_dir="/app",
+                agent_network=None,
+                agent_memory="8g",
+                agent_cpu=2.0,
+                agent_platform=None,
+                agent_image="openscientist-agent:latest",
+                agent_timeout=14400,
+            ),
+            provider=provider,
+            database=SimpleNamespace(
+                effective_database_url="postgresql+asyncpg://web:web-pw@postgres:5432/db"
+            ),
+            phenix=SimpleNamespace(phenix_host_path=None),
+            secret_key="master-key",
+            airgap=SimpleNamespace(enabled=False),
+        )
+
+    def _runner(self, mock_client: MagicMock) -> JobContainerRunner:
+        with patch("openscientist.job_container.runner.docker.from_env", return_value=mock_client):
+            return JobContainerRunner()
+
+    def _launch_patches(self):
+        return (
+            patch("openscientist.job_container.runner.get_settings", return_value=self._settings()),
+            patch.object(JobContainerRunner, "_get_network", return_value="bridge"),
+            patch(
+                "openscientist.job_container.runner.to_host_path",
+                return_value=Path("/app/jobs/job-123"),
+            ),
+            patch(
+                "openscientist.agent.factory.agent_class_for_provider_id", return_value=MagicMock()
+            ),
+        )
+
+    def test_the_container_gets_its_own_login_and_never_the_web_one(self, agent_login) -> None:
+        mock_client = MagicMock()
+        a, b, c, d = self._launch_patches()
+        with a, b, c, d:
+            self._runner(mock_client).launch("job-123", Path("/app/jobs/job-123"))
+        kwargs = mock_client.containers.run.call_args.kwargs
+        assert kwargs["environment"]["DATABASE_URL"] == _LOGIN.database_url
+        assert not any("web-pw" in value for value in kwargs["environment"].values())
+        assert kwargs["labels"][AGENT_LOGIN_LABEL] == _LOGIN.role
+        agent_login.opened.assert_called_once_with("job-123", lifetime_seconds=14400)
+
+    def test_no_container_starts_without_its_login(self, agent_login) -> None:
+        agent_login.opened.side_effect = RuntimeError("cannot create role")
+        mock_client = MagicMock()
+        a, b, c, d = self._launch_patches()
+        with a, b, c, d, pytest.raises(RuntimeError, match="cannot create role"):
+            self._runner(mock_client).launch("job-123", Path("/app/jobs/job-123"))
+        mock_client.containers.run.assert_not_called()
+
+    def test_a_container_that_fails_to_start_gives_its_login_back(self, agent_login) -> None:
+        mock_client = MagicMock()
+        mock_client.containers.run.side_effect = docker_errors.APIError("no such image")
+        a, b, c, d = self._launch_patches()
+        with a, b, c, d, pytest.raises(docker_errors.APIError):
+            self._runner(mock_client).launch("job-123", Path("/app/jobs/job-123"))
+        agent_login.closed.assert_called_once_with(_LOGIN.role)
+
+    def test_cleanup_gives_back_the_login_of_the_removed_container(self, agent_login) -> None:
+        """Startup cleanup uses a fresh runner, so the login name comes from the
+        container's label and not from runner state."""
+        container = MagicMock()
+        container.labels = {AGENT_LOGIN_LABEL: _LOGIN.role}
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = [container]
+        self._runner(mock_client).cleanup("job-123")
+        container.remove.assert_called_once_with(force=True)
+        agent_login.closed.assert_called_once_with(_LOGIN.role)
+
+    def test_a_failed_chat_turn_gives_its_login_back(self, agent_login) -> None:
+        container = MagicMock()
+        container.labels = {AGENT_LOGIN_LABEL: _LOGIN.role}
+        container.wait.return_value = {"StatusCode": 1}
+        container.logs.return_value = b"boom"
+        mock_client = MagicMock()
+        mock_client.containers.run.return_value = container
+        a, b, c, d = self._launch_patches()
+        with a, b, c, d, pytest.raises(RuntimeError, match="exited with code 1"):
+            self._runner(mock_client).run_chat_turn("job-123", Path("/app/jobs/job-123"))
+        agent_login.opened.assert_called_once_with("job-123", lifetime_seconds=300)
+        agent_login.closed.assert_called_once_with(_LOGIN.role)
+
+    def test_live_logins_are_the_labels_of_every_listed_container(self) -> None:
+        """Exited containers count too, since their teardown has yet to run."""
+        running, exited = MagicMock(), MagicMock()
+        running.labels = {AGENT_LOGIN_LABEL: "agent_" + "1" * 32}
+        exited.labels = {AGENT_LOGIN_LABEL: "agent_" + "2" * 32}
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = [running, exited]
+        assert self._runner(mock_client).live_login_roles() == {
+            "agent_" + "1" * 32,
+            "agent_" + "2" * 32,
+        }
+        assert mock_client.containers.list.call_args.kwargs["all"] is True
+
+    def test_live_logins_are_unknown_when_docker_fails(self) -> None:
+        mock_client = MagicMock()
+        mock_client.containers.list.side_effect = docker_errors.DockerException("down")
+        assert self._runner(mock_client).live_login_roles() is None
+
+
 class TestJobContainerRunner:
     """Tests for JobContainerRunner."""
 
@@ -71,6 +206,7 @@ class TestJobContainerRunner:
                 agent_cpu=2.0,
                 agent_platform=None,
                 agent_image=agent_image,
+                agent_timeout=14400,
             ),
             provider=provider,
             database=SimpleNamespace(effective_database_url="postgresql://db"),
@@ -615,7 +751,11 @@ class TestJobSecretInjection:
         """The injected key is HMAC(master, "job_secret:" + job_id), not the master."""
         settings = self._settings(master="master-key")
         env = JobContainerRunner._build_container_environment(
-            cast(Settings, settings), job_id="job-1", job_mount="/agent/jobs/job-1", provider_env={}
+            cast(Settings, settings),
+            job_id="job-1",
+            job_mount="/agent/jobs/job-1",
+            provider_env={},
+            database_url="postgresql://agent",
         )
         expected = hmac.new(b"master-key", b"job_secret:job-1", hashlib.sha256).hexdigest()
         assert env["OPENSCIENTIST_SECRET_KEY"] == expected
@@ -629,12 +769,14 @@ class TestJobSecretInjection:
             job_id="job-a",
             job_mount="/agent/jobs/job-a",
             provider_env={},
+            database_url="postgresql://agent",
         )
         env_b = JobContainerRunner._build_container_environment(
             cast(Settings, settings),
             job_id="job-b",
             job_mount="/agent/jobs/job-b",
             provider_env={},
+            database_url="postgresql://agent",
         )
         secret_a = env_a["OPENSCIENTIST_SECRET_KEY"]
         secret_b = env_b["OPENSCIENTIST_SECRET_KEY"]
@@ -660,7 +802,11 @@ class TestJobSecretInjection:
         """The container env carries a per-job exec placeholder and the broker URL."""
         settings = self._settings(master="master-key")
         env = JobContainerRunner._build_container_environment(
-            cast(Settings, settings), job_id="job-x", job_mount="/agent/jobs/job-x", provider_env={}
+            cast(Settings, settings),
+            job_id="job-x",
+            job_mount="/agent/jobs/job-x",
+            provider_env={},
+            database_url="postgresql://agent",
         )
         assert env["OPENSCIENTIST_EXEC_TOKEN"] == make_exec_placeholder("master-key", "job-x")
         assert env["OPENSCIENTIST_EXEC_TOKEN"].startswith("job-x.")
@@ -689,6 +835,7 @@ class TestAirgapFirewallLaunch:
                 agent_cpu=2.0,
                 agent_platform=None,
                 agent_image="openscientist-agent:latest",
+                agent_timeout=14400,
             ),
             provider=provider,
             database=SimpleNamespace(
@@ -788,6 +935,7 @@ class TestChatTurnLaunch:
                 agent_cpu=2.0,
                 agent_platform=None,
                 agent_image="openscientist-agent:latest",
+                agent_timeout=14400,
             ),
             provider=provider,
             database=SimpleNamespace(

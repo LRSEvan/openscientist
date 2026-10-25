@@ -17,8 +17,8 @@ import openscientist.database.session as session_module
 from openscientist.database.engine import get_engine
 from openscientist.database.models import Job, User
 from openscientist.database.rls import set_current_user
-from openscientist.database.session import AsyncSessionLocal, get_session_ctx
-from openscientist.job_manager import _apply_rls_context
+from openscientist.database.session import get_session_ctx
+from openscientist.job_manager import _job_session
 
 _WHO = text("SELECT current_user, current_setting('app.current_user_id', true)")
 
@@ -95,8 +95,7 @@ async def test_get_session_stays_under_rls_after_a_commit(two_owners: _TwoOwners
 async def test_a_thread_safe_user_session_stays_under_rls_after_a_commit(
     two_owners: _TwoOwners,
 ) -> None:
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, two_owners.alice)
+    async with _job_session(two_owners.alice) as session:
         await session.commit()
         assert await _visible_jobs(session, two_owners) == {two_owners.alice_job}
         who = tuple((await session.execute(_WHO)).one())

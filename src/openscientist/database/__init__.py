@@ -7,8 +7,9 @@ Dual-Engine Pattern:
     - get_session(): Standard session with RLS enforced by PostgreSQL role
     - get_admin_session(): Admin session that bypasses RLS via BYPASSRLS role
 
-For production deployments, configure ADMIN_DATABASE_URL with a PostgreSQL
-role that has the BYPASSRLS privilege (created by docker/postgres/init.sql).
+ADMIN_DATABASE_URL must name a PostgreSQL role that has the BYPASSRLS privilege
+(created by docker/postgres/bootstrap.sql). Admin sessions never fall back to
+DATABASE_URL.
 """
 
 from .base import Base, UUIDv7Mixin

@@ -365,7 +365,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Research with hypotheses",
@@ -382,7 +382,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Research without hypotheses",
@@ -400,7 +400,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Default hypotheses test",
@@ -416,7 +416,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Research with model metadata",

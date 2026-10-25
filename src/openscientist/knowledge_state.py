@@ -19,8 +19,7 @@ from openscientist.database.models.hypothesis import Hypothesis
 from openscientist.database.models.iteration_summary import IterationSummary
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.models.literature import Literature
-from openscientist.database.rls import set_current_user
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import AsyncSessionLocal, SessionOpener
 
 KS_FILENAME = "knowledge_state.json"
 
@@ -779,16 +778,8 @@ class KnowledgeState:
 
     # Database persistence methods
 
-    async def _save_to_database_with_session(
-        self,
-        session: AsyncSession,
-        job_id: str,
-        user_id: UUID | None = None,
-    ) -> None:
+    async def _save_to_database_with_session(self, session: AsyncSession, job_id: str) -> None:
         """Persist knowledge-state rows using an existing session."""
-        if user_id:
-            await set_current_user(session, user_id)
-
         job_uuid = UUID(job_id)
         await self._update_job_record(session, job_uuid)
         await self._upsert_hypotheses(session, job_uuid)
@@ -1029,12 +1020,7 @@ class KnowledgeState:
                 )
             )
 
-    async def save_to_database(
-        self,
-        job_id: str,
-        user_id: UUID | None = None,
-        session: AsyncSession | None = None,
-    ) -> None:
+    async def save_to_database(self, job_id: str, session: AsyncSession | None = None) -> None:
         """
         Save knowledge state to database tables.
 
@@ -1043,43 +1029,50 @@ class KnowledgeState:
 
         Args:
             job_id: Job ID (UUID string)
-            user_id: User ID for RLS context (optional)
+            session: The caller's session, whose role decides which rows the
+                save may reach. Without one, the process's own login is used,
+                which in the agent container is the container's job login.
         """
         if session is None:
-            async with AsyncSessionLocal(thread_safe=True) as session:
-                await self._save_to_database_with_session(session, job_id, user_id)
-                await session.commit()
+            async with AsyncSessionLocal(thread_safe=True) as own_session:
+                await self._save_to_database_with_session(own_session, job_id)
+                await own_session.commit()
             return
 
-        await self._save_to_database_with_session(session, job_id, user_id)
+        await self._save_to_database_with_session(session, job_id)
         await session.commit()
 
     @classmethod
-    async def load_from_database(cls, job_id: str, user_id: UUID | None = None) -> "KnowledgeState":
+    async def load_from_database(
+        cls, job_id: str, session: AsyncSession | None = None
+    ) -> "KnowledgeState":
         """
         Load knowledge state from database tables.
 
         Args:
             job_id: Job ID (UUID string)
-            user_id: User ID for RLS context (optional)
+            session: The caller's session, as for :meth:`save_to_database`.
 
         Returns:
             KnowledgeState instance populated from database
         """
-        async with AsyncSessionLocal(thread_safe=True) as session:
-            if user_id:
-                await set_current_user(session, user_id)
+        if session is None:
+            async with AsyncSessionLocal(thread_safe=True) as own_session:
+                return await cls._load_with_session(own_session, job_id)
+        return await cls._load_with_session(session, job_id)
 
-            job_uuid = UUID(job_id)
-            job = await cls._load_job_or_raise(session, job_id, job_uuid)
-            ks = cls._new_from_job_record(job_id, job)
-            await cls._load_hypotheses(session, job_uuid, ks)
-            await cls._load_findings(session, job_uuid, ks)
-            await cls._load_literature(session, job_uuid, ks)
-            await cls._load_analysis_log(session, job_uuid, ks)
-            await cls._load_iteration_summaries(session, job_uuid, ks)
-            await cls._load_feedback_history(session, job_uuid, ks)
-            return ks
+    @classmethod
+    async def _load_with_session(cls, session: AsyncSession, job_id: str) -> "KnowledgeState":
+        job_uuid = UUID(job_id)
+        job = await cls._load_job_or_raise(session, job_id, job_uuid)
+        ks = cls._new_from_job_record(job_id, job)
+        await cls._load_hypotheses(session, job_uuid, ks)
+        await cls._load_findings(session, job_uuid, ks)
+        await cls._load_literature(session, job_uuid, ks)
+        await cls._load_analysis_log(session, job_uuid, ks)
+        await cls._load_iteration_summaries(session, job_uuid, ks)
+        await cls._load_feedback_history(session, job_uuid, ks)
+        return ks
 
     @classmethod
     async def _load_job_or_raise(
@@ -1258,15 +1251,30 @@ class KnowledgeState:
                 }
             )
 
-    def save_to_database_sync(self, job_id: str, user_id: UUID | None = None) -> None:
-        """Synchronous wrapper for save_to_database."""
+    def save_to_database_sync(self, job_id: str, open_session: SessionOpener | None = None) -> None:
+        """Run save_to_database in ``open_session``, opened inside the wrapper's own loop."""
         from openscientist.async_tasks import run_sync
 
-        run_sync(self.save_to_database(job_id, user_id))
+        async def save() -> None:
+            if open_session is None:
+                await self.save_to_database(job_id)
+                return
+            async with open_session() as session:
+                await self.save_to_database(job_id, session)
+
+        run_sync(save())
 
     @classmethod
-    def load_from_database_sync(cls, job_id: str, user_id: UUID | None = None) -> "KnowledgeState":
-        """Synchronous wrapper for load_from_database."""
+    def load_from_database_sync(
+        cls, job_id: str, open_session: SessionOpener | None = None
+    ) -> "KnowledgeState":
+        """Run load_from_database in ``open_session``, opened inside the wrapper's own loop."""
         from openscientist.async_tasks import run_sync
 
-        return run_sync(cls.load_from_database(job_id, user_id))
+        async def load() -> "KnowledgeState":
+            if open_session is None:
+                return await cls.load_from_database(job_id)
+            async with open_session() as session:
+                return await cls.load_from_database(job_id, session)
+
+        return run_sync(load())

@@ -12,8 +12,9 @@ import os
 import re
 from functools import lru_cache
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 logger = logging.getLogger(__name__)
 _SIMPLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+$")
@@ -320,8 +321,8 @@ class DatabaseSettings(BaseSettings):
 
     database_url: str = Field(alias="DATABASE_URL")
 
-    # Admin database URL for elevated operations (bypasses RLS via DB role).
-    # If not set, falls back to DATABASE_URL.
+    # Login for admin sessions, which bypass RLS. The web process requires it.
+    # Agent containers load these settings without it.
     admin_database_url: str | None = Field(default=None, alias="ADMIN_DATABASE_URL")
 
     # Debug settings
@@ -332,10 +333,45 @@ class DatabaseSettings(BaseSettings):
         """Get the database URL."""
         return self.database_url
 
-    @property
-    def effective_admin_database_url(self) -> str:
-        """Get the admin database URL for elevated operations (bypasses RLS)."""
-        return self.admin_database_url or self.database_url
+    def required_admin_database_url(self) -> str:
+        """The admin login URL, for a process that opens admin sessions."""
+        if not self.admin_database_url:
+            raise ValueError(
+                "ADMIN_DATABASE_URL is not set. Admin sessions need the openscientist_admin "
+                "login and do not fall back to DATABASE_URL."
+            )
+        return self.admin_database_url
+
+
+class MigrationSettings(BaseSettings):
+    """Logins of the migration step (Alembic and the PubMed loader). The web never
+    loads these, so it holds no owner password."""
+
+    model_config = SettingsConfigDict(
+        env_file=(".env", ".env.owner"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    owner_database_url: str | None = Field(default=None, alias="OWNER_DATABASE_URL")
+    # Wins over a password in OWNER_DATABASE_URL, so .env.owner is its only source.
+    postgres_owner_password: SecretStr | None = Field(default=None, alias="POSTGRES_OWNER_PASSWORD")
+    # Password the migrations give openscientist_admin.
+    postgres_admin_password: SecretStr | None = Field(default=None, alias="POSTGRES_ADMIN_PASSWORD")
+
+    def required_owner_database_url(self) -> str:
+        """The openscientist_owner URL, with POSTGRES_OWNER_PASSWORD filled in."""
+        if not self.owner_database_url:
+            raise ValueError(
+                "OWNER_DATABASE_URL is not set. Migrations and the PubMed loader log in "
+                "as openscientist_owner."
+            )
+        url = make_url(self.owner_database_url)
+        if self.postgres_owner_password is not None:
+            password = self.postgres_owner_password.get_secret_value()
+            if password:
+                url = url.set(password=password)
+        return url.render_as_string(hide_password=False)
 
 
 class AuthSettings(BaseSettings):
