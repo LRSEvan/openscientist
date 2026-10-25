@@ -615,6 +615,7 @@ class TestRunnerInjection:
             job_id="job-1",
             job_mount="/agent/jobs/job-1",
             provider_env=provider_env,
+            database_url="postgresql://agent",
         )
         assert env["ANTHROPIC_BASE_URL"] == "http://openscientist:8081"
         assert env["ANTHROPIC_API_KEY"] == "job-1.tok"
