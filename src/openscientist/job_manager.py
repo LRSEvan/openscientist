@@ -31,13 +31,13 @@ from openscientist.knowledge_state import KnowledgeState
 from openscientist.ntfy import notify_job_status_change
 from openscientist.orchestrator import create_job
 from openscientist.providers import get_provider
-from openscientist.settings import Settings
+from openscientist.settings import ProviderSettings
 from openscientist.version import get_version_string
 
 logger = logging.getLogger(__name__)
 
 
-def _effective_model(settings: Settings) -> str | None:
+def _effective_model(provider: ProviderSettings) -> str | None:
     """Resolve the model the active provider will actually use, for recording
     on the job so the UI can show a model badge.
 
@@ -47,7 +47,7 @@ def _effective_model(settings: Settings) -> str | None:
     resolves (for example codex on the account default), leaving the job with a
     provider badge only.
     """
-    model = settings.provider.model or settings.provider.anthropic_default_sonnet_model
+    model = provider.model or provider.anthropic_default_sonnet_model
     if model:
         return str(model)
     try:
@@ -513,7 +513,7 @@ class JobManager:
 
         settings = get_settings()
         llm_provider = settings.provider.provider_id.lower()
-        model = _effective_model(settings)
+        model = _effective_model(settings.provider)
         llm_config = {"model": model} if model else None
 
         # Create job in database
