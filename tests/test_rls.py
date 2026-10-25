@@ -8,8 +8,11 @@ Verifies that:
 4. Admin session functionality works
 """
 
+from uuid import UUID
+
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openscientist.database import (
@@ -17,7 +20,7 @@ from openscientist.database import (
     set_current_user,
     verify_rls_enabled,
 )
-from openscientist.database.models import Job, JobShare, User
+from openscientist.database.models import Administrator, Job, JobShare, User
 from tests.helpers import enable_rls
 
 
@@ -334,6 +337,49 @@ async def test_get_session_enforces_rls(test_engine):
         assert result.scalar_one_or_none() is None, (
             "Alice can see Bob's job by direct ID — RLS is not enforced"
         )
+
+
+async def _insert_own_job(session: AsyncSession, *, approved: bool, admin: bool) -> Job:
+    """Create a user, then insert a job as that user through the app role."""
+    user = User(email=f"starter-{approved}-{admin}@example.com", name="Starter")
+    user.is_approved = approved
+    session.add(user)
+    await session.flush()
+    if admin:
+        session.add(Administrator(user_id=user.id))
+        await session.flush()
+
+    await enable_rls(session)
+    await set_current_user(session, user.id)
+    job = Job(owner_id=user.id, research_question="Can I start?")
+    session.add(job)
+    await session.flush()
+    return job
+
+
+async def _stored_owner(session: AsyncSession, job: Job) -> UUID | None:
+    result = await session.execute(text("SELECT owner_id FROM jobs WHERE id = :id"), {"id": job.id})
+    return result.scalar_one_or_none()
+
+
+@pytest.mark.asyncio
+async def test_approved_user_can_insert_own_job(db_session: AsyncSession):
+    job = await _insert_own_job(db_session, approved=True, admin=False)
+    assert await _stored_owner(db_session, job) == job.owner_id
+
+
+@pytest.mark.asyncio
+async def test_unapproved_admin_can_insert_own_job(db_session: AsyncSession):
+    """Admins may start jobs without the approval flag, as the UI already allows."""
+    job = await _insert_own_job(db_session, approved=False, admin=True)
+    assert await _stored_owner(db_session, job) == job.owner_id
+
+
+@pytest.mark.asyncio
+async def test_unapproved_user_cannot_insert_own_job(db_session: AsyncSession):
+    with pytest.raises(DBAPIError, match="jobs_insert_requires_start_permission"):
+        await _insert_own_job(db_session, approved=False, admin=False)
+    await db_session.rollback()
 
 
 @pytest.mark.asyncio
