@@ -17,7 +17,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openscientist.database.models import Job, JobChatMessage
-from openscientist.database.session import AsyncSessionLocal
 from openscientist.knowledge_state import KnowledgeState
 
 logger = logging.getLogger(__name__)
@@ -28,13 +27,10 @@ _CHAT_REQUEST_FILE = ".chat_request.json"
 _CHAT_RESPONSE_FILE = ".chat_response.json"
 
 
-async def _load_research_question_from_db(job_id: str) -> str | None:
+async def _load_research_question_from_db(job_id: str, session: AsyncSession) -> str | None:
     try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
-            result = await session.execute(
-                select(Job.research_question).where(Job.id == UUID(job_id))
-            )
-            value = result.scalar_one_or_none()
+        result = await session.execute(select(Job.research_question).where(Job.id == UUID(job_id)))
+        value = result.scalar_one_or_none()
         if isinstance(value, str) and value.strip():
             return value
     except ValueError:
@@ -130,16 +126,16 @@ def _append_iteration_summaries(parts: list[str], summaries: list[Any]) -> None:
     parts.append("")
 
 
-def _load_knowledge_state(job_id: str) -> dict[str, Any] | None:
+async def _load_knowledge_state(job_id: str, session: AsyncSession) -> dict[str, Any] | None:
     try:
-        payload = KnowledgeState.load_from_database_sync(job_id).to_dict()
+        payload = (await KnowledgeState.load_from_database(job_id, session)).to_dict()
     except Exception as e:
         logger.warning("Failed to load knowledge state for job %s: %s", job_id, e)
         return None
     return payload if isinstance(payload, dict) else None
 
 
-async def load_job_context(job_id: str) -> str:
+async def load_job_context(job_id: str, session: AsyncSession) -> str:
     """
     Load comprehensive job context for LLM chat.
 
@@ -148,16 +144,18 @@ async def load_job_context(job_id: str) -> str:
 
     Args:
         job_id: Job ID
+        session: The chatting user's session, so the context holds only what
+            that user may see
 
     Returns:
         Formatted context string for LLM
     """
     context_parts: list[str] = []
-    research_question = await _load_research_question_from_db(job_id)
+    research_question = await _load_research_question_from_db(job_id, session)
     if research_question:
         _append_research_question(context_parts, research_question)
 
-    ks = _load_knowledge_state(job_id)
+    ks = await _load_knowledge_state(job_id, session)
     if not ks:
         return "\n".join(context_parts)
 
@@ -288,7 +286,7 @@ Be concise, accurate, and cite specific papers or findings when relevant. Focus 
     # few-shotting a report dump, and the live user message comes last.
     prompt_parts: list[str] = []
 
-    job_context = await load_job_context(str(job_id))
+    job_context = await load_job_context(str(job_id), session)
     if job_context.strip():
         prompt_parts.append(
             "## Background reference for this job\n"

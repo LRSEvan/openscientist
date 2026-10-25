@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from functools import partial
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
@@ -16,7 +17,7 @@ from uuid import UUID
 from sqlalchemy import select
 
 from openscientist.database.models.job import Job as JobModel
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import AsyncSessionLocal, SessionOpener
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.prompts.common import namespace_tool_mentions
 
@@ -408,9 +409,10 @@ async def _persist_job_status(
     job_uuid: UUID,
     status: str,
     error_message: str | None,
+    open_session: SessionOpener,
 ) -> None:
     try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+        async with open_session() as session:
             job_result = await session.execute(select(JobModel).where(JobModel.id == job_uuid))
             job = job_result.scalar_one_or_none()
             if job is None:
@@ -428,15 +430,23 @@ async def update_job_status(
     job_dir: Path,
     status: str,
     error_message: str | None = None,
+    *,
+    open_session: SessionOpener | None = None,
 ) -> None:
-    """Update job status in the database. The web process notifies the owner."""
+    """Update job status in ``open_session``, else the process's own login, and notify the owner."""
     job_id = job_dir.name
 
     job_uuid = _parse_job_uuid(job_id)
     if job_uuid is None:
         return
 
-    await _persist_job_status(job_id, job_uuid, status, error_message)
+    await _persist_job_status(
+        job_id,
+        job_uuid,
+        status,
+        error_message,
+        open_session or partial(AsyncSessionLocal, thread_safe=True),
+    )
 
 
 async def wait_for_feedback_or_timeout(

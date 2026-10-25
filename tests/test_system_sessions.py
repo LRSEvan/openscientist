@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 import openscientist.database.engine as engine_module
 import openscientist.database.session as session_module
 from openscientist.database.models import Job, User
+from openscientist.database.session import thread_safe_admin_session
 from openscientist.job.types import JobStatus
 from openscientist.job_manager import (
     _db_delete_job,
@@ -29,7 +30,9 @@ from openscientist.job_manager import (
     _db_get_notification_target,
     _db_list_jobs,
     _db_update_job_status,
+    _load_progress_from_knowledge_state,
 )
+from openscientist.knowledge_state import KnowledgeState
 from openscientist.ntfy import ensure_user_has_topic, get_user_ntfy_settings
 from openscientist.settings import get_settings
 
@@ -132,3 +135,13 @@ async def test_notification_lookups_work_without_the_web_login(
             text("SELECT ntfy_topic FROM users WHERE id = :id"), {"id": owned_job.owner_id}
         )
         assert stored.scalar_one() == topic
+
+
+def test_job_progress_is_read_without_the_web_login(
+    web_login_without_rights: None, owned_job: _OwnedJob
+) -> None:
+    """A failed progress read returns defaults, so a real finding count proves the read worked."""
+    ks = KnowledgeState(owned_job.job_id, "System paths", 3)
+    ks.add_finding("A finding", "evidence")
+    ks.save_to_database_sync(owned_job.job_id, open_session=thread_safe_admin_session)
+    assert _load_progress_from_knowledge_state(owned_job.job_id, "completed", -1, -1) == (1, 1)

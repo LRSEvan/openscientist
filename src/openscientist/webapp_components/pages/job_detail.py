@@ -10,6 +10,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -20,7 +21,7 @@ from openscientist.agent.factory import agent_class_for_provider_id
 from openscientist.async_tasks import run_sync
 from openscientist.auth import get_current_user_id, is_current_user_admin, require_auth
 from openscientist.database.rls import set_current_user
-from openscientist.database.session import get_session_ctx
+from openscientist.database.session import get_session_ctx, thread_safe_user_session
 from openscientist.job.types import JobInfo, JobStatus
 from openscientist.job_chat import get_chat_history, send_chat_message
 from openscientist.job_manager import _db_get_job, _db_get_share_permission
@@ -74,7 +75,9 @@ def _derive_progress_from_ks(
 def _load_knowledge_state(job_id: str, user_id: str) -> tuple[dict[str, Any] | None, str | None]:
     """Load knowledge state from database, returning (data, error_message)."""
     try:
-        ks = KnowledgeState.load_from_database_sync(job_id, UUID(user_id))
+        ks = KnowledgeState.load_from_database_sync(
+            job_id, open_session=partial(thread_safe_user_session, UUID(user_id))
+        )
         return ks.to_dict(), None
     except Exception as e:
         logger.warning("Failed to load knowledge state from database for %s: %s", job_id, e)
@@ -582,13 +585,14 @@ def _next_iteration_for_feedback(ks_data: dict[str, Any] | None) -> int:
 def _submit_feedback_and_continue(
     job_dir: Path, job_id: str, user_id: str, completed_iter: int, feedback_text: str
 ) -> None:
-    ks = KnowledgeState.load_from_database_sync(job_id, UUID(user_id))
+    as_user = partial(thread_safe_user_session, UUID(user_id))
+    ks = KnowledgeState.load_from_database_sync(job_id, open_session=as_user)
     if feedback_text.strip():
         ks.add_feedback(feedback_text.strip(), completed_iter)
-        ks.save_to_database_sync(job_id, UUID(user_id))
+        ks.save_to_database_sync(job_id, open_session=as_user)
 
     try:
-        run_sync(update_job_status(job_dir, "running"))
+        run_sync(update_job_status(job_dir, "running", open_session=as_user))
     except Exception:
         ui.notify("Failed to continue job. Please try again.", type="negative")
         return

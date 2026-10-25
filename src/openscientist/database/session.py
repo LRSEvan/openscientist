@@ -13,8 +13,9 @@ switches to openscientist_app, a non-superuser NOLOGIN role subject to RLS.
 """
 
 import logging
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -22,7 +23,7 @@ from sqlalchemy.pool import NullPool
 from openscientist.settings import get_settings
 
 from .engine import get_admin_engine, get_engine
-from .rls import use_app_role
+from .rls import set_current_user, use_app_role
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,19 @@ def thread_safe_admin_session() -> AsyncSession:
     for system work in the web process that acts for no user.
     """
     return _create_fresh_session_factory(get_settings().database.required_admin_database_url())()
+
+
+@asynccontextmanager
+async def thread_safe_user_session(user_id: UUID) -> AsyncIterator[AsyncSession]:
+    """A user's RLS session for worker threads, on its own unpooled engine."""
+    async with _create_fresh_session_factory()() as session:
+        await use_app_role(session)
+        await set_current_user(session, user_id)
+        yield session
+
+
+#: Opens the caller's session inside the coroutine that uses it.
+SessionOpener = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 def async_session_local(thread_safe: bool = False) -> AsyncSession:

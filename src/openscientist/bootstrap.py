@@ -1496,7 +1496,7 @@ async def _sync_knowledge_state_payload(
         )
         ks = KnowledgeState.__new__(KnowledgeState)
         ks.data = normalized_ks
-        await ks.save_to_database(str(job.id), job.owner_id, session=session)
+        await ks.save_to_database(str(job.id), session=session)
         result.synced_knowledge_state += 1
         return True
     except Exception as e:

@@ -24,8 +24,7 @@ from openscientist.container_manager import get_container_manager
 from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.models.job_share import JobShare
-from openscientist.database.rls import set_current_user, use_app_role
-from openscientist.database.session import AsyncSessionLocal, thread_safe_admin_session
+from openscientist.database.session import thread_safe_admin_session, thread_safe_user_session
 from openscientist.exceptions import ProviderError
 from openscientist.job.types import JobInfo, JobStatus, JobStatusUpdateResult
 from openscientist.knowledge_state import KnowledgeState
@@ -72,9 +71,7 @@ async def _job_session(user_id: UUID | None) -> AsyncIterator[AsyncSession]:
         async with thread_safe_admin_session() as session:
             yield session
         return
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await use_app_role(session)
-        await set_current_user(session, user_id)
+    async with thread_safe_user_session(user_id) as session:
         yield session
 
 
@@ -91,9 +88,11 @@ def _load_progress_from_knowledge_state(
     default_iterations: int,
     default_findings: int,
 ) -> tuple[int, int]:
-    """Load iteration and findings progress from persisted knowledge state."""
+    """Load progress as the admin login, since job lists and polls read it for no user."""
     try:
-        ks = KnowledgeState.load_from_database_sync(job_id).data
+        ks = KnowledgeState.load_from_database_sync(
+            job_id, open_session=thread_safe_admin_session
+        ).data
         findings_count = len(ks.get("findings", []))
         ks_iteration = int(ks.get("iteration", 1))
 
