@@ -18,6 +18,8 @@ from sqlalchemy import Connection, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.helpers import ADMIN_TEST_PASSWORD
+
 _MIGRATION = (
     Path(__file__).parent.parent
     / "src/openscientist/database/migrations/versions"
@@ -65,20 +67,18 @@ async def _login_as_admin(database_url: str, password: str) -> str:
 
 
 @pytest_asyncio.fixture
-async def admin_can_log_in(test_engine: AsyncEngine) -> AsyncGenerator[None, None]:
-    """conftest leaves the role NOLOGIN. Enable LOGIN and revert afterwards."""
-    async with test_engine.begin() as conn:
-        await conn.execute(text("ALTER ROLE openscientist_admin WITH LOGIN"))
+async def restores_admin_password(test_engine: AsyncEngine) -> AsyncGenerator[None, None]:
+    """The test changes the admin password. Put back the one conftest set."""
     yield
     async with test_engine.begin() as conn:
-        await conn.execute(text("ALTER ROLE openscientist_admin WITH NOLOGIN PASSWORD NULL"))
+        await conn.execute(text(f"ALTER ROLE openscientist_admin PASSWORD '{ADMIN_TEST_PASSWORD}'"))
 
 
 @pytest.mark.asyncio
 async def test_admin_logs_in_with_the_configured_password(
     test_engine: AsyncEngine,
     test_database_url: str,
-    admin_can_log_in: None,
+    restores_admin_password: None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:

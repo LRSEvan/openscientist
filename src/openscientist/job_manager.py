@@ -10,7 +10,8 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import Coroutine
+from collections.abc import AsyncIterator, Coroutine
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,19 +25,20 @@ from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.models.job_share import JobShare
 from openscientist.database.rls import set_current_user, use_app_role
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import AsyncSessionLocal, thread_safe_admin_session
 from openscientist.exceptions import ProviderError
 from openscientist.job.types import JobInfo, JobStatus, JobStatusUpdateResult
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.ntfy import notify_job_status_change
 from openscientist.orchestrator import create_job
 from openscientist.providers import get_provider
+from openscientist.settings import Settings
 from openscientist.version import get_version_string
 
 logger = logging.getLogger(__name__)
 
 
-def _effective_model(settings: Any) -> str | None:
+def _effective_model(settings: Settings) -> str | None:
     """Resolve the model the active provider will actually use, for recording
     on the job so the UI can show a model badge.
 
@@ -59,12 +61,21 @@ def _effective_model(settings: Any) -> str | None:
 # Database helper functions for async operations
 
 
-async def _apply_rls_context(session: AsyncSession, user_id: UUID | None) -> None:
-    """Apply user-scoped RLS context when a user id is provided."""
+@asynccontextmanager
+async def _job_session(user_id: UUID | None) -> AsyncIterator[AsyncSession]:
+    """The user's session when a user is given, else an admin session.
+
+    Work for no user is system work (worker threads, queue, polls), so it runs
+    through the admin login and never on the web login's own rights.
+    """
     if user_id is None:
+        async with thread_safe_admin_session() as session:
+            yield session
         return
-    await use_app_role(session)
-    await set_current_user(session, user_id)
+    async with AsyncSessionLocal(thread_safe=True) as session:
+        await use_app_role(session)
+        await set_current_user(session, user_id)
+        yield session
 
 
 def _derive_progress_from_db(status: str, current_iteration: int) -> int:
@@ -128,9 +139,7 @@ async def _db_create_job(
     Returns:
         The created JobModel instance
     """
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, owner_id)
-
+    async with _job_session(owner_id) as session:
         job = JobModel(
             id=UUID(job_id),
             owner_id=owner_id,
@@ -156,13 +165,10 @@ async def _db_create_job(
 async def _db_get_job(job_id: str, user_id: UUID | None = None) -> JobModel | None:
     """Get a job from the database (thread-safe for worker threads).
 
-    When user_id is provided, drops to openscientist_app role so RLS policies
-    are enforced. Without user_id, runs as the connection user (superuser)
-    which bypasses RLS — use only for internal/system operations.
+    With user_id, RLS limits the result to what that user may see. Without it,
+    this is system work and runs as the admin login.
     """
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).where(JobModel.id == UUID(job_id))
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
@@ -173,9 +179,7 @@ async def _db_get_share_permission(job_id: str, user_id: UUID) -> str | None:
 
     Returns 'view', 'edit', or None if the user has no share.
     """
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobShare.permission_level).where(
             JobShare.job_id == UUID(job_id),
             JobShare.shared_with_user_id == user_id,
@@ -198,9 +202,7 @@ async def _db_update_job_status(
     """
     result = JobStatusUpdateResult()
 
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).where(JobModel.id == UUID(job_id))
         db_result = await session.execute(stmt)
         job = db_result.scalar_one_or_none()
@@ -235,7 +237,7 @@ async def _fill_notification_target(
 async def _db_get_notification_target(job_id: str) -> JobStatusUpdateResult:
     """Notification data for a status the agent container wrote."""
     result = JobStatusUpdateResult()
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with _job_session(None) as session:
         stmt = select(JobModel).where(JobModel.id == UUID(job_id))
         job = (await session.execute(stmt)).scalar_one_or_none()
         if job:
@@ -249,9 +251,7 @@ async def _db_list_jobs(
     user_id: UUID | None = None,
 ) -> list[JobModel]:
     """List jobs from the database (thread-safe for worker threads)."""
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).order_by(JobModel.created_at.desc())
 
         if status:
@@ -266,9 +266,7 @@ async def _db_list_jobs(
 
 async def _db_delete_job(job_id: str, user_id: UUID | None = None) -> None:
     """Delete a job from the database (thread-safe for worker threads)."""
-    async with AsyncSessionLocal(thread_safe=True) as session:
-        await _apply_rls_context(session, user_id)
-
+    async with _job_session(user_id) as session:
         stmt = select(JobModel).where(JobModel.id == UUID(job_id))
         result = await session.execute(stmt)
         job = result.scalar_one_or_none()

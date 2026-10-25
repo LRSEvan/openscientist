@@ -63,22 +63,24 @@ def _get_admin_session_factory() -> async_sessionmaker[AsyncSession]:
     return _admin_session_factory
 
 
-def _create_fresh_session_factory() -> async_sessionmaker[AsyncSession]:
+def _create_fresh_session_factory(
+    database_url: str | None = None,
+) -> async_sessionmaker[AsyncSession]:
     """Create a fresh session factory for the current event loop.
 
     This creates a new engine with NullPool (no connection pooling)
     for use in worker threads or contexts with different event loops.
     The engine and factory are NOT cached because asyncpg connections
     are bound to the event loop they were created in, and asyncio.run()
-    creates a new event loop each time.
+    creates a new event loop each time. ``database_url`` defaults to the
+    web login's.
     """
     settings = get_settings()
-    database_url = settings.database.effective_database_url
 
     # Create a fresh engine with NullPool - no caching since each
     # asyncio.run() creates a new event loop and connections are loop-bound
     thread_engine = create_async_engine(
-        database_url,
+        database_url or settings.database.effective_database_url,
         poolclass=NullPool,  # No pooling - each connection is fresh
         echo=settings.database.sql_echo,
     )
@@ -89,6 +91,15 @@ def _create_fresh_session_factory() -> async_sessionmaker[AsyncSession]:
         autocommit=False,
         autoflush=False,
     )
+
+
+def thread_safe_admin_session() -> AsyncSession:
+    """An admin session safe for worker threads and their own event loops.
+
+    Connects with ``ADMIN_DATABASE_URL`` (``openscientist_admin``, BYPASSRLS),
+    for system work in the web process that acts for no user.
+    """
+    return _create_fresh_session_factory(get_settings().database.required_admin_database_url())()
 
 
 def async_session_local(thread_safe: bool = False) -> AsyncSession:

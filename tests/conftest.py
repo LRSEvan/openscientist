@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -26,6 +27,7 @@ from openscientist.database.models import (
     SkillSource,
     User,
 )
+from tests.helpers import ADMIN_TEST_PASSWORD
 
 
 # Clear any cached settings after environment setup
@@ -160,6 +162,10 @@ def _apply_migrations_once(test_database_url: str) -> None:
             await conn.execute(
                 text("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO openscientist_admin")
             )
+            # Admin sessions log in as this role, as in production.
+            await conn.execute(
+                text(f"ALTER ROLE openscientist_admin WITH LOGIN PASSWORD '{ADMIN_TEST_PASSWORD}'")
+            )
 
         await engine.dispose()
 
@@ -188,7 +194,7 @@ def _apply_alembic_migrations(database_url: str) -> None:
     # Set environment variable for Alembic
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
-    env["POSTGRES_ADMIN_PASSWORD"] = "test-admin-password"
+    env["POSTGRES_ADMIN_PASSWORD"] = ADMIN_TEST_PASSWORD
 
     # Get the path to the project root (where alembic.ini is)
     project_root = Path(__file__).parent.parent
@@ -253,6 +259,11 @@ def test_database_url(postgres_container: PostgresContainer | None) -> str:
 
     # Propagate the real URL so thread-safe session factories connect correctly
     os.environ["DATABASE_URL"] = url
+    os.environ["ADMIN_DATABASE_URL"] = (
+        make_url(url)
+        .set(username="openscientist_admin", password=ADMIN_TEST_PASSWORD)
+        .render_as_string(hide_password=False)
+    )
     from openscientist.settings import clear_settings_cache
 
     clear_settings_cache()

@@ -18,8 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from openscientist.pubmed_mirror.__main__ import loader_dsn
 from openscientist.pubmed_mirror.ingest import ingest_files
 from openscientist.settings import DatabaseSettings
-
-_ADMIN_PASSWORD = "pubmed-ingest-test-password"
+from tests.helpers import ADMIN_TEST_PASSWORD
 
 _SAMPLE_XML = """<?xml version="1.0"?>
 <PubmedArticleSet>
@@ -60,23 +59,13 @@ def baseline_file(tmp_path: Path) -> Path:
     return path
 
 
-@pytest_asyncio.fixture
-async def admin_login_url(
-    test_engine: AsyncEngine, test_database_url: str
-) -> AsyncGenerator[str, None]:
-    """LOGIN DSN for openscientist_admin, as docker-compose configures it.
-
-    conftest creates the role NOLOGIN, so enable LOGIN to dial it directly and
-    revert afterwards.
-    """
-    async with test_engine.begin() as conn:
-        await conn.execute(
-            text(f"ALTER ROLE openscientist_admin WITH LOGIN PASSWORD '{_ADMIN_PASSWORD}'")
-        )
-    url = make_url(test_database_url).set(username="openscientist_admin", password=_ADMIN_PASSWORD)
-    yield url.render_as_string(hide_password=False)
-    async with test_engine.begin() as conn:
-        await conn.execute(text("ALTER ROLE openscientist_admin WITH NOLOGIN PASSWORD NULL"))
+@pytest.fixture
+def admin_login_url(test_engine: AsyncEngine, test_database_url: str) -> str:
+    """LOGIN DSN for openscientist_admin, as docker-compose configures it."""
+    url = make_url(test_database_url).set(
+        username="openscientist_admin", password=ADMIN_TEST_PASSWORD
+    )
+    return url.render_as_string(hide_password=False)
 
 
 @pytest_asyncio.fixture
