@@ -92,13 +92,6 @@ jobs:
         # called directly and this step touches no dependencies.
         run: .venv/bin/python -m pytest -m "not network" --cov=src/openscientist --cov-report=term-missing --cov-report=xml
 
-      - name: Publish coverage report
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-xml
-          path: coverage.xml
-          if-no-files-found: error
-
       - name: Upload coverage to Codecov
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
@@ -117,10 +110,3 @@ jobs:
           files: ./coverage.xml
           disable_search: true
           fail_ci_if_error: false
-
-  sonarcloud:
-    needs: test
-    # A pull request from a fork cannot read SONAR_TOKEN.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    uses: ./.github/workflows/sonarcloud.yml
-    secrets: inherit
