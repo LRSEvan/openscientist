@@ -20,6 +20,7 @@ from sqlalchemy.orm import selectinload
 
 from openscientist.async_tasks import run_sync
 from openscientist.database.models import Session, User
+from openscientist.database.retry import is_connection_error
 from openscientist.database.session import get_admin_session
 
 logger = logging.getLogger(__name__)
@@ -38,21 +39,17 @@ async def get_current_user(db: AsyncSession, session_token: str) -> User | None:
     Returns:
         User object if session is valid, None otherwise
     """
-    try:
-        stmt = (
-            select(User)
-            .join(Session)
-            .where(
-                Session.id == session_token,
-                Session.expires_at > datetime.now(UTC),
-            )
-            .options(selectinload(User.administrator))
+    stmt = (
+        select(User)
+        .join(Session)
+        .where(
+            Session.id == session_token,
+            Session.expires_at > datetime.now(UTC),
         )
-        result = await db.execute(stmt)
-        return result.scalar_one_or_none()
-    except Exception as e:
-        logger.error("Error getting current user: %s", e)
-        return None
+        .options(selectinload(User.administrator))
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 async def validate_session(session_token: str) -> dict[str, Any] | None:
@@ -63,26 +60,22 @@ async def validate_session(session_token: str) -> dict[str, Any] | None:
         session_token: Session token to validate
 
     Returns:
-        Dictionary with user_id, email, name, admin/approval flags if valid, None otherwise
+        Dictionary with user_id, email, name, admin/approval flags if valid, None otherwise.
+        A database error is raised, so it never reads as a missing session.
     """
-    try:
-        async with get_admin_session() as db:
-            user = await get_current_user(db, session_token)
-            if user:
-                is_admin = user.administrator is not None
-                can_start_jobs = bool(user.is_approved or is_admin)
-                return {
-                    "user_id": str(user.id),
-                    "email": user.email,
-                    "name": user.name,
-                    "is_admin": is_admin,
-                    "is_approved": bool(user.is_approved),
-                    "can_start_jobs": can_start_jobs,
-                }
-    except Exception as e:
-        logger.error("Session validation error: %s", e)
-
-    return None
+    async with get_admin_session() as db:
+        user = await get_current_user(db, session_token)
+        if user is None:
+            return None
+        is_admin = user.administrator is not None
+        return {
+            "user_id": str(user.id),
+            "email": user.email,
+            "name": user.name,
+            "is_admin": is_admin,
+            "is_approved": bool(user.is_approved),
+            "can_start_jobs": bool(user.is_approved or is_admin),
+        }
 
 
 def _get_session_token() -> str | None:
@@ -148,6 +141,14 @@ def _redirect_to_login(
     ui.navigate.to("/login")
 
 
+def _show_database_unavailable() -> None:
+    """Tell the visitor the database is unreachable, leaving their sign-in alone."""
+    with ui.column().classes("w-full items-center mt-16 gap-4"):
+        ui.label("OpenScientist cannot reach its database right now.").classes("text-h6")
+        ui.label("You are still signed in. Try again in a moment.").classes("text-grey-7")
+        ui.button("Retry", icon="refresh", on_click=ui.navigate.reload)
+
+
 def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
     """
     Decorator to require authentication for a page.
@@ -173,7 +174,14 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
             return None
 
         # Validate session against database
-        user_info = await validate_session(session_token)
+        try:
+            user_info = await validate_session(session_token)
+        except Exception as e:
+            if not is_connection_error(e):
+                raise
+            logger.error("Database unreachable while checking a session: %s", e)
+            _show_database_unavailable()
+            return None
         if not user_info:
             logger.debug("Invalid session token, redirecting to login")
             _redirect_to_login(clear_storage=True)
@@ -196,9 +204,12 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
 
         try:
             user_info = run_sync(validate_session(session_token))
-        except Exception:
-            logger.error("Session validation failed in sync auth path", exc_info=True)
-            user_info = None
+        except Exception as e:
+            if not is_connection_error(e):
+                raise
+            logger.error("Database unreachable while checking a session: %s", e)
+            _show_database_unavailable()
+            return None
 
         if not user_info:
             logger.debug("Invalid session token in sync path, redirecting to login")
