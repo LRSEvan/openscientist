@@ -19,9 +19,10 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from openscientist.container_manager import ContainerManager, get_container_manager
-from openscientist.exec_broker_client import EXEC_BROKER_PORT, EXEC_TOKEN_HEADER
+from openscientist.exec_broker_client import EXEC_TOKEN_HEADER
 from openscientist.job_container.secrets import make_exec_placeholder
 from openscientist.job_container.utils import HostPathSettings, to_container_path
+from openscientist.listener import bind_listener
 from openscientist.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -150,15 +151,21 @@ _broker_task: asyncio.Task[None] | None = None
 
 
 async def start_exec_broker() -> None:
-    """Start the broker listener as a loop task. The single, always-on exec path."""
+    """Start the broker listener as a loop task. The single, always-on exec path.
+
+    Raises:
+        ListenerBindError: Its port cannot be bound.
+    """
     global _broker_server, _broker_task
     if _broker_task is not None:
         return
+    port = get_settings().container.exec_broker_port
+    sock = bind_listener(port, name="execution broker", setting="OPENSCIENTIST_EXEC_BROKER_PORT")
     app = create_exec_broker_app(
         master_key=lambda: get_settings().secret_key,
         manager=get_container_manager,
     )
-    config = uvicorn.Config(app, host="0.0.0.0", port=EXEC_BROKER_PORT, log_level="warning")
+    config = uvicorn.Config(app, log_level="warning")
     _broker_server = _NoSignalServer(config)
-    _broker_task = asyncio.create_task(_broker_server.serve())
-    logger.info("Execution broker listening on port %d", EXEC_BROKER_PORT)
+    _broker_task = asyncio.create_task(_broker_server.serve(sockets=[sock]))
+    logger.info("Execution broker listening on port %d", port)
