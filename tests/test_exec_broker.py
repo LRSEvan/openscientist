@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -18,9 +20,8 @@ from openscientist.exec_broker_client import (
     BrokerError,
     execute_code_via_broker,
 )
-from openscientist.job_container.secrets import make_exec_placeholder
+from openscientist.job_container.secrets import issue_run_credentials, revoke_run_credentials
 
-_MASTER = "master-key"
 _HOST_PROJECT = "/host/proj"
 
 _EXPECTED_KWARGS = {
@@ -45,9 +46,23 @@ def broker_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(exec_broker, "get_settings", lambda: settings)
 
 
+@pytest.fixture
+def token_for() -> Iterator[Callable[[str], str]]:
+    """Issue a live run's broker token for a job, ended after the test."""
+    roles: list[str] = []
+
+    def issue(job_id: str) -> str:
+        role = f"agent_{uuid4().hex}"
+        roles.append(role)
+        return issue_run_credentials(job_id, role).exec_token
+
+    yield issue
+    for role in roles:
+        revoke_run_credentials(role)
+
+
 def _client(manager: MagicMock) -> TestClient:
-    app = create_exec_broker_app(master_key=lambda: _MASTER, manager=lambda: manager)
-    return TestClient(app)
+    return TestClient(create_exec_broker_app(manager=lambda: manager))
 
 
 def _manager(result: dict[str, Any]) -> MagicMock:
@@ -74,10 +89,10 @@ def _body(job_id: str = "job-1", **overrides: Any) -> dict[str, Any]:
 
 @pytest.mark.usefixtures("broker_settings")
 class TestExecBrokerServer:
-    def test_valid_request_runs_executor_and_returns_result(self) -> None:
+    def test_valid_request_runs_executor_and_returns_result(self, token_for) -> None:
         result = {"success": True, "output": "1", "plots": [], "execution_time": 0.1}
         manager = _manager(result)
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         resp = _client(manager).post("/execute", json=_body(), headers={EXEC_TOKEN_HEADER: token})
         assert resp.status_code == 200
         assert resp.json() == result
@@ -86,10 +101,10 @@ class TestExecBrokerServer:
         # host path resolved back to the web container's own mount root
         assert kwargs["output_dir"] == Path("/app/jobs/job-1/provenance")
 
-    def test_rejects_token_for_a_different_job(self) -> None:
+    def test_rejects_token_for_a_different_job(self, token_for) -> None:
         manager = _manager({})
-        # A valid token, but for job-2, presented with a body claiming job-1.
-        token = make_exec_placeholder(_MASTER, "job-2")
+        # A live token, but for job-2, presented with a body claiming job-1.
+        token = token_for("job-2")
         resp = _client(manager).post(
             "/execute", json=_body(job_id="job-1"), headers={EXEC_TOKEN_HEADER: token}
         )
@@ -102,9 +117,18 @@ class TestExecBrokerServer:
         assert resp.status_code == 401
         manager.execute_code.assert_not_called()
 
-    def test_ignores_non_execute_code_fields(self) -> None:
+    def test_refuses_a_run_that_has_ended(self) -> None:
+        manager = _manager({})
+        role = f"agent_{uuid4().hex}"
+        token = issue_run_credentials("job-1", role).exec_token
+        revoke_run_credentials(role)
+        resp = _client(manager).post("/execute", json=_body(), headers={EXEC_TOKEN_HEADER: token})
+        assert resp.status_code == 401
+        manager.execute_code.assert_not_called()
+
+    def test_ignores_non_execute_code_fields(self, token_for) -> None:
         manager = _manager({"success": True, "output": "", "plots": [], "execution_time": 0.0})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(
             network_mode="host",
             volumes={"/etc": {"bind": "/etc"}},
@@ -118,34 +142,34 @@ class TestExecBrokerServer:
         # Only execute_code-shaped params reach the spawner, never a container spec.
         assert set(kwargs) == _EXPECTED_KWARGS
 
-    def test_rejects_output_dir_outside_job_directory(self) -> None:
+    def test_rejects_output_dir_outside_job_directory(self, token_for) -> None:
         manager = _manager({})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(output_dir=f"{_HOST_PROJECT}/jobs/other-job/provenance")
         resp = _client(manager).post("/execute", json=body, headers={EXEC_TOKEN_HEADER: token})
         assert resp.status_code == 403
         manager.execute_code.assert_not_called()
 
-    def test_rejects_data_file_outside_job_directory(self) -> None:
+    def test_rejects_data_file_outside_job_directory(self, token_for) -> None:
         manager = _manager({})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(data_files=[{"path": f"{_HOST_PROJECT}/jobs/victim/data/secret.csv"}])
         resp = _client(manager).post("/execute", json=body, headers={EXEC_TOKEN_HEADER: token})
         assert resp.status_code == 403
         manager.execute_code.assert_not_called()
 
-    def test_rejects_unsupported_language(self) -> None:
+    def test_rejects_unsupported_language(self, token_for) -> None:
         manager = _manager({})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         resp = _client(manager).post(
             "/execute", json=_body(language="ruby"), headers={EXEC_TOKEN_HEADER: token}
         )
         assert resp.status_code == 400
         manager.execute_code.assert_not_called()
 
-    def test_translates_and_confines_data_paths(self) -> None:
+    def test_translates_and_confines_data_paths(self, token_for) -> None:
         manager = _manager({"success": True, "output": "", "plots": [], "execution_time": 0.0})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(
             data_path=f"{_HOST_PROJECT}/jobs/job-1/data/primary.csv",
             data_files=[

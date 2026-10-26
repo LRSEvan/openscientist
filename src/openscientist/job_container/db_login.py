@@ -23,6 +23,7 @@ from sqlalchemy.engine import make_url
 
 from openscientist.async_tasks import run_sync
 from openscientist.database.session import AsyncSessionLocal
+from openscientist.job_container.secrets import revoke_run_credentials
 from openscientist.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -75,13 +76,15 @@ async def create_agent_login(job_id: str, *, lifetime_seconds: int) -> AgentLogi
 
 
 async def drop_agent_login(role: str) -> None:
-    """Unmap the login, end its sessions and drop it.
+    """End the run's LLM proxy and broker credentials, then unmap the login, end
+    its sessions and drop it.
 
-    The mapping goes first, so the login reaches nothing even if a later step
-    fails.
+    The credentials and the mapping go first, so the run reaches nothing even if
+    a later step fails.
     """
     if not _ROLE_PATTERN.fullmatch(role):
         raise ValueError(f"{role!r} is not an agent login")
+    revoke_run_credentials(role)
     async with AsyncSessionLocal() as session:
         await session.execute(
             text("DELETE FROM agent_job_roles WHERE role_name = :role"), {"role": role}

@@ -41,9 +41,9 @@ from openscientist.job_container.db_login import (
     open_agent_login,
 )
 from openscientist.job_container.secrets import (
+    RunCredentials,
     derive_job_secret,
-    make_exec_placeholder,
-    make_job_placeholder,
+    issue_run_credentials,
 )
 from openscientist.job_container.utils import resolve_docker_network, to_host_path
 from openscientist.llm_proxy import container_proxy_base_url
@@ -84,6 +84,7 @@ class JobContainerRunner:
         job_mount: str,
         provider_env: dict[str, str],
         database_url: str,
+        exec_token: str,
         run_mode: str = "discovery",
     ) -> dict[str, str]:
         """Build the environment variables for the agent container."""
@@ -97,8 +98,8 @@ class JobContainerRunner:
             # A short database outage should not end the job.
             "OPENSCIENTIST_DB_CONNECT_RETRY_SECONDS": str(CONTAINER_DB_RETRY_SECONDS),
             "OPENSCIENTIST_SECRET_KEY": derive_job_secret(settings.secret_key, job_id),
-            # Per-job execution credential the broker verifies, plus the broker URL.
-            EXEC_TOKEN_ENV: make_exec_placeholder(settings.secret_key, job_id),
+            # This run's execution credential the broker verifies, plus the broker URL.
+            EXEC_TOKEN_ENV: exec_token,
             EXEC_BROKER_URL_ENV: container_broker_base_url(),
             **provider_env,
         }
@@ -174,6 +175,7 @@ class JobContainerRunner:
         job_id: str,
         job_dir_host: Path,
         database_url: str,
+        credentials: RunCredentials,
         run_mode: str = "discovery",
     ) -> tuple[
         dict[str, str],
@@ -196,7 +198,7 @@ class JobContainerRunner:
         )
         provider_env = provider.proxied_container_env(
             proxy_base_url=container_proxy_base_url(),
-            placeholder=make_job_placeholder(settings.secret_key, job_id),
+            placeholder=credentials.llm_placeholder,
             gcp_credentials_container_path=gcp_credentials_container_path,
         )
         # Resolve a self-hosted model's window app-side and pass it in, since the
@@ -208,6 +210,7 @@ class JobContainerRunner:
             job_mount=job_mount,
             provider_env=provider_env,
             database_url=database_url,
+            exec_token=credentials.exec_token,
             run_mode=run_mode,
         )
         volumes = JobContainerRunner._build_container_volumes(
@@ -300,6 +303,8 @@ class JobContainerRunner:
         job_dir_host = to_host_path(job_dir_resolved, cs)
         login = open_agent_login(job_id, lifetime_seconds=lifetime_seconds)
         try:
+            # Ended with the login, when the container goes.
+            credentials = issue_run_credentials(job_id, login.role)
             return self._run_container(
                 settings,
                 job_id=job_id,
@@ -310,6 +315,7 @@ class JobContainerRunner:
                 database_url=login.database_url,
                 login_role=login.role,
                 chat_turn=chat_turn,
+                credentials=credentials,
             )
         except BaseException:
             close_agent_login(login.role)
@@ -327,6 +333,7 @@ class JobContainerRunner:
         database_url: str,
         login_role: str,
         chat_turn: str | None,
+        credentials: RunCredentials,
     ) -> Container:
         cs = settings.container
         env, volumes, agent_network, agent_memory, agent_cpu, agent_platform = (
@@ -335,6 +342,7 @@ class JobContainerRunner:
                 job_id=job_id,
                 job_dir_host=job_dir_host,
                 database_url=database_url,
+                credentials=credentials,
                 run_mode=run_mode,
             )
         )

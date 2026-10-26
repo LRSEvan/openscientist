@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from docker import errors as docker_errors
+from openscientist.exec_broker_client import EXEC_TOKEN_ENV
 from openscientist.job_chat import CHAT_TURN_ENV
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL, AgentLogin
 from openscientist.job_container.runner import (
@@ -17,12 +18,20 @@ from openscientist.job_container.runner import (
     AGENT_GCP_CREDENTIALS_PATH,
     JobContainerRunner,
 )
-from openscientist.job_container.secrets import derive_job_secret, make_exec_placeholder
+from openscientist.job_container.secrets import (
+    broker_accepts,
+    derive_job_secret,
+    proxy_accepts,
+    revoke_run_credentials,
+)
 from openscientist.providers.base import AirgapEgress, AirgapPosture
 from openscientist.settings import Settings
 
 
 class _FakeProvider:
+    #: The LLM placeholder of the latest launch.
+    last_placeholder = ""
+
     def __init__(self, posture: AirgapPosture | None = None) -> None:
         self._posture = posture
 
@@ -33,6 +42,7 @@ class _FakeProvider:
         placeholder: str,
         gcp_credentials_container_path: str | None = None,
     ) -> dict[str, str]:
+        _FakeProvider.last_placeholder = placeholder
         env = {"EXTRA_ENV": "1"}
         if gcp_credentials_container_path:
             env["GOOGLE_APPLICATION_CREDENTIALS"] = gcp_credentials_container_path
@@ -125,6 +135,18 @@ class TestContainerDatabaseLogin:
         assert not any("web-pw" in value for value in kwargs["environment"].values())
         assert kwargs["labels"][AGENT_LOGIN_LABEL] == _LOGIN.role
         agent_login.opened.assert_called_once_with("job-123", lifetime_seconds=14400)
+
+    def test_the_container_gets_live_credentials_of_its_own_run(self, agent_login) -> None:
+        mock_client = MagicMock()
+        a, b, c, d = self._launch_patches()
+        with a, b, c, d:
+            self._runner(mock_client).launch("job-123", Path("/app/jobs/job-123"))
+        try:
+            env = mock_client.containers.run.call_args.kwargs["environment"]
+            assert broker_accepts("job-123", env[EXEC_TOKEN_ENV])
+            assert proxy_accepts(_FakeProvider.last_placeholder)
+        finally:
+            revoke_run_credentials(_LOGIN.role)
 
     def test_no_container_starts_without_its_login(self, agent_login) -> None:
         agent_login.opened.side_effect = RuntimeError("cannot create role")
@@ -757,6 +779,7 @@ class TestJobSecretInjection:
             job_mount="/agent/jobs/job-1",
             provider_env={},
             database_url="postgresql://agent",
+            exec_token="job-1.exec",
         )
         expected = hmac.new(b"master-key", b"job_secret:job-1", hashlib.sha256).hexdigest()
         assert env["OPENSCIENTIST_SECRET_KEY"] == expected
@@ -771,6 +794,7 @@ class TestJobSecretInjection:
             job_mount="/agent/jobs/job-a",
             provider_env={},
             database_url="postgresql://agent",
+            exec_token="job-a.exec",
         )
         env_b = JobContainerRunner._build_container_environment(
             cast(Settings, settings),
@@ -778,6 +802,7 @@ class TestJobSecretInjection:
             job_mount="/agent/jobs/job-b",
             provider_env={},
             database_url="postgresql://agent",
+            exec_token="job-b.exec",
         )
         secret_a = env_a["OPENSCIENTIST_SECRET_KEY"]
         secret_b = env_b["OPENSCIENTIST_SECRET_KEY"]
@@ -798,20 +823,6 @@ class TestJobSecretInjection:
         assert settings.secret_key == derived
         expected_storage = hmac.new(derived.encode(), b"storage_secret", hashlib.sha256).hexdigest()
         assert settings.auth.storage_secret == expected_storage
-
-    def test_env_injects_exec_token_and_broker_url(self) -> None:
-        """The container env carries a per-job exec placeholder and the broker URL."""
-        settings = self._settings(master="master-key")
-        env = JobContainerRunner._build_container_environment(
-            cast(Settings, settings),
-            job_id="job-x",
-            job_mount="/agent/jobs/job-x",
-            provider_env={},
-            database_url="postgresql://agent",
-        )
-        assert env["OPENSCIENTIST_EXEC_TOKEN"] == make_exec_placeholder("master-key", "job-x")
-        assert env["OPENSCIENTIST_EXEC_TOKEN"].startswith("job-x.")
-        assert env["OPENSCIENTIST_EXEC_BROKER_URL"].endswith(":8082")
 
 
 class TestAirgapFirewallLaunch:
