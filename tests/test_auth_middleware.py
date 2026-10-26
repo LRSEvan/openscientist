@@ -20,7 +20,7 @@ def _make_fake_context(session_token: str | None = None):
         context=SimpleNamespace(
             client=SimpleNamespace(
                 request=SimpleNamespace(cookies=cookies),
-                page=SimpleNamespace(path="/new"),
+                page=SimpleNamespace(path="/new", response_timeout=3.0),
             )
         ),
         navigate=SimpleNamespace(to=MagicMock()),
