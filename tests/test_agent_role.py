@@ -18,8 +18,6 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-import openscientist.database.engine as engine_module
-import openscientist.database.session as session_module
 from openscientist.agent.base import TokenUsage
 from openscientist.database.models import CostRecord, Job, JobDataFile, User
 from openscientist.knowledge_state import KnowledgeState
@@ -183,19 +181,14 @@ def container_database(login_url: str) -> object:
     """Run the container's own code with DATABASE_URL set to the job login."""
     saved = os.environ.get("DATABASE_URL")
 
-    def reset() -> None:
-        get_settings.cache_clear()
-        engine_module._engine = None
-        session_module._session_factory = None
-
     os.environ["DATABASE_URL"] = login_url
-    reset()
+    get_settings.cache_clear()
     yield None
     if saved is None:
         os.environ.pop("DATABASE_URL", None)
     else:
         os.environ["DATABASE_URL"] = saved
-    reset()
+    get_settings.cache_clear()
 
 
 async def _owners_count(test_engine: AsyncEngine, table: str, job_id: UUID) -> int:

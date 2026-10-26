@@ -21,6 +21,7 @@ from uuid import UUID
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openscientist.async_tasks import thread_loop
 from openscientist.container_manager import get_container_manager
 from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
@@ -706,8 +707,10 @@ class JobManager:
             thread.start()
 
     def _run_job(self, job_id: str, run_mode: str = "discovery") -> None:
-        """Run a job (internal, called by thread)."""
-        self._run_job_in_container(job_id, run_mode=run_mode)
+        """Run a job on its own thread, whose database calls share one loop and
+        its pooled connections for the whole run."""
+        with thread_loop():
+            self._run_job_in_container(job_id, run_mode=run_mode)
 
     def _run_job_in_container(self, job_id: str, run_mode: str = "discovery") -> None:
         """Launch an agent container for the job and block until it reaches a terminal status.

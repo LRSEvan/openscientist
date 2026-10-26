@@ -61,7 +61,7 @@ async def set_job_title(title: str) -> str:
     except ValueError:
         return f"❌ Invalid job id: {STATE.job_id}"
     try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+        async with AsyncSessionLocal() as session:
             job = await session.get(JobModel, job_uuid)
             if job is None:
                 return "❌ Job not found in database."

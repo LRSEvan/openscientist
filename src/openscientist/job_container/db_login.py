@@ -51,7 +51,7 @@ async def create_agent_login(job_id: str, *, lifetime_seconds: int) -> AgentLogi
     role = f"agent_{secrets.token_hex(16)}"
     password = secrets.token_urlsafe(32)
     valid_until = datetime.now(UTC) + timedelta(seconds=lifetime_seconds) + _GRACE
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         # CREATE ROLE takes no bind parameters, so the server quotes the values.
         statement = (
             await session.execute(
@@ -82,7 +82,7 @@ async def drop_agent_login(role: str) -> None:
     """
     if not _ROLE_PATTERN.fullmatch(role):
         raise ValueError(f"{role!r} is not an agent login")
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         await session.execute(
             text("DELETE FROM agent_job_roles WHERE role_name = :role"), {"role": role}
         )
@@ -109,7 +109,7 @@ async def reap_agent_logins(live_roles: set[str] | None) -> list[str]:
     are dropped. Only roles named like an agent login that are members of
     openscientist_agent are considered.
     """
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         rows = (
             await session.execute(
                 text(

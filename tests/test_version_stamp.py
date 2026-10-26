@@ -23,19 +23,19 @@ _VERSION_INFO = {"agent_harness": "omp", "agent_harness_version": "17.1.5"}
 
 async def _create_job(job_id: UUID) -> None:
     """Commit a job row on its own connection, as the orchestrator sees one."""
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         session.add(Job(id=job_id, research_question="Version stamp", status="running"))
         await session.commit()
 
 
 async def _delete_job(job_id: UUID) -> None:
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         await session.execute(delete(Job).where(Job.id == job_id))
         await session.commit()
 
 
 async def _stored_version_info(job_id: UUID) -> dict[str, str] | None:
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         result = await session.execute(select(Job.version_info).where(Job.id == job_id))
         return result.scalar_one_or_none()
 

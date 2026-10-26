@@ -45,7 +45,7 @@ async def run_search(
 
 
 async def search_local(query: str, max_results: int = 10) -> list[dict[str, Any]]:
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         return await run_search(session, query, max_results)
 
 

@@ -10,7 +10,6 @@ import asyncio
 import logging
 import time
 from collections.abc import Collection
-from functools import partial
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
@@ -393,7 +392,7 @@ async def _get_job_status(job_id: str) -> str | None:
     for :data:`CONTAINER_DB_RETRY_SECONDS`."""
 
     async def read() -> str | None:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+        async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(JobModel.status).where(JobModel.id == UUID(job_id))
             )
@@ -472,7 +471,7 @@ async def update_job_status(
         status,
         error_message,
         allowed_from,
-        open_session or partial(AsyncSessionLocal, thread_safe=True),
+        open_session or AsyncSessionLocal,
         retry_for,
     )
 

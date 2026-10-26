@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Coroutine
+import threading
+from collections.abc import Coroutine, Iterator
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 _T = TypeVar("_T")
 
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+_thread_runner = threading.local()
 
 
 def create_background_task(
@@ -62,7 +66,8 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, timeout: float = 30) -> _T:
     Only for threads without a running event loop, such as worker threads and
     the CLI. On a running loop it would block that loop until the work ends,
     and every other task on it with it, so it raises and the caller must await
-    the coroutine instead.
+    the coroutine instead. Inside :func:`thread_loop` the coroutine runs on that
+    block's loop, and otherwise on a new loop of its own.
 
     Args:
         coro: The coroutine to execute.
@@ -78,6 +83,9 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, timeout: float = 30) -> _T:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        runner: asyncio.Runner | None = getattr(_thread_runner, "runner", None)
+        if runner is not None:
+            return runner.run(_bounded(coro, timeout))
         return asyncio.run(_bounded(coro, timeout))
     name = coro.__qualname__
     coro.close()
@@ -91,3 +99,16 @@ async def _bounded(coro: Coroutine[Any, Any, _T], timeout: float) -> _T:
     """Await the coroutine under the deadline, on the loop that runs it, so a
     cancellation reaches it and its cleanup completes before we return."""
     return await asyncio.wait_for(coro, timeout)
+
+
+@contextmanager
+def thread_loop() -> Iterator[None]:
+    """Run this thread's :func:`run_sync` calls on one loop until the block ends,
+    so their sessions share that loop's pooled connections. Closing the loop at
+    the end disposes its engines."""
+    with asyncio.Runner() as runner:
+        _thread_runner.runner = runner
+        try:
+            yield
+        finally:
+            del _thread_runner.runner

@@ -158,7 +158,7 @@ async def test_subprocess_smoke_real_ncbi(
 ) -> None:
     """End-to-end: subprocess MCP server hits real NCBI and writes to real DB."""
     job_id = uuid4()
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         session.add(
             Job(
                 id=job_id,
@@ -192,6 +192,6 @@ async def test_subprocess_smoke_real_ncbi(
         assert last_log["action"] == "search_pubmed"
         assert last_log["query"] == "CRISPR Cas9"
     finally:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+        async with AsyncSessionLocal() as session:
             await session.execute(delete(Job).where(Job.id == job_id))
             await session.commit()

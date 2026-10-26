@@ -593,7 +593,7 @@ async def _load_runtime_context(job_dir: Path) -> dict[str, Any]:
     """Load runtime job metadata from the database."""
     job_uuid = UUID(job_dir.name)
 
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         job_result = await session.execute(select(JobModel).where(JobModel.id == job_uuid))
         job = job_result.scalar_one_or_none()
         if job is None:
@@ -726,7 +726,7 @@ async def _persist_job_cost_record(
         cache_write_1h_tokens=tokens.cache_write_1h_tokens,
         reasoning_tokens=tokens.reasoning_tokens,
     )
-    async with AsyncSessionLocal(thread_safe=True) as session:
+    async with AsyncSessionLocal() as session:
         record = CostRecord(
             job_id=UUID(job_id),
             iteration=iteration,

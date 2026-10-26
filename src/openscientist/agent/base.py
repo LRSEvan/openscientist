@@ -312,7 +312,7 @@ class AbstractAgent[P: Provider](abc.ABC):
         from openscientist.prompts import get_enabled_skills
 
         try:
-            async with AsyncSessionLocal(thread_safe=True) as session:
+            async with AsyncSessionLocal() as session:
                 skills = await get_enabled_skills(session)
         except Exception as e:
             logger.warning("Failed to load enabled skills: %s", e)

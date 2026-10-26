@@ -106,7 +106,7 @@ async def _spawned_for_job(
     *,
     env_overrides: dict[str, str] | None = None,
 ) -> AsyncGenerator[ClientSession, None]:
-    async with AsyncSessionLocal(thread_safe=True) as setup:
+    async with AsyncSessionLocal() as setup:
         setup.add(
             Job(
                 id=job_id,
@@ -130,7 +130,7 @@ async def _spawned_for_job(
                 await session.initialize()
                 yield session
     finally:
-        async with AsyncSessionLocal(thread_safe=True) as cleanup:
+        async with AsyncSessionLocal() as cleanup:
             await cleanup.execute(delete(Job).where(Job.id == job_id))
             await cleanup.commit()
 

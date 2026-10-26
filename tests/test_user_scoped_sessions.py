@@ -16,8 +16,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-import openscientist.database.engine as engine_module
-import openscientist.database.session as session_module
 from openscientist.database import get_session_ctx
 from openscientist.database.models import Job, User
 from openscientist.database.models.job_share import JobShare
@@ -39,8 +37,6 @@ class _Fixture:
 @pytest_asyncio.fixture
 async def alices_job(test_engine: AsyncEngine) -> AsyncGenerator[_Fixture, None]:
     """Alice's job with one finding, and Bob, who has no share in it."""
-    engine_module._engine = None
-    session_module._session_factory = None
     async with AsyncSession(test_engine, expire_on_commit=False) as session:
         alice = User(email=f"alice-{uuid4().hex}@scoped.test", name="Alice")
         bob = User(email=f"bob-{uuid4().hex}@scoped.test", name="Bob")
@@ -60,10 +56,6 @@ async def alices_job(test_engine: AsyncEngine) -> AsyncGenerator[_Fixture, None]
         await conn.execute(
             text("DELETE FROM users WHERE id = ANY(:ids)"), {"ids": [alice.id, bob.id]}
         )
-    if engine_module._engine is not None:
-        await engine_module._engine.dispose()
-    engine_module._engine = None
-    session_module._session_factory = None
 
 
 async def _count(test_engine: AsyncEngine, sql: str, job_id: str) -> int:

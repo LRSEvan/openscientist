@@ -1034,7 +1034,7 @@ class KnowledgeState:
                 which in the agent container is the container's job login.
         """
         if session is None:
-            async with AsyncSessionLocal(thread_safe=True) as own_session:
+            async with AsyncSessionLocal() as own_session:
                 await self._save_to_database_with_session(own_session, job_id)
                 await own_session.commit()
             return
@@ -1057,7 +1057,7 @@ class KnowledgeState:
             KnowledgeState instance populated from database
         """
         if session is None:
-            async with AsyncSessionLocal(thread_safe=True) as own_session:
+            async with AsyncSessionLocal() as own_session:
                 return await cls._load_with_session(own_session, job_id)
         return await cls._load_with_session(session, job_id)
 

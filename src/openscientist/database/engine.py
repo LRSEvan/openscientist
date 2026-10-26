@@ -1,20 +1,28 @@
 """
 Database engine configuration for OpenScientist.
 
-Provides async SQLAlchemy engine instances with PostgreSQL connection pooling.
+An asyncpg connection belongs to the event loop that opened it, so each loop
+gets its own pooled engines, one per database login, created on first use.
+When the loop shuts down (``asyncio.run``, ``asyncio.Runner``, uvicorn and
+pytest-asyncio all shut down its async generators before closing it), its
+engines are disposed and its pooled connections closed.
 
 Engine Types:
-    - app_engine: Standard connection with limited privileges, subject to RLS policies
-    - admin_engine: Elevated connection that bypasses RLS (via PostgreSQL role)
+    - get_engine(): the login of ``DATABASE_URL``, subject to RLS
+    - get_admin_engine(): the login of ``ADMIN_DATABASE_URL``, which bypasses RLS
 
 ADMIN_DATABASE_URL must connect with a PostgreSQL role that has elevated
 privileges (table owner or role with BYPASSRLS). The admin engine refuses to
 start without it.
 """
 
+import asyncio
+import threading
+import weakref
+from collections.abc import AsyncGenerator
+
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-from sqlalchemy.pool import NullPool
 
 from openscientist.database.retry import guard_connect
 from openscientist.settings import get_settings
@@ -22,55 +30,87 @@ from openscientist.settings import get_settings
 # Load environment variables from .env file
 load_dotenv()
 
-# Global engine instances
-_engine: AsyncEngine | None = None
-_admin_engine: AsyncEngine | None = None
+
+class _LoopEngines:
+    """One loop's engines by URL, and the async generator that disposes them
+    when the loop shuts its async generators down."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.by_url: dict[str, AsyncEngine] = {}
+        self.keeper = _dispose_at_shutdown(loop, self.by_url)
+        # The keeper awaits nothing before its yield, so one step runs it there
+        # without the loop, and that first step registers it with this loop.
+        try:
+            self.keeper.asend(None).send(None)
+        except StopIteration:
+            return
+        raise AssertionError("the engine keeper awaited before reaching its yield")
+
+
+_loop_engines: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _LoopEngines] = (
+    weakref.WeakKeyDictionary()
+)
+_loop_engines_lock = threading.Lock()
+
+
+async def _dispose_at_shutdown(
+    loop: asyncio.AbstractEventLoop, by_url: dict[str, AsyncEngine]
+) -> AsyncGenerator[None, None]:
+    try:
+        yield
+    finally:
+        with _loop_engines_lock:
+            _loop_engines.pop(loop, None)
+        for engine in by_url.values():
+            await engine.dispose()
+
+
+def _engine_for(database_url: str) -> AsyncEngine:
+    """The running loop's pooled engine for ``database_url``."""
+    loop = asyncio.get_running_loop()
+    with _loop_engines_lock:
+        engines = _loop_engines.get(loop)
+        if engines is None:
+            engines = _loop_engines[loop] = _LoopEngines(loop)
+        engine = engines.by_url.get(database_url)
+        if engine is None:
+            settings = get_settings()
+            engine = engines.by_url[database_url] = guard_connect(
+                create_async_engine(
+                    database_url,
+                    pool_size=20,
+                    max_overflow=10,
+                    pool_timeout=30,
+                    pool_recycle=3600,
+                    pool_pre_ping=True,
+                    echo=settings.database.sql_echo,
+                ),
+                retry_for=settings.database.connect_retry_seconds,
+            )
+    return engine
 
 
 def get_engine() -> AsyncEngine:
     """
-    Get or create the async database engine for standard operations.
+    The running loop's engine for standard operations.
 
-    This engine uses the app database role with limited privileges.
-    All queries through this engine are subject to RLS policies.
+    It connects with ``DATABASE_URL``, whose login works under RLS policies.
 
     Returns:
         AsyncEngine: The SQLAlchemy async engine instance.
 
     Raises:
-        ValueError: If database is not properly configured.
+        RuntimeError: No event loop runs in this thread.
     """
-    global _engine
-
-    if _engine is None:
-        settings = get_settings()
-        database_url = settings.database.effective_database_url
-
-        _engine = guard_connect(
-            create_async_engine(
-                database_url,
-                # Connection pool settings
-                pool_size=20,  # Maximum number of permanent connections
-                max_overflow=10,  # Maximum number of temporary overflow connections
-                pool_timeout=30,  # Seconds to wait before giving up on getting a connection
-                pool_recycle=3600,  # Recycle connections after 1 hour
-                pool_pre_ping=True,  # Verify connections before using them
-                # Echo SQL queries in development
-                echo=settings.database.sql_echo,
-            ),
-            retry_for=settings.database.connect_retry_seconds,
-        )
-
-    return _engine
+    return _engine_for(get_settings().database.effective_database_url)
 
 
 def get_admin_engine() -> AsyncEngine:
     """
-    Get or create the admin database engine for privileged operations.
+    The running loop's engine for privileged operations.
 
-    This engine uses the admin database role with elevated privileges.
-    Queries through this engine bypass RLS policies via the PostgreSQL
-    role's privileges (table owner or BYPASSRLS grant).
+    It connects with ``ADMIN_DATABASE_URL``, whose role bypasses RLS policies
+    (table owner or BYPASSRLS grant).
 
     Use this engine only for:
     - Background schedulers (no user context available)
@@ -82,23 +122,7 @@ def get_admin_engine() -> AsyncEngine:
         AsyncEngine: The admin SQLAlchemy async engine instance.
 
     Raises:
-        ValueError: If database is not properly configured.
+        ValueError: ``ADMIN_DATABASE_URL`` is not configured.
+        RuntimeError: No event loop runs in this thread.
     """
-    global _admin_engine
-
-    if _admin_engine is None:
-        settings = get_settings()
-        database_url = settings.database.required_admin_database_url()
-
-        _admin_engine = guard_connect(
-            create_async_engine(
-                database_url,
-                # Use NullPool to avoid event loop conflicts in web frameworks
-                # Each connection is fresh, avoiding pool-related async issues
-                poolclass=NullPool,
-                echo=settings.database.sql_echo,
-            ),
-            retry_for=settings.database.connect_retry_seconds,
-        )
-
-    return _admin_engine
+    return _engine_for(get_settings().database.required_admin_database_url())
