@@ -506,3 +506,68 @@ async def test_deleting_a_job_cancels_it_only_while_it_is_active(
     mock_ui.notify.assert_called_once_with(
         f"Job {job_id[-8:]} deleted successfully", type="positive"
     )
+
+
+async def test_a_job_id_already_in_use_is_refused_and_the_job_kept(
+    make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock
+) -> None:
+    job = await make_job(JobStatus.COMPLETED)
+    with pytest.raises(ValueError, match="already exists"):
+        await _manager(tmp_path).create_job(str(job), "Another question?", data_files=[])
+    assert await _status(test_engine, job) == "completed"
+
+
+async def test_listing_jobs_by_status_returns_only_that_status(
+    make_job: MakeJob, tmp_path: Path, runner: MagicMock
+) -> None:
+    queued = await make_job(JobStatus.QUEUED)
+    running = await make_job(JobStatus.RUNNING)
+    listed = {job.job_id for job in await _manager(tmp_path).list_jobs(status=JobStatus.QUEUED)}
+    assert str(queued) in listed
+    assert str(running) not in listed
+
+
+async def test_a_cancel_completes_when_the_container_cannot_be_stopped(
+    make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock
+) -> None:
+    manager = _manager(tmp_path)
+    job = await make_job(JobStatus.RUNNING)
+    manager._running_jobs[str(job)] = MagicMock()
+    runner.stop.side_effect = RuntimeError("docker is unreachable")
+    with patch.object(manager, "_start_next_queued_job"):
+        await manager.cancel_job(str(job))
+    assert await _status(test_engine, job) == "cancelled"
+
+
+async def test_a_cancel_completes_when_the_owner_cannot_be_notified(
+    test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock
+) -> None:
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as session:
+        owner = User(
+            email=f"ntfy-{uuid4().hex}@cancel.test",
+            name="Owner",
+            ntfy_enabled=True,
+            ntfy_topic=f"topic-{uuid4().hex}",
+        )
+        session.add(owner)
+        await session.flush()
+        job = Job(owner_id=owner.id, research_question="Notify me?", status="running")
+        session.add(job)
+        await session.commit()
+    try:
+        with (
+            patch(
+                "openscientist.job_manager.notify_job_status_change",
+                side_effect=RuntimeError("ntfy is down"),
+            ) as notify,
+            patch.object(JobManager, "_start_next_queued_job"),
+        ):
+            await _manager(tmp_path).cancel_job(str(job.id))
+        notify.assert_called_once()
+        assert await _status(test_engine, job.id) == "cancelled"
+    finally:
+        async with factory() as session:
+            await session.execute(delete(Job).where(Job.id == job.id))
+            await session.execute(delete(User).where(User.id == owner.id))
+            await session.commit()

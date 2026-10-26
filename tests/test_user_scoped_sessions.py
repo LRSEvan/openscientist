@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,11 +19,13 @@ import openscientist.database.engine as engine_module
 import openscientist.database.session as session_module
 from openscientist.database import get_session_ctx
 from openscientist.database.models import Job, User
+from openscientist.database.models.job_share import JobShare
 from openscientist.database.rls import set_current_user
 from openscientist.database.session import thread_safe_user_session
 from openscientist.job_chat import load_job_context
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.orchestrator.iteration import update_job_status
+from openscientist.webapp_components.pages import job_detail
 
 
 @dataclass(frozen=True)
@@ -132,3 +135,76 @@ async def test_chat_context_comes_only_from_the_chatting_users_jobs(
     assert "Alice's question" in own
     assert "Alice's finding" in own
     assert "Alice" not in foreign
+
+
+async def _feedback(job_id: str) -> list[str]:
+    ks = await KnowledgeState.load_from_database(job_id)
+    return [entry["text"] for entry in ks.data.get("feedback_history", [])]
+
+
+@pytest.mark.asyncio
+async def test_the_owners_feedback_is_saved_and_continues_the_job(
+    alices_job: _Fixture, test_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    with patch.object(job_detail, "ui"):
+        await job_detail._submit_feedback_and_continue(
+            tmp_path / alices_job.job_id, alices_job.job_id, str(alices_job.owner), 1, "  Recheck  "
+        )
+    assert await _feedback(alices_job.job_id) == ["Recheck"]
+    assert await _status(test_engine, alices_job.job_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_a_strangers_feedback_changes_nothing(
+    alices_job: _Fixture, test_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    with patch.object(job_detail, "ui"), pytest.raises(ValueError, match="not found"):
+        await job_detail._submit_feedback_and_continue(
+            tmp_path / alices_job.job_id, alices_job.job_id, str(alices_job.stranger), 1, "Planted"
+        )
+    assert await _feedback(alices_job.job_id) == []
+    assert await _status(test_engine, alices_job.job_id) == "awaiting_feedback"
+
+
+@pytest.mark.asyncio
+async def test_the_job_page_shows_the_knowledge_state_to_its_owner_only(
+    alices_job: _Fixture,
+) -> None:
+    data, error = await job_detail._load_knowledge_state(alices_job.job_id, str(alices_job.owner))
+    assert error is None
+    assert data is not None
+    assert [f["title"] for f in data["findings"]] == ["Alice's finding"]
+    data, error = await job_detail._load_knowledge_state(
+        alices_job.job_id, str(alices_job.stranger)
+    )
+    assert data is None
+    assert error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("share", "rights"), [(None, None), ("view", (False, False)), ("edit", (False, True))]
+)
+async def test_a_users_rights_on_the_job_page_follow_their_share(
+    alices_job: _Fixture, test_engine: AsyncEngine, share: str | None, rights: object
+) -> None:
+    if share is not None:
+        async with AsyncSession(test_engine) as session:
+            session.add(
+                JobShare(
+                    job_id=UUID(alices_job.job_id),
+                    shared_with_user_id=alices_job.stranger,
+                    permission_level=share,
+                )
+            )
+            await session.commit()
+    bob = str(alices_job.stranger)
+    job = await job_detail._load_db_job_for_user(alices_job.job_id, bob)
+    if rights is None:
+        assert job is None
+    else:
+        assert await job_detail._resolve_job_permissions(alices_job.job_id, bob, job) == rights
+    own = await job_detail._load_db_job_for_user(alices_job.job_id, str(alices_job.owner))
+    assert await job_detail._resolve_job_permissions(
+        alices_job.job_id, str(alices_job.owner), own
+    ) == (True, True)
