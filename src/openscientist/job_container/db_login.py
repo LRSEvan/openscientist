@@ -11,6 +11,9 @@ the reaper drops what is left.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
 import re
 import secrets
@@ -46,6 +49,24 @@ class AgentLogin:
     database_url: str
 
 
+#: PostgreSQL's default ``scram_iterations``.
+_SCRAM_ITERATIONS = 4096
+
+
+def _scram_verifier(password: str) -> str:
+    """The SCRAM-SHA-256 verifier PostgreSQL stores for ``password`` (RFC 7677),
+    which accepts the password at login but cannot be turned back into it."""
+    salt = secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _SCRAM_ITERATIONS)
+    stored_key = hashlib.sha256(hmac.new(salted, b"Client Key", hashlib.sha256).digest()).digest()
+    server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+
+    def b64(raw: bytes) -> str:
+        return base64.b64encode(raw).decode()
+
+    return f"SCRAM-SHA-256${_SCRAM_ITERATIONS}:{b64(salt)}${b64(stored_key)}:{b64(server_key)}"
+
+
 async def create_agent_login(job_id: str, *, lifetime_seconds: int) -> AgentLogin:
     """Create a login for one container of ``job_id`` and map it to the job."""
     role = f"agent_{secrets.token_hex(16)}"
@@ -53,14 +74,20 @@ async def create_agent_login(job_id: str, *, lifetime_seconds: int) -> AgentLogi
     valid_until = datetime.now(UTC) + timedelta(seconds=lifetime_seconds) + _GRACE
     async with AsyncSessionLocal() as session:
         # CREATE ROLE takes no bind parameters, so the server quotes the values.
+        # The statement is SQL text that errors and the server log repeat, so it
+        # carries the password's SCRAM verifier, never the password.
         statement = (
             await session.execute(
                 text(
                     "SELECT format('CREATE ROLE %I LOGIN PASSWORD %L VALID UNTIL %L "
                     "IN ROLE openscientist_agent', CAST(:role AS text), "
-                    "CAST(:password AS text), CAST(:valid_until AS text))"
+                    "CAST(:verifier AS text), CAST(:valid_until AS text))"
                 ),
-                {"role": role, "password": password, "valid_until": valid_until.isoformat()},
+                {
+                    "role": role,
+                    "verifier": _scram_verifier(password),
+                    "valid_until": valid_until.isoformat(),
+                },
             )
         ).scalar_one()
         await (await session.connection()).exec_driver_sql(statement)

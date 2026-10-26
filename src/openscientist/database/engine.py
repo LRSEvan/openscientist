@@ -84,6 +84,9 @@ def _engine_for(database_url: str) -> AsyncEngine:
                     pool_recycle=3600,
                     pool_pre_ping=True,
                     echo=settings.database.sql_echo,
+                    # Statements bind session tokens and other secrets, and
+                    # database errors and the echo log reach the logs.
+                    hide_parameters=True,
                 ),
                 retry_for=settings.database.connect_retry_seconds,
             )
