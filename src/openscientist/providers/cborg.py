@@ -112,7 +112,7 @@ class CborgProvider(ClaudeCompatible):
 
     def claude_model_name(self) -> str:
         """Model name for ClaudeAgentOptions.model."""
-        return get_settings().provider.model or "claude-sonnet-4-20250514"
+        return get_settings().provider.model or "claude-sonnet-5-5"
 
     def _validate_optional_config(self) -> list[str]:
         """Check optional CBORG configuration."""
@@ -120,7 +120,7 @@ class CborgProvider(ClaudeCompatible):
         settings = get_settings()
 
         if not settings.provider.model:
-            warnings.append("OPENSCIENTIST_MODEL not set (will use Claude CLI default)")
+            warnings.append("OPENSCIENTIST_MODEL not set (will use claude-sonnet-5-5)")
 
         return warnings
 

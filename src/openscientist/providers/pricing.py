@@ -172,13 +172,6 @@ _FALLBACK_PRICING: dict[str, Any] = {
         "cache_creation_input_token_cost": 3.75e-6,
         "cache_creation_input_token_cost_above_1hr": 6e-6,
     },
-    "claude-sonnet-4-5": {
-        "input_cost_per_token": 3e-6,
-        "output_cost_per_token": 15e-6,
-        "cache_read_input_token_cost": 0.3e-6,
-        "cache_creation_input_token_cost": 3.75e-6,
-        "cache_creation_input_token_cost_above_1hr": 6e-6,
-    },
     "claude-haiku-4-5": {
         "input_cost_per_token": 1e-6,
         "output_cost_per_token": 5e-6,

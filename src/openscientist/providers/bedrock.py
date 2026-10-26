@@ -86,7 +86,7 @@ class BedrockProvider(ClaudeCompatible):
 
     def claude_model_name(self) -> str:
         """Model name for ClaudeAgentOptions.model."""
-        return get_settings().provider.model or "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        return get_settings().provider.model or "us.anthropic.claude-sonnet-5-5"
 
     def llm_upstream(self) -> LlmUpstream | None:
         p = get_settings().provider
@@ -164,9 +164,7 @@ class BedrockProvider(ClaudeCompatible):
         settings = get_settings()
 
         if not settings.provider.model:
-            warnings.append(
-                "OPENSCIENTIST_MODEL not set (will use global.anthropic.claude-sonnet-4-5-20250929-v1:0)"
-            )
+            warnings.append("OPENSCIENTIST_MODEL not set (will use us.anthropic.claude-sonnet-5-5)")
 
         if not settings.provider.anthropic_small_fast_model:
             warnings.append(

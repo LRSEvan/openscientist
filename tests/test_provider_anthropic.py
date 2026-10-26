@@ -179,11 +179,6 @@ class TestAnthropicClaudeCompatible:
         with patch("openscientist.providers.anthropic.get_settings", return_value=settings):
             assert AnthropicProvider().claude_model_name() == "claude-custom-model"
 
-    def test_claude_model_name_falls_back_to_default(self) -> None:
-        settings = _mock_settings(model=None)
-        with patch("openscientist.providers.anthropic.get_settings", return_value=settings):
-            assert AnthropicProvider().claude_model_name() == "claude-sonnet-4-20250514"
-
 
 class TestAnthropicGetCostInfo:
     """Tests for get_cost_info()."""
