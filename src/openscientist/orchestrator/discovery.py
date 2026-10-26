@@ -12,7 +12,8 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -46,7 +47,6 @@ from openscientist.orchestrator.iteration import (
     update_job_status,
     wait_for_feedback_or_timeout,
 )
-from openscientist.providers import get_provider
 from openscientist.providers.base import Provider
 from openscientist.settings import get_settings
 from openscientist.transcript import TranscriptEntry, save_transcript
@@ -228,6 +228,7 @@ async def _run_primary_discovery_loop(
     runtime: dict[str, Any],
     provenance_dir: Path,
     log_file: Path,
+    ledger: _CostLedger,
 ) -> None:
     """Run initial and iterative discovery phases before report generation."""
     job_id = runtime["job_id"]
@@ -246,6 +247,7 @@ async def _run_primary_discovery_loop(
     )
 
     logger.info("Iteration 1/%d: Starting session", max_iterations)
+    ledger.begin("discovery", 1)
     result = await executor.run_iteration(initial_prompt, reset_session=True)
     _check_turn_outcome(result, 1)
 
@@ -258,6 +260,7 @@ async def _run_primary_discovery_loop(
         result=result,
         overwrite_log=True,
     )
+    await ledger.record()
     if max_iterations > 1:
         increment_ks_iteration(job_id)
     await _assert_job_not_cancelled(job_id)
@@ -300,6 +303,7 @@ async def _run_primary_discovery_loop(
             "fresh session" if should_reset else "continuing",
         )
 
+        ledger.begin("discovery", iteration)
         result = await executor.run_iteration(iteration_prompt, reset_session=should_reset)
         _check_turn_outcome(result, iteration)
         _append_iteration_artifacts(
@@ -309,6 +313,7 @@ async def _run_primary_discovery_loop(
             prompt=iteration_prompt,
             result=result,
         )
+        await ledger.record()
 
         if iteration < max_iterations:
             increment_ks_iteration(job_id)
@@ -704,8 +709,9 @@ async def _persist_job_cost_record(
     provider_name: str,
     model_name: str,
     operation_type: str = "discovery",
+    iteration: int | None = None,
 ) -> None:
-    """Write a CostRecord for the completed job execution."""
+    """Write a CostRecord for ``tokens``, spent in ``operation_type`` at ``iteration``."""
     from openscientist.database.models import CostRecord
     from openscientist.providers.pricing import estimate_cost_usd
 
@@ -723,7 +729,7 @@ async def _persist_job_cost_record(
     async with AsyncSessionLocal(thread_safe=True) as session:
         record = CostRecord(
             job_id=UUID(job_id),
-            iteration=None,
+            iteration=iteration,
             operation_type=operation_type,
             provider=provider_name,
             model=model_name,
@@ -740,8 +746,102 @@ async def _persist_job_cost_record(
         await session.commit()
 
 
-async def _finalize_executor(executor: AbstractAgent[Provider], job_id: str) -> None:
-    """Log token usage, persist a cost record, and shut the executor down.
+class _CostLedger:
+    """A run's cost, written as it goes. Each record holds the tokens spent
+    since the last record that was written, so a failed write is carried into
+    the next one."""
+
+    def __init__(
+        self,
+        job_id: str,
+        *,
+        usage: Callable[[], TokenUsage],
+        provider_name: str,
+        model_name: str,
+    ) -> None:
+        self._job_id = job_id
+        self._usage = usage
+        self._provider_name = provider_name
+        self._model_name = model_name
+        self._written = TokenUsage()
+        self._operation_type = "discovery"
+        self._iteration: int | None = None
+
+    @classmethod
+    def for_executor(cls, executor: AbstractAgent[Provider], job_id: str) -> _CostLedger:
+        settings = get_settings()
+        provider = executor.provider
+        model_name = (
+            settings.provider.model
+            or settings.provider.anthropic_default_sonnet_model
+            or provider.effective_model_name()
+            or "unknown"
+        )
+        return cls(
+            job_id,
+            usage=lambda: executor.total_tokens,
+            provider_name=provider.display_name,
+            model_name=model_name,
+        )
+
+    def begin(self, operation_type: str, iteration: int | None) -> None:
+        """Label the tokens spent from now on."""
+        self._operation_type = operation_type
+        self._iteration = iteration
+
+    def _unwritten(self) -> tuple[TokenUsage, TokenUsage]:
+        # A copy, since agents grow their running total in place.
+        total = replace(self._usage())
+        return total, total - self._written
+
+    async def record(self) -> bool:
+        """Write the tokens spent since the last written record. Returns whether
+        nothing is left unwritten."""
+        total, unwritten = self._unwritten()
+        if unwritten == TokenUsage():
+            return True
+        try:
+            await _persist_job_cost_record(
+                self._job_id,
+                unwritten,
+                self._provider_name,
+                self._model_name,
+                operation_type=self._operation_type,
+                iteration=self._iteration,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not write the cost of job %s, carrying it to the next record: %s",
+                self._job_id,
+                e,
+            )
+            return False
+        self._written = total
+        return True
+
+    async def close(self) -> None:
+        """Write what is left. If that fails too, log every count so the
+        tokens can still be billed."""
+        if await self.record():
+            return
+        _, unwritten = self._unwritten()
+        logger.error(
+            "Cost of job %s was not saved: provider=%s model=%s input=%d output=%d "
+            "cache_write=%d cache_write_1h=%d cache_read=%d reasoning=%d",
+            self._job_id,
+            self._provider_name,
+            self._model_name,
+            unwritten.input_tokens,
+            unwritten.output_tokens,
+            unwritten.cache_write_tokens,
+            unwritten.cache_write_1h_tokens,
+            unwritten.cache_read_tokens,
+            unwritten.reasoning_tokens,
+        )
+
+
+async def _finalize_executor(executor: AbstractAgent[Provider], ledger: _CostLedger) -> None:
+    """Log token usage, write the cost not yet recorded, and shut the executor down.
 
     Shared ``finally`` handling for both the full discovery run and the
     report-only regeneration run so neither leaks the executor or its cost.
@@ -757,18 +857,7 @@ async def _finalize_executor(executor: AbstractAgent[Provider], job_id: str) -> 
         tokens.cache_write_1h_tokens,
         tokens.reasoning_tokens,
     )
-    try:
-        settings = get_settings()
-        provider = get_provider()
-        model_name = (
-            settings.provider.model
-            or settings.provider.anthropic_default_sonnet_model
-            or provider.effective_model_name()
-            or "unknown"
-        )
-        await _persist_job_cost_record(job_id, tokens, provider.display_name, model_name)
-    except Exception as cost_err:
-        logger.warning("Failed to persist cost record for job %s: %s", job_id, cost_err)
+    await ledger.close()
     await executor.shutdown()
 
 
@@ -818,13 +907,16 @@ async def regenerate_report_async(job_dir: Path) -> dict[str, Any]:
     logger.info("Regenerating report for job %s", job_id)
 
     executor = await _build_and_prepare_executor(job_dir, runtime)
+    ledger = _CostLedger.for_executor(executor, job_id)
     try:
+        ledger.begin("report", None)
         report_outcome = await _run_report_generation_phase(
             executor=executor,
             job_dir=job_dir,
             research_question=runtime["research_question"],
             description=runtime.get("description"),
         )
+        await ledger.record()
         final_status = await _persist_final_status(job_dir, report_outcome)
         ks = KnowledgeState.load_from_database_sync(job_id)
         return {
@@ -856,7 +948,7 @@ async def regenerate_report_async(job_dir: Path) -> dict[str, Any]:
             "error": str(e),
         }
     finally:
-        await _finalize_executor(executor, job_id)
+        await _finalize_executor(executor, ledger)
 
 
 async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
@@ -879,6 +971,7 @@ async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
     logger.info("Starting discovery for job %s (mode=%s)", job_id, runtime["investigation_mode"])
 
     executor = await _build_and_prepare_executor(job_dir, runtime)
+    ledger = _CostLedger.for_executor(executor, job_id)
     logger.info("Created agent executor for job %s", job_id)
 
     provenance_dir = job_dir / "provenance"
@@ -892,13 +985,16 @@ async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
             runtime=runtime,
             provenance_dir=provenance_dir,
             log_file=log_file,
+            ledger=ledger,
         )
+        ledger.begin("report", None)
         report_outcome = await _run_report_generation_phase(
             executor=executor,
             job_dir=job_dir,
             research_question=runtime["research_question"],
             description=runtime.get("description"),
         )
+        await ledger.record()
         final_status = await _persist_final_status(job_dir, report_outcome)
         ks = KnowledgeState.load_from_database_sync(job_id)
         return {
@@ -945,7 +1041,7 @@ async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
         }
 
     finally:
-        await _finalize_executor(executor, job_id)
+        await _finalize_executor(executor, ledger)
 
 
 def _save_transcript(path: Path, transcript: list[TranscriptEntry]) -> None:

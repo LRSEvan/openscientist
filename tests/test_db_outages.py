@@ -1,13 +1,9 @@
-"""Job-state paths under a real database outage (plans/swallowed-db-errors.md).
-
-The app reaches the test database through a TCP forwarder that a test closes,
-so connects are refused, and reopens to end the outage."""
+"""Job-state paths under a real database outage (plans/swallowed-db-errors.md),
+through the ``database`` forwarder fixture."""
 
 from __future__ import annotations
 
 import asyncio
-import os
-import socket
 import threading
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
@@ -20,108 +16,17 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select, text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 import openscientist.database.engine as engine_module
-import openscientist.database.session as session_module
 from openscientist.database.models import Job, User
 from openscientist.database.retry import DatabaseUnavailableError
 from openscientist.job_manager import JobManager, JobStatus
 from openscientist.orchestrator.discovery import _assert_job_running
 from openscientist.orchestrator.iteration import update_job_status
-from openscientist.settings import get_settings
-
-
-class _Forwarder:
-    """Forwards a local port to the database until :meth:`down`, and again after :meth:`up`."""
-
-    def __init__(self, target: tuple[str, int]) -> None:
-        self._target = target
-        probe = socket.socket()
-        probe.bind(("127.0.0.1", 0))
-        self.port = probe.getsockname()[1]
-        probe.close()
-        self._listener: socket.socket | None = None
-        self._open: set[socket.socket] = set()
-        self._lock = threading.Lock()
-        self.up()
-
-    def up(self) -> None:
-        listener = socket.socket()
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", self.port))
-        listener.listen()
-        listener.settimeout(0.1)
-        self._listener = listener
-        threading.Thread(target=self._accept, args=(listener,), daemon=True).start()
-
-    def down(self) -> None:
-        listener, self._listener = self._listener, None
-        if listener is not None:
-            listener.close()
-        with self._lock:
-            for sock in self._open:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                sock.close()
-            self._open.clear()
-
-    def _accept(self, listener: socket.socket) -> None:
-        while self._listener is listener:
-            try:
-                client, _ = listener.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            server = socket.create_connection(self._target)
-            with self._lock:
-                self._open.update((client, server))
-            for src, dst in ((client, server), (server, client)):
-                threading.Thread(target=self._pipe, args=(src, dst), daemon=True).start()
-
-    @staticmethod
-    def _pipe(src: socket.socket, dst: socket.socket) -> None:
-        try:
-            while data := src.recv(65536):
-                dst.sendall(data)
-        except OSError:
-            pass
-        finally:
-            for sock in (src, dst):
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-
-def _reset_database_state() -> None:
-    get_settings.cache_clear()
-    engine_module._engine = None
-    engine_module._admin_engine = None
-    session_module._session_factory = None
-    session_module._admin_session_factory = None
-
-
-@pytest.fixture
-def database(test_engine: AsyncEngine) -> Iterator[_Forwarder]:
-    """Point every app login at the forwarder, which starts up."""
-    names = ("DATABASE_URL", "ADMIN_DATABASE_URL")
-    saved = {name: os.environ[name] for name in names}
-    target = make_url(saved["DATABASE_URL"])
-    forwarder = _Forwarder((target.host or "127.0.0.1", target.port or 5432))
-    for name in names:
-        url = make_url(saved[name]).set(host="127.0.0.1", port=forwarder.port)
-        os.environ[name] = url.render_as_string(hide_password=False)
-    _reset_database_state()
-    yield forwarder
-    forwarder.down()
-    os.environ.update(saved)
-    _reset_database_state()
+from tests.db_logins import reset_database_state
+from tests.db_outage import Forwarder
 
 
 @pytest.fixture(autouse=True)
@@ -152,7 +57,7 @@ async def _status(test_engine: AsyncEngine, job_id: UUID) -> str:
         return str(await conn.scalar(select(Job.status).where(Job.id == job_id)))
 
 
-async def _down_for(database: _Forwarder, seconds: float) -> None:
+async def _down_for(database: Forwarder, seconds: float) -> None:
     await asyncio.sleep(seconds)
     database.up()
 
@@ -176,7 +81,7 @@ def _stop_manager_background(manager: JobManager) -> None:
 
 
 async def test_a_container_write_outlives_a_short_outage(
-    database: _Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     job = job_in[JobStatus.RUNNING]
     database.down()
@@ -189,7 +94,7 @@ async def test_a_container_write_outlives_a_short_outage(
 
 
 async def test_a_container_write_fails_once_the_outage_outlasts_its_window(
-    database: _Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     job = job_in[JobStatus.RUNNING]
     database.down()
@@ -204,7 +109,7 @@ async def test_a_container_write_fails_once_the_outage_outlasts_its_window(
 
 
 async def test_a_container_status_read_outlives_a_short_outage(
-    database: _Forwarder, job_in: dict[JobStatus, UUID]
+    database: Forwarder, job_in: dict[JobStatus, UUID]
 ) -> None:
     database.down()
     read = asyncio.create_task(_assert_job_running(str(job_in[JobStatus.RUNNING])))
@@ -213,7 +118,7 @@ async def test_a_container_status_read_outlives_a_short_outage(
 
 
 async def test_any_container_read_waits_out_a_short_outage(
-    database: _Forwarder,
+    database: Forwarder,
     job_in: dict[JobStatus, UUID],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,7 +129,7 @@ async def test_any_container_read_waits_out_a_short_outage(
     from openscientist.orchestrator.discovery import _load_runtime_context
 
     monkeypatch.setenv("OPENSCIENTIST_DB_CONNECT_RETRY_SECONDS", str(CONTAINER_DB_RETRY_SECONDS))
-    _reset_database_state()
+    reset_database_state()
     database.down()
     read = asyncio.create_task(_load_runtime_context(tmp_path / str(job_in[JobStatus.RUNNING])))
     await _down_for(database, 2)
@@ -273,7 +178,7 @@ def test_a_background_write_raises_a_non_connection_error_at_once() -> None:
 
 
 async def test_the_admin_engine_reports_an_outage_instead_of_a_connect_error(
-    database: _Forwarder,
+    database: Forwarder,
 ) -> None:
     """The admin engine answers like the web's: a working database connects,
     and an unreachable one answers as a database outage, not as a bare
@@ -287,7 +192,7 @@ async def test_the_admin_engine_reports_an_outage_instead_of_a_connect_error(
 
 
 async def test_a_job_read_during_an_outage_raises_instead_of_not_found(
-    database: _Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     manager = JobManager(jobs_dir=tmp_path)
     database.down()
@@ -296,7 +201,7 @@ async def test_a_job_read_during_an_outage_raises_instead_of_not_found(
 
 
 async def test_the_api_answers_503_during_an_outage(
-    database: _Forwarder, job_in: dict[JobStatus, UUID]
+    database: Forwarder, job_in: dict[JobStatus, UUID]
 ) -> None:
     from fastapi import FastAPI
 
@@ -363,7 +268,7 @@ async def test_registering_the_api_installs_the_outage_handlers() -> None:
 
 
 async def test_cancelling_a_job_that_ends_first_answers_400(
-    database: _Forwarder, test_engine: AsyncEngine, tmp_path: Path
+    database: Forwarder, test_engine: AsyncEngine, tmp_path: Path
 ) -> None:
     """A cancel that loses the race against the job's own end answers 400 with
     the job manager's error, instead of a 500. The job is running when the
@@ -412,7 +317,7 @@ async def test_cancelling_a_job_that_ends_first_answers_400(
 
 
 async def test_a_worker_write_applies_once_the_database_returns(
-    database: _Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     manager = JobManager(jobs_dir=tmp_path)
     job = job_in[JobStatus.RUNNING]
@@ -434,7 +339,7 @@ async def test_a_worker_write_applies_once_the_database_returns(
 
 
 async def test_startup_recovery_runs_once_the_database_returns(
-    database: _Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, test_engine: AsyncEngine, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     manager = JobManager(jobs_dir=tmp_path, max_concurrent=5)
     database.down()
@@ -450,7 +355,7 @@ async def test_startup_recovery_runs_once_the_database_returns(
 
 
 async def test_a_rejected_recovery_write_keeps_the_rest_of_the_recovery_running(
-    database: _Forwarder, test_engine: AsyncEngine, tmp_path: Path
+    database: Forwarder, test_engine: AsyncEngine, tmp_path: Path
 ) -> None:
     """A job whose recovery write the database rejects is skipped with a
     logged error, and the recovery goes on with the jobs after it."""
@@ -504,7 +409,7 @@ async def test_a_rejected_recovery_write_keeps_the_rest_of_the_recovery_running(
 
 
 async def test_a_lost_container_is_cancelled_when_cleanup_fails(
-    database: _Forwarder, test_engine: AsyncEngine, tmp_path: Path
+    database: Forwarder, test_engine: AsyncEngine, tmp_path: Path
 ) -> None:
     """The job is marked cancelled even when the container cleanup fails: the
     cancellation write is not rolled back by the cleanup error."""
@@ -545,7 +450,7 @@ async def test_a_lost_container_is_cancelled_when_cleanup_fails(
 
 
 async def test_startup_does_not_wait_for_a_down_database(
-    database: _Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     """Recovery waits out a lost database in the background, so the web
     process starts even when the database is still down, and picks the
@@ -591,7 +496,7 @@ async def test_startup_does_not_wait_for_a_down_database(
 
 
 async def test_a_pick_that_meets_an_outage_starts_the_job_after_it(
-    database: _Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     manager = JobManager(jobs_dir=tmp_path)
     queued = str(job_in[JobStatus.QUEUED])
@@ -624,7 +529,7 @@ def test_a_pick_error_other_than_an_outage_is_not_scheduled_to_retry(tmp_path: P
 
 
 async def test_a_second_outage_reuses_the_pending_repick(
-    database: _Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
+    database: Forwarder, job_in: dict[JobStatus, UUID], tmp_path: Path
 ) -> None:
     """A second pick failure while a repick is already pending does not reset
     the backoff; the job is picked once, after the database returns."""

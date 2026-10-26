@@ -53,6 +53,10 @@ from openscientist.version import SHORT_COMMIT_LENGTH
 
 logger = logging.getLogger(__name__)
 
+#: Seconds a stopped agent gets, after SIGTERM, to write the cost of the
+#: iteration in progress before docker sends SIGKILL.
+_STOP_GRACE_SECONDS = 10
+
 AGENT_APP_DIR = "/agent"
 AGENT_GCP_CREDENTIALS_PATH = f"{AGENT_APP_DIR}/gcp-credentials.json"
 
@@ -407,7 +411,7 @@ class JobContainerRunner:
         if role:
             close_agent_login(role)
 
-    def stop(self, job_id: str, timeout: int = 10) -> None:
+    def stop(self, job_id: str, timeout: int = _STOP_GRACE_SECONDS) -> None:
         """Stop the container for a job (graceful → SIGKILL)."""
         container = self._find_container(job_id)
         if container:
@@ -420,11 +424,18 @@ class JobContainerRunner:
                 logger.warning("Failed to stop container for job %s: %s", job_id, error)
 
     def cleanup(self, job_id: str, log_dir: Path | None = None) -> None:
-        """Remove the container for a job, optionally saving its logs first, and
-        drop its database login."""
+        """Stop the container for a job, giving it the same grace as :meth:`stop`,
+        then save its logs if asked, remove it and drop its database login."""
         container = self._find_container(job_id)
         if container:
             try:
+                # The agent writes the cost of the iteration in progress when it
+                # is stopped, so a forced removal would lose it.
+                try:
+                    container.stop(timeout=_STOP_GRACE_SECONDS)
+                except docker_errors.APIError as error:
+                    if not self._is_not_found_error(error):
+                        logger.warning("Failed to stop container for job %s: %s", job_id, error)
                 if log_dir is not None:
                     try:
                         logs = container.logs(stdout=True, stderr=True).decode(

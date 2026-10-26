@@ -132,6 +132,7 @@ async def test_per_record_table_carries_every_priced_bucket() -> None:
     kwargs = table.call_args.kwargs
     assert [column["field"] for column in kwargs["columns"]] == [
         "job_id",
+        "iteration",
         "model",
         "provider",
         *_PRICED_BUCKETS,

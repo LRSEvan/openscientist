@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -38,6 +39,7 @@ from tests.db_logins import (
     reset_database_state,
     run_bootstrap,
 )
+from tests.db_outage import Forwarder
 
 
 # Clear any cached settings after environment setup
@@ -308,6 +310,24 @@ async def test_engine(
 
     yield engine
     await engine.dispose()
+
+
+@pytest.fixture
+def database(test_engine: AsyncEngine) -> Generator[Forwarder, None, None]:
+    """Point every app login at a forwarder to the test database, which starts
+    up. ``database.down()`` refuses connects until ``database.up()``."""
+    names = ("DATABASE_URL", "ADMIN_DATABASE_URL")
+    saved = {name: os.environ[name] for name in names}
+    target = make_url(saved["DATABASE_URL"])
+    forwarder = Forwarder((target.host or "127.0.0.1", target.port or 5432))
+    for name in names:
+        url = make_url(saved[name]).set(host="127.0.0.1", port=forwarder.port)
+        os.environ[name] = url.render_as_string(hide_password=False)
+    reset_database_state()
+    yield forwarder
+    forwarder.down()
+    os.environ.update(saved)
+    reset_database_state()
 
 
 @pytest_asyncio.fixture

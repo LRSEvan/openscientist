@@ -20,6 +20,14 @@ async def render_billing_panel() -> None:
         _render_provider_cost_section()
 
 
+def _iteration_label(record: CostRecord) -> str:
+    """The iteration a record covers, "report" for the report phase, and blank
+    for a record that covers a whole run."""
+    if record.iteration is not None:
+        return str(record.iteration)
+    return "report" if record.operation_type == "report" else ""
+
+
 async def _render_db_cost_section() -> None:
     """Query CostRecord and display per-job cost breakdown."""
     async with get_admin_session() as session:
@@ -52,6 +60,7 @@ async def _render_db_cost_section() -> None:
 
     columns = [
         {"name": "job_id", "label": "Job", "field": "job_id", "align": "left"},
+        {"name": "iteration", "label": "Iteration", "field": "iteration", "align": "right"},
         {"name": "model", "label": "Model", "field": "model", "align": "left"},
         {"name": "provider", "label": "Provider", "field": "provider", "align": "left"},
         {
@@ -91,6 +100,7 @@ async def _render_db_cost_section() -> None:
         {
             "id": str(r.id),
             "job_id": "..." + str(r.job_id)[-8:],
+            "iteration": _iteration_label(r),
             "model": r.model,
             "provider": r.provider,
             "input_tokens": r.input_tokens,
