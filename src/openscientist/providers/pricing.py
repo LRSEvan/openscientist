@@ -158,6 +158,13 @@ _FALLBACK_PRICING: dict[str, Any] = {
         "cache_creation_input_token_cost": 6.25e-6,
         "cache_creation_input_token_cost_above_1hr": 10e-6,
     },
+    "claude-sonnet-5-5": {
+        "input_cost_per_token": 2e-6,
+        "output_cost_per_token": 10e-6,
+        "cache_read_input_token_cost": 0.1e-6,
+        "cache_creation_input_token_cost": 2.5e-6,
+        "cache_creation_input_token_cost_above_1hr": 4e-6,
+    },
     "claude-sonnet-4-6": {
         "input_cost_per_token": 3e-6,
         "output_cost_per_token": 15e-6,
@@ -166,13 +173,6 @@ _FALLBACK_PRICING: dict[str, Any] = {
         "cache_creation_input_token_cost_above_1hr": 6e-6,
     },
     "claude-sonnet-4-5": {
-        "input_cost_per_token": 3e-6,
-        "output_cost_per_token": 15e-6,
-        "cache_read_input_token_cost": 0.3e-6,
-        "cache_creation_input_token_cost": 3.75e-6,
-        "cache_creation_input_token_cost_above_1hr": 6e-6,
-    },
-    "claude-sonnet-4-20250514": {
         "input_cost_per_token": 3e-6,
         "output_cost_per_token": 15e-6,
         "cache_read_input_token_cost": 0.3e-6,
