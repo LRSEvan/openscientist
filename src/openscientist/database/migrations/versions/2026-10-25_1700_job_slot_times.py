@@ -1,7 +1,7 @@
 """Record when each job takes and gives back a slot, for the balancing scheduler.
 
 Revision ID: job_slot_times
-Revises: users_update_own_ntfy
+Revises: job_start_permission
 Create Date: 2026-10-25 17:00:00
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "job_slot_times"
-down_revision: str | None = "users_update_own_ntfy"
+down_revision: str | None = "job_start_permission"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
