@@ -197,7 +197,7 @@ async def test_a_job_read_during_an_outage_raises_instead_of_not_found(
     manager = JobManager(jobs_dir=tmp_path)
     database.down()
     with pytest.raises(DatabaseUnavailableError):
-        await asyncio.to_thread(manager.get_job, str(job_in[JobStatus.RUNNING]))
+        await manager.get_job(str(job_in[JobStatus.RUNNING]))
 
 
 async def test_the_api_answers_503_during_an_outage(

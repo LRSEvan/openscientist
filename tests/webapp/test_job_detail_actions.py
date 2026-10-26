@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -20,7 +20,7 @@ def _action_context() -> SimpleNamespace:
     """Stand-in for the regenerate action handler with a recording manager."""
     return SimpleNamespace(
         job_id="job-1",
-        job_manager=SimpleNamespace(regenerate_report=MagicMock()),
+        job_manager=SimpleNamespace(regenerate_report=AsyncMock()),
     )
 
 
@@ -39,7 +39,7 @@ def test_can_regenerate_report_gating(is_admin: bool, status: JobStatus, expecte
         assert job_detail._can_regenerate_report(_context(status)) is expected  # type: ignore[arg-type]
 
 
-def test_regenerate_action_blocks_non_admin_server_side() -> None:
+async def test_regenerate_action_blocks_non_admin_server_side() -> None:
     """The action handler re-checks admin and never reaches the manager for a
     non-admin, even if the button were somehow triggered."""
     context = _action_context()
@@ -47,19 +47,19 @@ def test_regenerate_action_blocks_non_admin_server_side() -> None:
         patch.object(job_detail, "is_current_user_admin", return_value=False),
         patch.object(job_detail, "ui"),  # swallow notify/navigate
     ):
-        job_detail._regenerate_report(context)  # type: ignore[arg-type]
+        await job_detail._regenerate_report(context)  # type: ignore[arg-type]
     context.job_manager.regenerate_report.assert_not_called()
 
 
-def test_regenerate_action_calls_manager_for_admin() -> None:
+async def test_regenerate_action_calls_manager_for_admin() -> None:
     """An admin action reaches the manager with the job id."""
     context = _action_context()
     with (
         patch.object(job_detail, "is_current_user_admin", return_value=True),
         patch.object(job_detail, "ui"),  # swallow notify/navigate
     ):
-        job_detail._regenerate_report(context)  # type: ignore[arg-type]
-    context.job_manager.regenerate_report.assert_called_once_with("job-1")
+        await job_detail._regenerate_report(context)  # type: ignore[arg-type]
+    context.job_manager.regenerate_report.assert_awaited_once_with("job-1")
 
 
 class TestTimelineHeaderText:

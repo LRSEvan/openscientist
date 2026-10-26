@@ -92,10 +92,8 @@ async def test_a_user_cannot_save_knowledge_into_someone_elses_job(
     ks = await KnowledgeState.load_from_database(alices_job.job_id)
     ks.add_finding("Planted finding", "evidence")
     with pytest.raises(DBAPIError):
-        ks.save_to_database_sync(
-            alices_job.job_id,
-            open_session=partial(thread_safe_user_session, alices_job.stranger),
-        )
+        async with thread_safe_user_session(alices_job.stranger) as session:
+            await ks.save_to_database(alices_job.job_id, session)
     planted = "SELECT count(*) FROM findings WHERE job_id = :id AND text = 'Planted finding'"
     assert await _count(test_engine, planted, alices_job.job_id) == 0
 

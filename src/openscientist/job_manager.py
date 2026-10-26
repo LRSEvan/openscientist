@@ -5,6 +5,7 @@ Handles job lifecycle, status tracking, and cleanup.
 """
 
 import argparse
+import asyncio
 import json
 import logging
 import shutil
@@ -89,7 +90,7 @@ def _derive_progress_from_db(status: str, current_iteration: int) -> int:
     return current_iteration
 
 
-def _load_progress_from_knowledge_state(
+async def _load_progress(
     job_id: str,
     status: str,
     default_iterations: int,
@@ -97,9 +98,8 @@ def _load_progress_from_knowledge_state(
 ) -> tuple[int, int]:
     """Load progress as the admin login, since job lists and polls read it for no user."""
     try:
-        ks = KnowledgeState.load_from_database_sync(
-            job_id, open_session=thread_safe_admin_session
-        ).data
+        async with thread_safe_admin_session() as session:
+            ks = (await KnowledgeState.load_from_database(job_id, session)).data
         findings_count = len(ks.get("findings", []))
         ks_iteration = int(ks.get("iteration", 1))
 
@@ -112,6 +112,16 @@ def _load_progress_from_knowledge_state(
     except Exception as e:
         logger.warning("Failed to load KS for job %s: %s", job_id, e)
         return default_iterations, default_findings
+
+
+def _load_progress_from_knowledge_state(
+    job_id: str,
+    status: str,
+    default_iterations: int,
+    default_findings: int,
+) -> tuple[int, int]:
+    """:func:`_load_progress` for worker threads."""
+    return _run_async(_load_progress(job_id, status, default_iterations, default_findings))
 
 
 async def _db_create_job(
@@ -437,10 +447,6 @@ class JobManager:
         except Exception as e:
             logger.warning("Failed to cleanup container for stale job %s: %s", job_id, e)
 
-    def _ensure_job_not_exists(self, job_id: str) -> None:
-        if self.get_job(job_id) is not None:
-            raise ValueError(f"Job {job_id} already exists")
-
     def _check_budget_before_creation(self) -> None:
         try:
             provider = get_provider()
@@ -457,7 +463,7 @@ class JobManager:
         error_msg = "; ".join(errors) if errors else "Budget limit exceeded"
         raise ValueError(f"Cannot create job: {error_msg}")
 
-    def _create_db_job_record(
+    async def _create_db_job_record(
         self,
         *,
         job_id: str,
@@ -475,21 +481,19 @@ class JobManager:
     ) -> UUID | None:
         owner_uuid = UUID(owner_id) if owner_id else None
         try:
-            _run_async(
-                _db_create_job(
-                    job_id,
-                    research_question,
-                    max_iterations,
-                    use_hypotheses=use_hypotheses,
-                    investigation_mode=investigation_mode,
-                    owner_id=owner_uuid,
-                    short_title=short_title,
-                    description=description,
-                    pdb_code=pdb_code,
-                    space_group=space_group,
-                    llm_provider=llm_provider,
-                    llm_config=llm_config,
-                )
+            await _db_create_job(
+                job_id,
+                research_question,
+                max_iterations,
+                use_hypotheses=use_hypotheses,
+                investigation_mode=investigation_mode,
+                owner_id=owner_uuid,
+                short_title=short_title,
+                description=description,
+                pdb_code=pdb_code,
+                space_group=space_group,
+                llm_provider=llm_provider,
+                llm_config=llm_config,
             )
         except Exception as e:
             logger.error("Failed to create job in database: %s", e)
@@ -533,7 +537,7 @@ class JobManager:
             self._rollback_failed_job_creation(job_id, owner_uuid)
             raise ValueError(f"Failed to initialize job files: {e}") from e
 
-    def create_job(
+    async def create_job(
         self,
         job_id: str,
         research_question: str,
@@ -572,8 +576,10 @@ class JobManager:
             ValueError: If job_id already exists
             BudgetExceededError: If insufficient budget
         """
-        self._ensure_job_not_exists(job_id)
-        self._check_budget_before_creation()
+        if await self.get_job(job_id) is not None:
+            raise ValueError(f"Job {job_id} already exists")
+        # The provider's cost endpoint is a blocking HTTP call.
+        await asyncio.to_thread(self._check_budget_before_creation)
 
         # Capture provider & model from current settings
         from openscientist.settings import get_settings
@@ -585,7 +591,7 @@ class JobManager:
 
         # Create job in database
         logger.info("Creating job %s in database", job_id)
-        owner_uuid = self._create_db_job_record(
+        owner_uuid = await self._create_db_job_record(
             job_id=job_id,
             research_question=research_question,
             max_iterations=max_iterations,
@@ -600,9 +606,11 @@ class JobManager:
             llm_config=llm_config,
         )
 
-        # Create job directory and files
+        # Git init, file copies and the first knowledge-state save block, so
+        # they run on a worker thread.
         logger.info("Creating job %s filesystem structure", job_id)
-        self._create_job_files(
+        await asyncio.to_thread(
+            self._create_job_files,
             job_id=job_id,
             research_question=research_question,
             data_files=data_files,
@@ -611,20 +619,20 @@ class JobManager:
             owner_uuid=owner_uuid,
         )
 
-        # Load job info
-        job_info = self._load_job_info(job_id)
+        job_info = await self.get_job(job_id)
         if job_info is None:
             raise ValueError(f"Failed to load newly created job {job_id}")
 
-        # Auto-start if requested
         if auto_start:
-            self.start_job(job_id)
+            await asyncio.to_thread(self.start_job, job_id)
 
         return job_info
 
     def start_job(self, job_id: str) -> None:
         """
-        Start a job asynchronously.
+        Start a job on a worker thread, or queue it when no slot is free. It
+        reads and writes the database synchronously, so callers on an event
+        loop run it through ``asyncio.to_thread``.
 
         Args:
             job_id: Job ID
@@ -634,7 +642,7 @@ class JobManager:
         """
         with self._lock:
             # Check job exists
-            job_info = self.get_job(job_id)
+            job_info = self._load_job_info(job_id)
             if job_info is None:
                 raise ValueError(f"Job {job_id} not found")
 
@@ -662,7 +670,7 @@ class JobManager:
             self._running_jobs[job_id] = thread
             thread.start()
 
-    def regenerate_report(self, job_id: str) -> None:
+    async def regenerate_report(self, job_id: str) -> None:
         """Re-run only the report-generation phase for a completed job.
 
         Backs the admin "Regenerate report" action. Launches the agent
@@ -676,8 +684,8 @@ class JobManager:
             ValueError: If the job is missing, not completed, already running,
                 or the max concurrent limit is reached.
         """
+        job_info = await self.get_job(job_id)
         with self._lock:
-            job_info = self.get_job(job_id)
             if job_info is None:
                 raise ValueError(f"Job {job_id} not found")
             if job_info.status != JobStatus.COMPLETED:
@@ -861,7 +869,7 @@ class JobManager:
         while self._start_next_queued_job():
             pass
 
-    def cancel_job(self, job_id: str) -> None:
+    async def cancel_job(self, job_id: str) -> None:
         """
         Cancel a job that has not ended, stopping its container if it has one.
 
@@ -871,17 +879,21 @@ class JobManager:
         Raises:
             ValueError: If job not found or already ended
         """
-        if self.get_job(job_id) is None:
+        if await _db_get_job(job_id) is None:
             raise ValueError(f"Job {job_id} not found")
 
-        if not self._update_job_status(
+        cancellation_reason = "Cancelled by user"
+        target = await _db_update_job_status(
             job_id,
             JobStatus.CANCELLED,
             allowed_from=self.ACTIVE_STATUSES,
-            cancellation_reason="Cancelled by user",
-            retry=False,
-        ):
+            cancellation_reason=cancellation_reason,
+        )
+        if not target.applied:
             raise ValueError(f"Job {job_id} has already ended")
+        await _status_notification(
+            job_id, JobStatus.CANCELLED, target, cancellation_reason=cancellation_reason
+        )
 
         # The worker thread stays tracked until it exits, so slots stay counted.
         # A thread that has not launched yet sees the cancel and does not launch.
@@ -889,20 +901,23 @@ class JobManager:
             has_worker = job_id in self._running_jobs
 
         # Stop the container now rather than when the worker's poll sees the cancel.
+        # docker stop waits for the container, so it runs on a worker thread.
         if has_worker:
-            try:
-                from openscientist.job_container import JobContainerRunner
-
-                JobContainerRunner().stop(job_id)
-            except Exception as e:
-                logger.warning("Failed to stop container for cancelled job %s: %s", job_id, e)
+            await asyncio.to_thread(self._stop_container, job_id)
 
         logger.info("Job %s cancelled", job_id)
+        await asyncio.to_thread(self._start_next_queued_job)
 
-        # Start next queued job if any
-        self._start_next_queued_job()
+    @staticmethod
+    def _stop_container(job_id: str) -> None:
+        try:
+            from openscientist.job_container import JobContainerRunner
 
-    def get_job(self, job_id: str) -> JobInfo | None:
+            JobContainerRunner().stop(job_id)
+        except Exception as e:
+            logger.warning("Failed to stop container for cancelled job %s: %s", job_id, e)
+
+    async def get_job(self, job_id: str) -> JobInfo | None:
         """
         Get job information.
 
@@ -912,9 +927,10 @@ class JobManager:
         Returns:
             JobInfo or None if not found
         """
-        return self._load_job_info(job_id)
+        job_model = await _db_get_job(job_id)
+        return None if job_model is None else await self._job_info(job_model)
 
-    def list_jobs(
+    async def list_jobs(
         self,
         status: JobStatus | None = None,
         limit: int | None = None,
@@ -931,10 +947,10 @@ class JobManager:
         Returns:
             List of JobInfo objects, sorted by created_at (newest first)
         """
-        db_jobs = _run_async(_db_list_jobs(status=status, limit=limit))
-        return [self._db_model_to_job_info(m) for m in db_jobs]
+        db_jobs = await _db_list_jobs(status=status, limit=limit)
+        return [await self._job_info(m) for m in db_jobs]
 
-    def delete_job(self, job_id: str) -> None:
+    async def delete_job(self, job_id: str) -> None:
         """
         Delete a job and its files.
 
@@ -944,22 +960,23 @@ class JobManager:
         Raises:
             ValueError: If job not found or still running
         """
-        job_info = self.get_job(job_id)
-        if job_info is None:
+        job_model = await _db_get_job(job_id)
+        if job_model is None:
             raise ValueError(f"Job {job_id} not found")
 
-        if job_info.status == JobStatus.RUNNING:
+        if job_model.status == JobStatus.RUNNING.value:
             raise ValueError(f"Cannot delete running job {job_id}")
 
-        # Delete from database
         try:
-            owner_id = UUID(job_info.owner_id) if job_info.owner_id else None
-            _run_async(_db_delete_job(job_id, owner_id))
+            await _db_delete_job(job_id, job_model.owner_id)
         except Exception as e:
             logger.error("Failed to delete job from database: %s", e)
             raise ValueError(f"Failed to delete job {job_id} from database: {e}") from e
 
-        # Clean up any executor containers for this job
+        # Docker calls and the directory removal block, so they run on a worker thread.
+        await asyncio.to_thread(self._remove_job_artifacts, job_id)
+
+    def _remove_job_artifacts(self, job_id: str) -> None:
         try:
             container_manager = get_container_manager()
             if container_manager.is_available():
@@ -969,7 +986,6 @@ class JobManager:
         except Exception as e:
             logger.warning("Failed to cleanup containers for job %s: %s", job_id, e)
 
-        # Delete job directory
         job_dir = self.jobs_dir / job_id
         if job_dir.exists():
             shutil.rmtree(job_dir)
@@ -1006,7 +1022,7 @@ class JobManager:
                 created_at = created_at.replace(tzinfo=UTC)
             if created_at < cutoff:
                 try:
-                    self.delete_job(job_id)
+                    _run_async(self.delete_job(job_id))
                     deleted += 1
                 except (OSError, ValueError) as e:
                     logger.error("Failed to delete job %s: %s", job_id, e)
@@ -1028,14 +1044,14 @@ class JobManager:
         """Count tracked jobs, including those paused for feedback, which keep their container."""
         return len(self._running_jobs)
 
-    def get_job_summary(self) -> dict[str, Any]:
+    async def get_job_summary(self) -> dict[str, Any]:
         """
         Get summary of all jobs (no user filtering).
 
         Returns:
             Dictionary with job counts and budget info
         """
-        jobs = self.list_jobs()
+        jobs = await self.list_jobs()
 
         status_counts = {}
         for status in JobStatus:
@@ -1044,7 +1060,7 @@ class JobManager:
         # Get project-level cost info from provider
         try:
             provider = get_provider()
-            cost_info = provider.get_cost_info(lookback_hours=24)
+            cost_info = await asyncio.to_thread(provider.get_cost_info, lookback_hours=24)
             budget_check = provider.evaluate_budget(cost_info)
         except (ValueError, ProviderError) as e:
             logger.warning("Could not fetch cost info: %s", e)
@@ -1082,6 +1098,13 @@ class JobManager:
             default_findings=0,
         )
 
+        return JobInfo.from_db_model(job_model, iterations_completed, findings_count)
+
+    async def _job_info(self, job_model: JobModel) -> JobInfo:
+        """:meth:`_db_model_to_job_info` for callers on an event loop."""
+        iterations_completed, findings_count = await _load_progress(
+            str(job_model.id), job_model.status, job_model.current_iteration, 0
+        )
         return JobInfo.from_db_model(job_model, iterations_completed, findings_count)
 
     def _load_job_info(self, job_id: str) -> JobInfo | None:
@@ -1162,24 +1185,43 @@ class JobManager:
         error_message: str | None = None,
         cancellation_reason: str | None = None,
     ) -> None:
-        if not target or not target.ntfy_enabled or not target.owner_id:
-            return
-        iterations_completed = _derive_progress_from_db(status.value, target.current_iteration)
-        try:
-            _run_async(
-                notify_job_status_change(
-                    user_id=UUID(target.owner_id),
-                    job_id=job_id,
-                    job_title=target.job_title or "",
-                    new_status=status.value,
-                    error_message=error_message,
-                    cancellation_reason=cancellation_reason,
-                    iteration=iterations_completed,
-                    ntfy_topic=target.ntfy_topic,
-                )
+        """:func:`_status_notification` for worker threads."""
+        _run_async(
+            _status_notification(
+                job_id,
+                status,
+                target,
+                error_message=error_message,
+                cancellation_reason=cancellation_reason,
             )
-        except Exception as e:
-            logger.warning("Failed to send ntfy notification: %s", e)
+        )
+
+
+async def _status_notification(
+    job_id: str,
+    status: JobStatus,
+    target: JobStatusUpdateResult | None,
+    *,
+    error_message: str | None = None,
+    cancellation_reason: str | None = None,
+) -> None:
+    """Tell the job's owner about ``status``, if they turned notifications on."""
+    if not target or not target.ntfy_enabled or not target.owner_id:
+        return
+    iterations_completed = _derive_progress_from_db(status.value, target.current_iteration)
+    try:
+        await notify_job_status_change(
+            user_id=UUID(target.owner_id),
+            job_id=job_id,
+            job_title=target.job_title or "",
+            new_status=status.value,
+            error_message=error_message,
+            cancellation_reason=cancellation_reason,
+            iteration=iterations_completed,
+            ntfy_topic=target.ntfy_topic,
+        )
+    except Exception as e:
+        logger.warning("Failed to send ntfy notification: %s", e)
 
 
 def main() -> None:
@@ -1250,7 +1292,7 @@ def main() -> None:
     # Execute command
     if args.command == "list":
         status = JobStatus(args.status) if args.status else None
-        jobs = manager.list_jobs(status=status, limit=args.limit)
+        jobs = asyncio.run(manager.list_jobs(status=status, limit=args.limit))
 
         print(f"{'Job ID':<20} {'Status':<12} {'Iterations':<12} {'Findings':<10} {'Created At'}")
         print("-" * 80)
@@ -1263,14 +1305,14 @@ def main() -> None:
             )
 
     elif args.command == "get":
-        job_result = manager.get_job(args.job_id)
+        job_result = asyncio.run(manager.get_job(args.job_id))
         if job_result is None:
             print(f"Job {args.job_id} not found")
         else:
             print(json.dumps(job_result.to_dict(), indent=2))
 
     elif args.command == "delete":
-        manager.delete_job(args.job_id)
+        asyncio.run(manager.delete_job(args.job_id))
         print(f"Deleted job {args.job_id}")
 
     elif args.command == "cleanup":
@@ -1278,7 +1320,7 @@ def main() -> None:
         print(f"Deleted {deleted} jobs")
 
     elif args.command == "summary":
-        summary = manager.get_job_summary()
+        summary = asyncio.run(manager.get_job_summary())
         print(json.dumps(summary, indent=2))
 
 

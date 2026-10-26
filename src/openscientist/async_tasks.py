@@ -5,7 +5,6 @@ Helpers for safe fire-and-forget asyncio task execution and sync/async bridging.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 from collections.abc import Coroutine
 from typing import Any, TypeVar
@@ -60,8 +59,10 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, timeout: float = 30) -> _T:
     the caller. Bound the work itself (for a query, the database's own
     ``statement_timeout``) when a hard wall is required.
 
-    ``asyncio.run`` owns the loop in both paths, so task cancellation, async
-    generator shutdown and executor shutdown all happen as usual.
+    Only for threads without a running event loop, such as worker threads and
+    the CLI. On a running loop it would block that loop until the work ends,
+    and every other task on it with it, so it raises and the caller must await
+    the coroutine instead.
 
     Args:
         coro: The coroutine to execute.
@@ -72,14 +73,18 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, timeout: float = 30) -> _T:
 
     Raises:
         TimeoutError: The deadline passed and the coroutine was cancelled.
+        RuntimeError: The calling thread runs an event loop.
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(_bounded(coro, timeout))
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, _bounded(coro, timeout)).result()
+    name = coro.__qualname__
+    coro.close()
+    raise RuntimeError(
+        f"run_sync({name}) was called on a running event loop, which it would block. "
+        "Await the coroutine instead."
+    )
 
 
 async def _bounded(coro: Coroutine[Any, Any, _T], timeout: float) -> _T:

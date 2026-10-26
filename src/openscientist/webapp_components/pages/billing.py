@@ -1,5 +1,6 @@
 """Billing and cost tracking panel."""
 
+import asyncio
 import logging
 
 from nicegui import ui
@@ -17,7 +18,7 @@ async def render_billing_panel() -> None:
     """Render the billing panel (for use as an admin subtab)."""
     with ui.column().classes("w-full gap-6"):
         await _render_db_cost_section()
-        _render_provider_cost_section()
+        await _render_provider_cost_section()
 
 
 def _iteration_label(record: CostRecord) -> str:
@@ -116,14 +117,15 @@ async def _render_db_cost_section() -> None:
     ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
 
 
-def _render_provider_cost_section() -> None:
+async def _render_provider_cost_section() -> None:
     """Provider-level cost API."""
     with ui.card().classes("w-full max-w-4xl"):
         ui.label("Provider Cost API").classes("text-h6 mb-4")
 
         try:
             provider = get_provider()
-            cost_info = provider.get_cost_info(lookback_hours=24)
+            # Provider cost APIs are blocking HTTP calls, with a timeout of 10 s each.
+            cost_info = await asyncio.to_thread(provider.get_cost_info, lookback_hours=24)
             budget_check = provider.evaluate_budget(cost_info)
 
             with ui.row().classes("w-full gap-8 mb-4"):

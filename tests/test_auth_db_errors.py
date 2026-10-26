@@ -70,23 +70,6 @@ async def test_a_page_during_an_outage_keeps_the_visitor_signed_in(
     middleware.ui.navigate.to.assert_not_called()  # type: ignore[attr-defined]
 
 
-def test_a_sync_page_during_an_outage_keeps_the_visitor_signed_in(
-    database: Forwarder, visitor: dict[str, object]
-) -> None:
-    ran = False
-
-    def page() -> None:
-        nonlocal ran
-        ran = True
-
-    stored = dict(visitor)
-    database.down()
-    middleware.require_auth(page)()
-    assert not ran
-    assert visitor == stored
-    middleware.ui.navigate.to.assert_not_called()  # type: ignore[attr-defined]
-
-
 async def test_a_signed_in_visitor_reaches_the_page(
     database: Forwarder, visitor: dict[str, object]
 ) -> None:
@@ -148,29 +131,6 @@ async def test_an_unexpected_validation_error_is_not_treated_as_an_outage(
     monkeypatch.setattr(middleware, "validate_session", broken)
     with pytest.raises(ValueError, match="unexpected"):
         await middleware.require_auth(page)()
-    assert not ran
-    # no "database unreachable" screen
-    middleware.ui.button.assert_not_called()  # type: ignore[attr-defined]
-    middleware.ui.navigate.to.assert_not_called()  # type: ignore[attr-defined]
-
-
-def test_an_unexpected_sync_validation_error_is_not_treated_as_an_outage(
-    visitor: dict[str, object], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A non-connection error is not an outage and not a sign-out, so it
-    reaches the caller instead of being dressed up as either."""
-    ran = False
-
-    def page() -> None:
-        nonlocal ran
-        ran = True
-
-    async def broken(_token: str) -> dict[str, object] | None:
-        raise ValueError("unexpected")
-
-    monkeypatch.setattr(middleware, "validate_session", broken)
-    with pytest.raises(ValueError, match="unexpected"):
-        middleware.require_auth(page)()
     assert not ran
     # no "database unreachable" screen
     middleware.ui.button.assert_not_called()  # type: ignore[attr-defined]

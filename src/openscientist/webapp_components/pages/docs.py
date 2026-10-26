@@ -98,7 +98,7 @@ DOCS_PAGE_CONTENT_MARKDOWN = dedent(
 
 @ui.page("/docs")
 @require_auth
-def docs_page() -> None:
+async def docs_page() -> None:
     """Documentation page with user guide."""
     render_navigator(active_page="docs")
 

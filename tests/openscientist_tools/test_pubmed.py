@@ -72,7 +72,7 @@ def _state_job_id(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(STATE, "job_id", "test-job-uuid")
 
 
-def test_returns_formatted_markdown(
+async def test_returns_formatted_markdown(
     monkeypatch: pytest.MonkeyPatch,
     patched_ks_persistence: KnowledgeState,
 ) -> None:
@@ -81,7 +81,7 @@ def test_returns_formatted_markdown(
         _fake_requests_get(esearch_payload=_ESEARCH_TWO_HITS, efetch_xml=_EFETCH_TWO_PAPERS),
     )
 
-    result = search_pubmed(query="cold adapted carnosine", max_results=10)
+    result = await search_pubmed(query="cold adapted carnosine", max_results=10)
 
     assert result.startswith("Found 2 papers for query: 'cold adapted carnosine'")
     assert "PMID: 12345678" in result
@@ -89,7 +89,7 @@ def test_returns_formatted_markdown(
     assert "Carnosine in cold-adapted cells" in result
 
 
-def test_writes_literature_and_log_to_knowledge_state(
+async def test_writes_literature_and_log_to_knowledge_state(
     monkeypatch: pytest.MonkeyPatch,
     patched_ks_persistence: KnowledgeState,
 ) -> None:
@@ -98,7 +98,7 @@ def test_writes_literature_and_log_to_knowledge_state(
         _fake_requests_get(esearch_payload=_ESEARCH_TWO_HITS, efetch_xml=_EFETCH_TWO_PAPERS),
     )
 
-    search_pubmed(query="cold adapted carnosine", description="why")
+    await search_pubmed(query="cold adapted carnosine", description="why")
 
     assert len(patched_ks_persistence.data["literature"]) == 2
     pmids = {entry["pmid"] for entry in patched_ks_persistence.data["literature"]}
@@ -111,7 +111,7 @@ def test_writes_literature_and_log_to_knowledge_state(
     assert last_log["description"] == "why"
 
 
-def test_empty_results(
+async def test_empty_results(
     monkeypatch: pytest.MonkeyPatch,
     patched_ks_persistence: KnowledgeState,
 ) -> None:
@@ -120,7 +120,7 @@ def test_empty_results(
         _fake_requests_get(esearch_payload=_ESEARCH_EMPTY, efetch_xml=""),
     )
 
-    result = search_pubmed(query="nonexistent topic xyzzy")
+    result = await search_pubmed(query="nonexistent topic xyzzy")
 
     assert result == "No papers found for query: 'nonexistent topic xyzzy'"
     assert patched_ks_persistence.data["literature"] == []
@@ -186,7 +186,7 @@ async def test_subprocess_smoke_real_ncbi(
                 assert isinstance(block, TextContent)
                 assert block.text.startswith("Found ") and "PMID:" in block.text
 
-        reloaded = KnowledgeState.load_from_database_sync(str(job_id))
+        reloaded = await KnowledgeState.load_from_database(str(job_id))
         assert len(reloaded.data["literature"]) >= 1
         last_log = reloaded.data["analysis_log"][-1]
         assert last_log["action"] == "search_pubmed"

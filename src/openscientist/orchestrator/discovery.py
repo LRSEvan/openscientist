@@ -161,18 +161,16 @@ async def _sync_version_metadata(job_id: str) -> None:
     """Record runtime version provenance on the job, best effort.
 
     Provenance is not a result, so anything that will not take it costs the run
-    its version strings and nothing more. It used to load and save the whole
-    knowledge state through the sync bridge, which turned one slow write into a
-    failed run. Two bounds apply to the write, because neither covers the
-    other: ``statement_timeout`` stops a slow statement inside the database,
-    and the surrounding deadline covers what the database cannot see (name
-    resolution, connecting, acquiring a connection, cleanup). It does not bound
-    metadata collection, whose blocking subprocesses hold the loop and carry
-    their own limits, but a failure there is still caught here.
+    its version strings and nothing more. Two bounds apply to the write, because
+    neither covers the other: ``statement_timeout`` stops a slow statement
+    inside the database, and the surrounding deadline covers what the database
+    cannot see (name resolution, connecting, acquiring a connection, cleanup).
+    Metadata collection runs off the loop in a worker thread, whose subprocesses
+    carry their own limits, and a failure there is still caught here.
     """
     try:
         async with asyncio.timeout(_STAMP_DEADLINE_SECONDS):
-            version_info = get_version_metadata()
+            version_info = await asyncio.to_thread(get_version_metadata)
             if not version_info:
                 return
             async with AsyncSessionLocal() as session:
@@ -236,7 +234,7 @@ async def _run_primary_discovery_loop(
     data_files = runtime["data_files"]
     investigation_mode = runtime["investigation_mode"]
 
-    ks = KnowledgeState.load_from_database_sync(job_id)
+    ks = await KnowledgeState.load_from_database(job_id)
     initial_prompt = build_initial_prompt(
         runtime["research_question"],
         max_iterations,
@@ -262,7 +260,7 @@ async def _run_primary_discovery_loop(
     )
     await ledger.record()
     if max_iterations > 1:
-        increment_ks_iteration(job_id)
+        await increment_ks_iteration(job_id)
     await _assert_job_not_cancelled(job_id)
 
     pending_feedback_result = await _wait_for_coinvestigate_feedback(
@@ -282,7 +280,7 @@ async def _run_primary_discovery_loop(
 
     for iteration in range(2, max_iterations + 1):
         await _assert_job_not_cancelled(job_id)
-        ks = KnowledgeState.load_from_database_sync(job_id)
+        ks = await KnowledgeState.load_from_database(job_id)
         if pending_feedback is None:
             pending_feedback = ks.get_feedback_for_iteration(iteration)
 
@@ -316,7 +314,7 @@ async def _run_primary_discovery_loop(
         await ledger.record()
 
         if iteration < max_iterations:
-            increment_ks_iteration(job_id)
+            await increment_ks_iteration(job_id)
         await _assert_job_not_cancelled(job_id)
         pending_feedback_result = await _wait_for_coinvestigate_feedback(
             job_dir,
@@ -520,7 +518,7 @@ async def _set_consensus_answer(
     stands and the job completes with the prior consensus (logged), rather than
     fabricating one.
     """
-    baseline = KnowledgeState.load_from_database_sync(job_dir.name).data.get("consensus_answer")
+    baseline = (await KnowledgeState.load_from_database(job_dir.name)).data.get("consensus_answer")
     tool_prefix = executor.prompt_fragments().mcp_tool_prefix
     for attempt in range(1, _MAX_CONSENSUS_ATTEMPTS + 1):
         prompt = (
@@ -529,7 +527,9 @@ async def _set_consensus_answer(
             else build_consensus_retry_prompt(research_question, tool_prefix=tool_prefix)
         )
         await executor.run_iteration(prompt, reset_session=False)
-        current = KnowledgeState.load_from_database_sync(job_dir.name).data.get("consensus_answer")
+        current = (await KnowledgeState.load_from_database(job_dir.name)).data.get(
+            "consensus_answer"
+        )
         if current and current != baseline:
             if attempt > 1:
                 logger.info("Consensus recorded on attempt %d", attempt)
@@ -551,7 +551,7 @@ async def _run_report_generation_phase(
 ) -> _ReportOutcome:
     """Run the report and consensus turns (each with bounded retries) and output
     artifact handling."""
-    ks = KnowledgeState.load_from_database_sync(job_dir.name)
+    ks = await KnowledgeState.load_from_database(job_dir.name)
     report_result, report_success = await _run_report_turn(
         executor, job_dir, research_question, ks, description
     )
@@ -918,7 +918,7 @@ async def regenerate_report_async(job_dir: Path) -> dict[str, Any]:
         )
         await ledger.record()
         final_status = await _persist_final_status(job_dir, report_outcome)
-        ks = KnowledgeState.load_from_database_sync(job_id)
+        ks = await KnowledgeState.load_from_database(job_id)
         return {
             "job_id": job_id,
             "status": final_status,
@@ -934,7 +934,7 @@ async def regenerate_report_async(job_dir: Path) -> dict[str, Any]:
         except Exception as status_error:
             logger.warning("Failed to persist failure status for job %s: %s", job_id, status_error)
         try:
-            ks = KnowledgeState.load_from_database_sync(job_id)
+            ks = await KnowledgeState.load_from_database(job_id)
             iterations = ks.data["iteration"]
             findings = len(ks.data["findings"])
         except Exception:
@@ -996,7 +996,7 @@ async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
         )
         await ledger.record()
         final_status = await _persist_final_status(job_dir, report_outcome)
-        ks = KnowledgeState.load_from_database_sync(job_id)
+        ks = await KnowledgeState.load_from_database(job_id)
         return {
             "job_id": job_id,
             "status": final_status,
@@ -1006,7 +1006,7 @@ async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
 
     except _DiscoveryCancelledError:
         logger.info("Discovery cancelled for job %s", job_id)
-        ks = KnowledgeState.load_from_database_sync(job_id)
+        ks = await KnowledgeState.load_from_database(job_id)
         return {
             "job_id": job_id,
             "status": "cancelled",
@@ -1026,7 +1026,7 @@ async def run_discovery_async(job_dir: Path) -> dict[str, Any]:
         except Exception as status_error:
             logger.warning("Failed to persist failure status for job %s: %s", job_id, status_error)
         try:
-            ks = KnowledgeState.load_from_database_sync(job_id)
+            ks = await KnowledgeState.load_from_database(job_id)
             iterations = ks.data["iteration"]
             findings = len(ks.data["findings"])
         except Exception:

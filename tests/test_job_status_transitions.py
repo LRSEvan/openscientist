@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
@@ -137,9 +138,9 @@ async def test_a_job_cancelled_before_its_worker_begins_is_not_launched(
 ) -> None:
     manager = _manager(tmp_path)
     job = await make_job(JobStatus.QUEUED)
-    manager.cancel_job(str(job))
+    await manager.cancel_job(str(job))
     with patch.object(manager, "_start_next_queued_job"):
-        manager._run_job_in_container(str(job))
+        await asyncio.to_thread(manager._run_job_in_container, str(job))
     runner.launch.assert_not_called()
     assert await _status(test_engine, job) == "cancelled"
 
@@ -155,7 +156,7 @@ async def test_a_launch_crash_fails_the_job_and_starts_the_next_one(
     next_up = await make_job(JobStatus.QUEUED)
     runner.launch.side_effect = RuntimeError("docker launch failed")
     with patch.object(manager, "_run_job"):
-        manager._run_job_in_container(str(crasher))
+        await asyncio.to_thread(manager._run_job_in_container, str(crasher))
     status, error = await _ending(test_engine, crasher)
     assert status == "failed"
     assert "docker launch failed" in (error or "")
@@ -171,7 +172,7 @@ async def test_cancelling_a_started_queued_job_keeps_its_slot_and_stops_it(
     job = await make_job(JobStatus.QUEUED)
     manager._running_jobs[str(job)] = MagicMock()
     with patch.object(manager, "_start_next_queued_job"):
-        manager.cancel_job(str(job))
+        await manager.cancel_job(str(job))
     assert str(job) in manager._running_jobs
     runner.stop.assert_called_once_with(str(job))
 
@@ -184,7 +185,7 @@ async def test_a_started_queued_job_is_not_picked_again(
     own_thread = MagicMock()
     manager._running_jobs[str(job)] = own_thread
     with patch.object(manager, "_run_job"):
-        manager._start_next_queued_job()
+        await asyncio.to_thread(manager._start_next_queued_job)
     assert manager._running_jobs[str(job)] is own_thread
 
 
@@ -195,7 +196,7 @@ async def test_the_oldest_queued_job_starts_first(
     older = await make_job(JobStatus.QUEUED)
     newer = await make_job(JobStatus.QUEUED)
     with patch.object(manager, "_run_job"):
-        manager._start_next_queued_job()
+        await asyncio.to_thread(manager._start_next_queued_job)
     assert str(older) in manager._running_jobs
     assert str(newer) not in manager._running_jobs
 
@@ -219,7 +220,7 @@ async def test_a_job_waiting_for_feedback_can_be_cancelled(
     job = await make_job(JobStatus.AWAITING_FEEDBACK)
     manager._running_jobs[str(job)] = MagicMock()
     with patch.object(manager, "_start_next_queued_job"):
-        manager.cancel_job(str(job))
+        await manager.cancel_job(str(job))
     assert await _status(test_engine, job) == "cancelled"
     runner.stop.assert_called_once_with(str(job))
 
@@ -236,7 +237,7 @@ async def test_cancelling_a_finished_job_fails_loudly(
     manager = _manager(tmp_path)
     job = await make_job(finished)
     with pytest.raises(ValueError, match="already ended"):
-        manager.cancel_job(str(job))
+        await manager.cancel_job(str(job))
     assert await _status(test_engine, job) == finished.value
     runner.stop.assert_not_called()
 
@@ -248,7 +249,7 @@ async def test_start_job_refuses_a_finished_job(
     manager = _manager(tmp_path)
     job = await make_job(finished)
     with pytest.raises(ValueError, match="cannot be started"):
-        manager.start_job(str(job))
+        await asyncio.to_thread(manager.start_job, str(job))
     assert str(job) not in manager._running_jobs
     assert await _status(test_engine, job) == finished.value
 
@@ -266,7 +267,7 @@ async def test_starting_a_job_that_stopped_waiting_fails_loudly(
         return_value=JobStatusUpdateResult(),
     ):
         with pytest.raises(ValueError, match="stopped waiting"):
-            manager.start_job(str(job))
+            await asyncio.to_thread(manager.start_job, str(job))
     assert str(job) not in manager._running_jobs
     assert await _status(test_engine, job) == "pending"
 
@@ -339,7 +340,7 @@ async def test_startup_recovery_keeps_waiting_jobs_and_ends_started_ones(
     completed = await make_job(JobStatus.COMPLETED)
     manager = _manager(tmp_path, max_concurrent=5)
     with patch.object(manager, "_run_job"):
-        manager.recover_after_restart()
+        await asyncio.to_thread(manager.recover_after_restart)
     assert await _status(test_engine, running) == "cancelled"
     assert await _status(test_engine, paused) == "cancelled"
     assert await _status(test_engine, completed) == "completed"
@@ -365,7 +366,7 @@ async def test_a_lost_jobs_cleanup_failure_does_not_stop_recovery(
     runner.cleanup.side_effect = _cleanup
     manager = _manager(tmp_path, max_concurrent=5)
     with patch.object(manager, "_run_job"):
-        manager.recover_after_restart()
+        await asyncio.to_thread(manager.recover_after_restart)
     assert await _status(test_engine, broken) == "cancelled"
     assert await _status(test_engine, other) == "cancelled"
 
@@ -406,7 +407,7 @@ async def test_submitting_feedback_resumes_a_paused_job(
     job_dir = tmp_path / str(job_id)
     job_dir.mkdir()
     with patch.object(job_detail, "ui") as mock_ui:
-        job_detail._submit_feedback_and_continue(
+        await job_detail._submit_feedback_and_continue(
             job_dir, str(job_id), str(owner_id), 1, "check the PDB route"
         )
     assert await _status(test_engine, job_id) == "running"
@@ -422,7 +423,7 @@ async def test_feedback_for_a_job_that_ended_while_paused_keeps_its_ending(
     job_dir = tmp_path / str(job_id)
     job_dir.mkdir()
     with patch.object(job_detail, "ui") as mock_ui:
-        job_detail._submit_feedback_and_continue(job_dir, str(job_id), str(owner_id), 1, "")
+        await job_detail._submit_feedback_and_continue(job_dir, str(job_id), str(owner_id), 1, "")
     assert await _status(test_engine, job_id) == "cancelled"
     mock_ui.notify.assert_called_once_with(
         "This job is no longer waiting for feedback.", type="warning"
@@ -444,17 +445,18 @@ def _job_info(status: JobStatus) -> JobInfo:
         (JobStatus.COMPLETED, False),
     ],
 )
-def test_the_delete_dialog_warns_only_when_the_job_is_active(
+async def test_the_delete_dialog_warns_only_when_the_job_is_active(
     status: JobStatus, warns: bool, tmp_path: Path
 ) -> None:
     """The dialog warns the user that an active job will be cancelled before deletion."""
     manager = JobManager(jobs_dir=tmp_path)
     with (
-        patch.object(manager, "get_job", return_value=_job_info(status)),
+        patch.object(manager, "get_job", new_callable=AsyncMock, return_value=_job_info(status)),
         patch.object(ui_components, "ui") as mock_ui,
     ):
-        mock_ui.refreshable.side_effect = lambda fn: fn
-        ui_components.render_delete_dialog(str(uuid4()), manager)
+        dialog = cast(MagicMock, ui_components.render_delete_dialog(str(uuid4()), manager))
+        show = [call for call in dialog.on.call_args_list if call.args and call.args[0] == "show"]
+        await show[0].args[1]()
     labels = [call.args[0] for call in mock_ui.label.call_args_list if call.args]
     active_note = "This job is currently active and will be cancelled before deletion."
     assert (active_note in labels) is warns
@@ -475,7 +477,9 @@ async def test_deleting_a_job_cancels_it_only_while_it_is_active(
     owner = uuid4()
     manager = MagicMock()
     manager.ACTIVE_STATUSES = JobManager.ACTIVE_STATUSES
-    manager.get_job.return_value = _job_info(status)
+    manager.get_job = AsyncMock(return_value=_job_info(status))
+    manager.cancel_job = AsyncMock()
+    manager.delete_job = AsyncMock()
     captured: list[Callable[[], Awaitable[None]]] = []
 
     def _capture_actions(*_args: object, **kwargs: object) -> MagicMock:
@@ -492,14 +496,13 @@ async def test_deleting_a_job_cancels_it_only_while_it_is_active(
         patch.object(ui_components, "get_admin_session", _admin_session),
         patch.object(ui_components, "ui") as mock_ui,
     ):
-        mock_ui.refreshable.side_effect = lambda fn: fn
         ui_components.render_delete_dialog(job_id, manager)
         await captured[0]()
     if cancels_first:
-        manager.cancel_job.assert_called_once_with(job_id)
+        manager.cancel_job.assert_awaited_once_with(job_id)
     else:
         manager.cancel_job.assert_not_called()
-    manager.delete_job.assert_called_once_with(job_id)
+    manager.delete_job.assert_awaited_once_with(job_id)
     mock_ui.notify.assert_called_once_with(
         f"Job {job_id[-8:]} deleted successfully", type="positive"
     )

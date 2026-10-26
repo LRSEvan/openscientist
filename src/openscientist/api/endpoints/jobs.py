@@ -5,6 +5,7 @@ Provides REST API endpoints for creating, listing, monitoring, and managing
 OpenScientist scientific analysis jobs.
 """
 
+import asyncio
 import logging
 import tempfile
 from datetime import datetime
@@ -386,7 +387,7 @@ async def create_job(
     try:
         with tempfile.TemporaryDirectory(prefix="openscientist_api_upload_") as upload_tmp:
             data_files = await _persist_uploaded_files(upload_files, Path(upload_tmp))
-            job_manager.create_job(
+            await job_manager.create_job(
                 job_id=str(job_uuid),
                 research_question=job_data.research_question,
                 data_files=data_files,
@@ -575,7 +576,7 @@ async def cancel_job(
     # Cancel via JobManager
     job_manager = _get_job_manager()
     try:
-        job_manager.cancel_job(str(job.id))
+        await job_manager.cancel_job(str(job.id))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     logger.info("Cancelled job %s for user %s", job.id, user.email)
@@ -630,7 +631,8 @@ async def download_report(
             stripped_path = job_dir / "_final_report_stripped.md"
             stripped_path.write_text(stripped, encoding="utf-8")
             try:
-                markdown_to_pdf(stripped_path, pdf_path)
+                # Rendering a long report takes seconds of CPU.
+                await asyncio.to_thread(markdown_to_pdf, stripped_path, pdf_path)
             finally:
                 stripped_path.unlink(missing_ok=True)
 

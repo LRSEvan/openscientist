@@ -1,6 +1,8 @@
 """Tests for job_manager module."""
 
+import asyncio
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -155,71 +157,30 @@ class TestJobManagerListAndGet:
     @pytest.fixture(autouse=True)
     def _mock_ks_progress(self):
         with patch(
-            "openscientist.job_manager._load_progress_from_knowledge_state",
+            "openscientist.job_manager._load_progress",
+            new_callable=AsyncMock,
             return_value=(0, 0),
         ):
             yield
 
     @pytest.fixture
-    def db_jobs(self):
-        return [
-            _make_db_job("completed", "2026-02-03T00:00:00"),
-            _make_db_job("failed", "2026-02-02T00:00:00"),
-            _make_db_job("completed", "2026-02-01T00:00:00"),
-        ]
-
-    @pytest.fixture
     def manager(self, tmp_path) -> JobManager:
         return _new_manager(tmp_path)
 
-    def test_list_all_jobs(self, manager, db_jobs):
-        with patch(
-            "openscientist.job_manager._db_list_jobs", new_callable=AsyncMock, return_value=db_jobs
-        ):
-            jobs = manager.list_jobs()
-        assert len(jobs) == 3
-
-    def test_list_sorted_newest_first(self, manager, db_jobs):
-        with patch(
-            "openscientist.job_manager._db_list_jobs", new_callable=AsyncMock, return_value=db_jobs
-        ):
-            jobs = manager.list_jobs()
-        assert jobs[0].created_at > jobs[-1].created_at
-
-    def test_list_passes_status_filter(self, manager, db_jobs):
-        with patch(
-            "openscientist.job_manager._db_list_jobs",
-            new_callable=AsyncMock,
-            return_value=[db_jobs[1]],
-        ) as mock:
-            jobs = manager.list_jobs(status=JobStatus.FAILED)
-            mock.assert_called_once_with(status=JobStatus.FAILED, limit=None)
-        assert len(jobs) == 1
-
-    def test_list_passes_limit(self, manager, db_jobs):
-        with patch(
-            "openscientist.job_manager._db_list_jobs",
-            new_callable=AsyncMock,
-            return_value=db_jobs[:2],
-        ) as mock:
-            jobs = manager.list_jobs(limit=2)
-            mock.assert_called_once_with(status=None, limit=2)
-        assert len(jobs) == 2
-
-    def test_get_existing_job(self, manager):
+    async def test_get_existing_job(self, manager):
         db_job = _make_db_job("completed", "2026-02-01T00:00:00")
         with patch(
             "openscientist.job_manager._db_get_job", new_callable=AsyncMock, return_value=db_job
         ):
-            job = manager.get_job(str(db_job.id))
+            job = await manager.get_job(str(db_job.id))
         assert job is not None
         assert job.status == JobStatus.COMPLETED
 
-    def test_get_nonexistent_returns_none(self, manager):
+    async def test_get_nonexistent_returns_none(self, manager):
         with patch(
             "openscientist.job_manager._db_get_job", new_callable=AsyncMock, return_value=None
         ):
-            assert manager.get_job(str(uuid4())) is None
+            assert await manager.get_job(str(uuid4())) is None
 
 
 class TestJobManagerRegenerateReport:
@@ -228,7 +189,8 @@ class TestJobManagerRegenerateReport:
     @pytest.fixture(autouse=True)
     def _mock_ks_progress(self):
         with patch(
-            "openscientist.job_manager._load_progress_from_knowledge_state",
+            "openscientist.job_manager._load_progress",
+            new_callable=AsyncMock,
             return_value=(0, 0),
         ):
             yield
@@ -237,31 +199,31 @@ class TestJobManagerRegenerateReport:
     def manager(self, tmp_path) -> JobManager:
         return _new_manager(tmp_path)
 
-    def test_missing_job_raises(self, manager):
+    async def test_missing_job_raises(self, manager):
         with patch(
             "openscientist.job_manager._db_get_job", new_callable=AsyncMock, return_value=None
         ):
             with pytest.raises(ValueError, match="not found"):
-                manager.regenerate_report(str(uuid4()))
+                await manager.regenerate_report(str(uuid4()))
 
-    def test_non_completed_raises(self, manager):
+    async def test_non_completed_raises(self, manager):
         db_job = _make_db_job("running", "2026-02-01T00:00:00")
         with patch(
             "openscientist.job_manager._db_get_job", new_callable=AsyncMock, return_value=db_job
         ):
             with pytest.raises(ValueError, match="not completed"):
-                manager.regenerate_report(str(db_job.id))
+                await manager.regenerate_report(str(db_job.id))
 
-    def test_already_running_raises(self, manager):
+    async def test_already_running_raises(self, manager):
         db_job = _make_db_job("completed", "2026-02-01T00:00:00")
         manager._running_jobs[str(db_job.id)] = MagicMock()
         with patch(
             "openscientist.job_manager._db_get_job", new_callable=AsyncMock, return_value=db_job
         ):
             with pytest.raises(ValueError, match="already running"):
-                manager.regenerate_report(str(db_job.id))
+                await manager.regenerate_report(str(db_job.id))
 
-    def test_launches_in_report_only_mode(self, manager):
+    async def test_launches_in_report_only_mode(self, manager):
         """A completed job spawns a worker thread that runs the container in
         report-only mode and is tracked as running."""
         db_job = _make_db_job("completed", "2026-02-01T00:00:00")
@@ -278,7 +240,7 @@ class TestJobManagerRegenerateReport:
                 "openscientist.job_manager.threading.Thread", return_value=fake_thread
             ) as mock_thread,
         ):
-            manager.regenerate_report(job_id)
+            await manager.regenerate_report(job_id)
 
         assert manager._running_jobs[job_id] is fake_thread
         fake_thread.start.assert_called_once()
@@ -295,12 +257,13 @@ class TestJobManagerDelete:
     @pytest.fixture(autouse=True)
     def _mock_ks_progress(self):
         with patch(
-            "openscientist.job_manager._load_progress_from_knowledge_state",
+            "openscientist.job_manager._load_progress",
+            new_callable=AsyncMock,
             return_value=(0, 0),
         ):
             yield
 
-    def test_delete_completed_job(self, tmp_path):
+    async def test_delete_completed_job(self, tmp_path):
         manager = _new_manager(tmp_path)
         job_id = str(uuid4())
         _write_config(tmp_path, job_id, status="completed")
@@ -314,11 +277,11 @@ class TestJobManagerDelete:
             ),
             patch("openscientist.job_manager._db_delete_job", new_callable=AsyncMock),
         ):
-            manager.delete_job(job_id)
+            await manager.delete_job(job_id)
 
         assert not (tmp_path / job_id).exists()
 
-    def test_delete_nonexistent_raises(self, tmp_path):
+    async def test_delete_nonexistent_raises(self, tmp_path):
         manager = _new_manager(tmp_path)
         with (
             patch(
@@ -328,9 +291,9 @@ class TestJobManagerDelete:
             ),
             pytest.raises(ValueError, match="not found"),
         ):
-            manager.delete_job(str(uuid4()))
+            await manager.delete_job(str(uuid4()))
 
-    def test_delete_running_raises(self, tmp_path):
+    async def test_delete_running_raises(self, tmp_path):
         manager = _new_manager(tmp_path)
         job_id = str(uuid4())
         db_job = _make_db_job("running", "2026-02-01T00:00:00", job_id=job_id)
@@ -343,9 +306,9 @@ class TestJobManagerDelete:
             ),
             pytest.raises(ValueError, match="Cannot delete running"),
         ):
-            manager.delete_job(job_id)
+            await manager.delete_job(job_id)
 
-    def test_delete_aborts_when_database_delete_fails(self, tmp_path):
+    async def test_delete_aborts_when_database_delete_fails(self, tmp_path):
         manager = _new_manager(tmp_path)
         job_id = str(uuid4())
         _write_config(tmp_path, job_id, status="completed")
@@ -364,7 +327,7 @@ class TestJobManagerDelete:
             ),
             pytest.raises(ValueError, match=f"Failed to delete job {job_id} from database"),
         ):
-            manager.delete_job(job_id)
+            await manager.delete_job(job_id)
 
         assert (tmp_path / job_id).exists()
 
@@ -456,7 +419,7 @@ class TestContainerStatusNotifications:
 class TestJobManagerKSProgress:
     """Tests for real-time KS progress reading."""
 
-    def test_running_job_reads_ks(self, tmp_path):
+    async def test_running_job_reads_ks(self, tmp_path):
         manager = _new_manager(tmp_path)
         job_id = str(uuid4())
         _write_config(tmp_path, job_id, status="running")
@@ -471,11 +434,15 @@ class TestJobManagerKSProgress:
                 "openscientist.job_manager._db_get_job", new_callable=AsyncMock, return_value=db_job
             ),
             patch(
-                "openscientist.job_manager.KnowledgeState.load_from_database_sync",
+                "openscientist.job_manager.thread_safe_admin_session", return_value=nullcontext()
+            ),
+            patch(
+                "openscientist.job_manager.KnowledgeState.load_from_database",
+                new_callable=AsyncMock,
                 return_value=MagicMock(data=ks_data),
             ),
         ):
-            job = manager.get_job(job_id)
+            job = await manager.get_job(job_id)
 
         assert job is not None
         assert job.iterations_completed == 4
@@ -485,24 +452,25 @@ class TestJobManagerKSProgress:
 class TestJobManagerCancellationConcurrency:
     """Tests for cancellation behavior and active-slot accounting."""
 
-    def test_cancel_running_job_keeps_thread_registered_until_exit(self, tmp_path):
+    async def test_cancel_running_job_keeps_thread_registered_until_exit(self, tmp_path):
         manager = _new_manager(tmp_path)
         job_id = str(uuid4())
         manager._running_jobs[job_id] = MagicMock()
-
-        running_job = JobInfo(
-            job_id=job_id,
-            research_question="Q?",
-            status=JobStatus.RUNNING,
-            created_at="2026-02-01T00:00:00+00:00",
-        )
+        db_job = _make_db_job("running", "2026-02-01T00:00:00", job_id=job_id)
 
         with (
-            patch.object(manager, "get_job", return_value=running_job),
-            patch.object(manager, "_update_job_status"),
+            patch(
+                "openscientist.job_manager._db_get_job", new_callable=AsyncMock, return_value=db_job
+            ),
+            patch(
+                "openscientist.job_manager._db_update_job_status",
+                new_callable=AsyncMock,
+                return_value=JobStatusUpdateResult(applied=True),
+            ),
+            patch.object(manager, "_stop_container"),
             patch.object(manager, "_start_next_queued_job"),
         ):
-            manager.cancel_job(job_id)
+            await manager.cancel_job(job_id)
 
         # Cancellation is cooperative; keep tracking until worker thread exits.
         assert job_id in manager._running_jobs
@@ -547,7 +515,7 @@ class TestJobManagerConcurrencyLimit:
             manager._running_jobs[str(paused.id)] = MagicMock()
 
             with patch.object(manager, "_run_job"):
-                manager.start_job(str(new.id))
+                await asyncio.to_thread(manager.start_job, str(new.id))
 
             assert str(new.id) not in manager._running_jobs
             async with session_factory() as session:
@@ -634,7 +602,7 @@ class TestJobManagerCleanup:
 class TestJobManagerCreationSafety:
     """Tests for creation-time safety guards."""
 
-    def test_create_job_blocks_when_budget_limit_exceeded(self, tmp_path):
+    async def test_create_job_blocks_when_budget_limit_exceeded(self, tmp_path):
         manager = _new_manager(tmp_path)
         fake_provider = SimpleNamespace(
             check_budget_limits=lambda: {
@@ -644,24 +612,24 @@ class TestJobManagerCreationSafety:
         )
 
         with (
-            patch.object(manager, "get_job", return_value=None),
+            patch.object(manager, "get_job", new_callable=AsyncMock, return_value=None),
             patch("openscientist.job_manager.get_provider", return_value=fake_provider),
             pytest.raises(ValueError, match="Cannot create job"),
         ):
-            manager.create_job(
+            await manager.create_job(
                 job_id=str(uuid4()),
                 research_question="Budget test",
                 data_files=[],
                 auto_start=False,
             )
 
-    def test_create_job_rolls_back_database_when_filesystem_init_fails(self, tmp_path):
+    async def test_create_job_rolls_back_database_when_filesystem_init_fails(self, tmp_path):
         manager = _new_manager(tmp_path)
         job_id = str(uuid4())
         fake_provider = SimpleNamespace(check_budget_limits=lambda: {"can_proceed": True})
 
         with (
-            patch.object(manager, "get_job", return_value=None),
+            patch.object(manager, "get_job", new_callable=AsyncMock, return_value=None),
             patch("openscientist.job_manager.get_provider", return_value=fake_provider),
             patch("openscientist.job_manager._db_create_job", new_callable=AsyncMock),
             patch(
@@ -670,7 +638,7 @@ class TestJobManagerCreationSafety:
             patch("openscientist.job_manager.create_job", side_effect=RuntimeError("disk full")),
             pytest.raises(ValueError, match="Failed to initialize job files"),
         ):
-            manager.create_job(
+            await manager.create_job(
                 job_id=job_id,
                 research_question="Filesystem failure test",
                 data_files=[],
@@ -679,7 +647,7 @@ class TestJobManagerCreationSafety:
 
         assert mock_db_delete.await_count == 1
 
-    def test_create_job_records_llm_provider_and_model(self, tmp_path):
+    async def test_create_job_records_llm_provider_and_model(self, tmp_path):
         manager = _new_manager(tmp_path)
         job_id = str(uuid4())
         created_job = JobInfo(
@@ -697,14 +665,17 @@ class TestJobManagerCreationSafety:
         )
 
         with (
-            patch.object(manager, "get_job", return_value=None),
+            patch.object(
+                manager, "get_job", new_callable=AsyncMock, side_effect=[None, created_job]
+            ),
             patch.object(manager, "_check_budget_before_creation"),
             patch.object(manager, "_create_job_files"),
-            patch.object(manager, "_load_job_info", return_value=created_job),
             patch("openscientist.settings.get_settings", return_value=settings),
-            patch.object(manager, "_create_db_job_record") as mock_create_db_job_record,
+            patch.object(
+                manager, "_create_db_job_record", new_callable=AsyncMock
+            ) as mock_create_db_job_record,
         ):
-            manager.create_job(
+            await manager.create_job(
                 job_id=job_id,
                 research_question="Model tracking test",
                 data_files=[],

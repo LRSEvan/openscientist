@@ -3,6 +3,7 @@ in the scheduler window, then that owner's oldest queued job."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -76,10 +77,10 @@ async def _job(
     return job.id
 
 
-def _picked(tmp_path: Path, window: timedelta = timedelta(hours=24)) -> set[str]:
+async def _picked(tmp_path: Path, window: timedelta = timedelta(hours=24)) -> set[str]:
     manager = JobManager(jobs_dir=tmp_path, scheduler_window=window)
     with patch.object(manager, "_run_job"):
-        manager._start_next_queued_job()
+        await asyncio.to_thread(manager._start_next_queued_job)
     return set(manager._running_jobs)
 
 
@@ -104,7 +105,7 @@ async def test_the_owner_with_fewer_hours_goes_first_even_with_a_newer_job(
     bobs = await _job(
         test_engine, owners.bob, JobStatus.QUEUED, created=_NOW - timedelta(minutes=5)
     )
-    assert _picked(tmp_path) == {str(bobs)}
+    assert await _picked(tmp_path) == {str(bobs)}
 
 
 async def test_a_running_job_counts_up_to_now(
@@ -122,7 +123,7 @@ async def test_a_running_job_counts_up_to_now(
     bobs = await _job(test_engine, owners.bob, JobStatus.QUEUED)
     manager = JobManager(jobs_dir=tmp_path, max_concurrent=2)
     with patch.object(manager, "_run_job"):
-        manager._start_next_queued_job()
+        await asyncio.to_thread(manager._start_next_queued_job)
     assert set(manager._running_jobs) == {str(bobs)}
 
 
@@ -147,7 +148,7 @@ async def test_only_hours_inside_the_window_count(
         ),
         "bob": await _job(test_engine, owners.bob, JobStatus.QUEUED),
     }
-    assert _picked(tmp_path, timedelta(hours=window_hours)) == {str(queued[expected])}
+    assert await _picked(tmp_path, timedelta(hours=window_hours)) == {str(queued[expected])}
 
 
 async def test_equal_hours_fall_back_to_the_oldest_queued_job(
@@ -156,7 +157,7 @@ async def test_equal_hours_fall_back_to_the_oldest_queued_job(
     older = await _job(test_engine, owners.bob, JobStatus.QUEUED, created=_NOW - timedelta(hours=2))
     await _job(test_engine, owners.alice, JobStatus.QUEUED, created=_NOW - timedelta(hours=1))
     await _job(test_engine, owners.bob, JobStatus.QUEUED)
-    assert _picked(tmp_path) == {str(older)}
+    assert await _picked(tmp_path) == {str(older)}
 
 
 def test_a_failed_pick_starts_no_job(tmp_path: Path) -> None:

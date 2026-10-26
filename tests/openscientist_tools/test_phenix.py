@@ -149,7 +149,7 @@ def _fake_setup_phenix_env() -> dict[str, str]:
 # ----- In-process branch coverage -----
 
 
-def test_run_phenix_tool_happy_path(
+async def test_run_phenix_tool_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -165,7 +165,7 @@ def test_run_phenix_tool_happy_path(
     )
     monkeypatch.setattr("openscientist_tools.phenix.subprocess.run", lambda *a, **kw: completed)
 
-    result = run_phenix_tool("phenix.clashscore", ["model.pdb"])
+    result = await run_phenix_tool("phenix.clashscore", ["model.pdb"])
     assert "MolProbity clashscore = 5.0" in result
     assert "Command: phenix.clashscore" in result
 
@@ -175,7 +175,7 @@ def test_run_phenix_tool_happy_path(
     assert last_log["success"] is True
 
 
-def test_run_phenix_tool_nonzero_returncode(
+async def test_run_phenix_tool_nonzero_returncode(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -191,14 +191,14 @@ def test_run_phenix_tool_nonzero_returncode(
     )
     monkeypatch.setattr("openscientist_tools.phenix.subprocess.run", lambda *a, **kw: completed)
 
-    result = run_phenix_tool("phenix.clashscore", ["model.pdb"])
+    result = await run_phenix_tool("phenix.clashscore", ["model.pdb"])
     assert "❌" in result
     assert "exited with code 1" in result
     assert "bad input file" in result
     assert patched_ks_persistence.data["analysis_log"][-1]["success"] is False
 
 
-def test_run_phenix_tool_timeout(
+async def test_run_phenix_tool_timeout(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -211,21 +211,21 @@ def test_run_phenix_tool_timeout(
 
     monkeypatch.setattr("openscientist_tools.phenix.subprocess.run", _raise_timeout)
 
-    result = run_phenix_tool("phenix.clashscore", ["model.pdb"])
+    result = await run_phenix_tool("phenix.clashscore", ["model.pdb"])
     assert "timed out after 5 minutes" in result
 
 
-def test_run_phenix_tool_missing_input_file(
+async def test_run_phenix_tool_missing_input_file(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
 ) -> None:
     monkeypatch.setattr(phenix_module, "setup_phenix_env", _fake_setup_phenix_env)
-    result = run_phenix_tool("phenix.clashscore", ["nonexistent.pdb"])
+    result = await run_phenix_tool("phenix.clashscore", ["nonexistent.pdb"])
     assert result == "❌ Error: File not found: nonexistent.pdb"
 
 
-def test_compare_structures_appends_rmsd_interpretation(
+async def test_compare_structures_appends_rmsd_interpretation(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -242,7 +242,7 @@ def test_compare_structures_appends_rmsd_interpretation(
     )
     monkeypatch.setattr("openscientist_tools.phenix.subprocess.run", lambda *a, **kw: completed)
 
-    result = compare_structures("exp.pdb", "pred.pdb")
+    result = await compare_structures("exp.pdb", "pred.pdb")
     assert "RMSD = 1.23" in result
     assert "Interpretation hints" in result
     assert "RMSD 1-2 Å" in result
@@ -307,7 +307,7 @@ async def test_run_phenix_tool_via_subprocess(
         assert "❌" not in text
         assert "Command: phenix.clashscore" in text
 
-        reloaded = KnowledgeState.load_from_database_sync(str(job_id))
+        reloaded = await KnowledgeState.load_from_database(str(job_id))
         assert reloaded.data["analysis_log"][-1]["action"] == "run_phenix_tool"
         assert reloaded.data["analysis_log"][-1]["tool_name"] == "phenix.clashscore"
 

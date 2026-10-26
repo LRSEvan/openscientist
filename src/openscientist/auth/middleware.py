@@ -8,7 +8,6 @@ Supports cookie-backed session authentication.
 import inspect
 import logging
 from collections.abc import Callable
-from contextlib import suppress
 from datetime import UTC, datetime
 from functools import wraps
 from typing import Any
@@ -18,7 +17,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from openscientist.async_tasks import run_sync
 from openscientist.database.models import Session, User
 from openscientist.database.retry import is_connection_error
 from openscientist.database.session import get_admin_session
@@ -120,23 +118,10 @@ def _save_return_to_path() -> None:
         logger.debug("Could not save return_to path", exc_info=True)
 
 
-def _clear_user_storage(tolerate_uninitialized: bool = False) -> None:
-    """Clear NiceGUI user storage with optional tolerance for test contexts."""
-    if tolerate_uninitialized:
-        with suppress(AssertionError, AttributeError):
-            app.storage.user.clear()
-        return
-    app.storage.user.clear()
-
-
-def _redirect_to_login(
-    *,
-    clear_storage: bool = False,
-    tolerate_uninitialized_storage: bool = False,
-) -> None:
+def _redirect_to_login(*, clear_storage: bool = False) -> None:
     """Persist return path and navigate to login."""
     if clear_storage:
-        _clear_user_storage(tolerate_uninitialized=tolerate_uninitialized_storage)
+        app.storage.user.clear()
     _save_return_to_path()
     ui.navigate.to("/login")
 
@@ -153,16 +138,21 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
     """
     Decorator to require authentication for a page.
 
-    Checks for valid session token (from cookie or storage) and redirects to
-    login if not authenticated. For async functions, validates session against
-    database.
+    Checks for valid session token (from cookie or storage), validates it against
+    the database, and redirects to login if not authenticated.
 
     Args:
-        func: Page function to protect
+        func: Async page function to protect. A sync page would run its session
+            check on the event loop and block every other request, so it is refused.
 
     Returns:
         Wrapped function that checks authentication
+
+    Raises:
+        TypeError: ``func`` is not a coroutine function.
     """
+    if not inspect.iscoroutinefunction(func):
+        raise TypeError(f"require_auth needs an async page, and {func.__qualname__} is sync")
 
     @wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -193,37 +183,7 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
         # Call the decorated function
         return await func(*args, **kwargs)
 
-    @wraps(func)
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        # Strictly validate every protected sync page against the database.
-        session_token = _get_session_token()
-        if not session_token:
-            logger.debug("No session cookie, redirecting to login")
-            _redirect_to_login(clear_storage=True, tolerate_uninitialized_storage=True)
-            return None
-
-        try:
-            user_info = run_sync(validate_session(session_token))
-        except Exception as e:
-            if not is_connection_error(e):
-                raise
-            logger.error("Database unreachable while checking a session: %s", e)
-            _show_database_unavailable()
-            return None
-
-        if not user_info:
-            logger.debug("Invalid session token in sync path, redirecting to login")
-            _redirect_to_login(clear_storage=True, tolerate_uninitialized_storage=True)
-            return None
-
-        _store_authenticated_user(session_token, user_info)
-
-        return func(*args, **kwargs)
-
-    # Return appropriate wrapper based on function type
-    if inspect.iscoroutinefunction(func):
-        return async_wrapper
-    return sync_wrapper
+    return async_wrapper
 
 
 def get_current_user_id() -> str | None:

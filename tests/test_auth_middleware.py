@@ -26,8 +26,8 @@ def _make_fake_context(session_token: str | None = None):
     return fake_app, fake_ui, storage
 
 
-def test_require_auth_sync_rejects_invalid_cookie_session(monkeypatch):
-    """Sync-protected pages must validate sessions against the database."""
+async def test_require_auth_rejects_invalid_cookie_session(monkeypatch):
+    """Protected pages must validate sessions against the database."""
     fake_app, fake_ui, storage = _make_fake_context(session_token="bad-token")
     monkeypatch.setattr(middleware, "app", fake_app)
     monkeypatch.setattr(middleware, "ui", fake_ui)
@@ -39,19 +39,19 @@ def test_require_auth_sync_rejects_invalid_cookie_session(monkeypatch):
 
     called = {"value": False}
 
-    def protected_page():
+    async def protected_page():
         called["value"] = True
 
     wrapped = middleware.require_auth(protected_page)
-    wrapped()
+    await wrapped()
 
     assert called["value"] is False
     fake_ui.navigate.to.assert_called_once_with("/login")
     assert storage.get("return_to") == "/new"
 
 
-def test_require_auth_sync_accepts_valid_session_and_populates_storage(monkeypatch):
-    """Sync-protected pages should execute only after successful validation."""
+async def test_require_auth_accepts_valid_session_and_populates_storage(monkeypatch):
+    """Protected pages should execute only after successful validation."""
     fake_app, fake_ui, storage = _make_fake_context(session_token="good-token")
     monkeypatch.setattr(middleware, "app", fake_app)
     monkeypatch.setattr(middleware, "ui", fake_ui)
@@ -70,12 +70,12 @@ def test_require_auth_sync_accepts_valid_session_and_populates_storage(monkeypat
 
     called = {"value": False}
 
-    def protected_page():
+    async def protected_page():
         called["value"] = True
         return "ok"
 
     wrapped = middleware.require_auth(protected_page)
-    result = wrapped()
+    result = await wrapped()
 
     assert result == "ok"
     assert called["value"] is True

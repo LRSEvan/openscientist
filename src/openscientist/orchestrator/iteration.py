@@ -381,11 +381,11 @@ def build_consensus_retry_prompt(research_question: str, *, tool_prefix: str) ->
 Calling that tool is the only action for this step."""
 
 
-def increment_ks_iteration(job_id: str) -> None:
+async def increment_ks_iteration(job_id: str) -> None:
     """Increment the persisted knowledge-state iteration counter."""
-    ks = KnowledgeState.load_from_database_sync(job_id)
+    ks = await KnowledgeState.load_from_database(job_id)
     ks.data["iteration"] += 1
-    ks.save_to_database_sync(job_id)
+    await ks.save_to_database(job_id)
 
 
 async def _get_job_status(job_id: str) -> str | None:

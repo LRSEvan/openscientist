@@ -181,7 +181,7 @@ def _mock_broker(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> Mag
 # ----- In-process branch coverage (broker HTTP mocked) -----
 
 
-def test_execute_code_python_happy_path(
+async def test_execute_code_python_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -191,7 +191,7 @@ def test_execute_code_python_happy_path(
         {"success": True, "output": "hello world", "execution_time": 0.5, "plots": []},
     )
 
-    result = execute_code("print('hello world')")
+    result = await execute_code("print('hello world')")
 
     assert "hello world" in result
     assert "successfully" in result.lower() or "✅" in result
@@ -208,7 +208,7 @@ def test_execute_code_python_happy_path(
     assert last_log["success"] is True
 
 
-def test_execute_code_rust_happy_path(
+async def test_execute_code_rust_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -218,7 +218,7 @@ def test_execute_code_rust_happy_path(
         {"success": True, "output": "42", "execution_time": 1.2, "plots": []},
     )
 
-    execute_code('fn main(){println!("42");}', language="rust")
+    await execute_code('fn main(){println!("42");}', language="rust")
 
     call_kwargs = broker.call_args.kwargs
     assert call_kwargs["language"] == "rust"
@@ -227,7 +227,7 @@ def test_execute_code_rust_happy_path(
     assert "data_path" not in call_kwargs
 
 
-def test_execute_code_sparql_happy_path(
+async def test_execute_code_sparql_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -237,26 +237,26 @@ def test_execute_code_sparql_happy_path(
         {"success": True, "output": "rows: 0", "execution_time": 0.3, "plots": []},
     )
 
-    execute_code("SELECT * WHERE { ?s ?p ?o } LIMIT 1", language="sparql")
+    await execute_code("SELECT * WHERE { ?s ?p ?o } LIMIT 1", language="sparql")
 
     call_kwargs = broker.call_args.kwargs
     assert call_kwargs["language"] == "sparql"
     assert call_kwargs["timeout"] == 60
 
 
-def test_execute_code_invalid_language_returns_error(
+async def test_execute_code_invalid_language_returns_error(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
 ) -> None:
-    result = execute_code("anything", language="lisp")
+    result = await execute_code("anything", language="lisp")
     assert result == (
         "❌ ERROR: Unsupported language 'lisp'. Supported: 'python', 'rust', 'sparql'"
     )
     assert patched_ks_persistence.data["analysis_log"] == []
 
 
-def test_execute_code_failure_returns_error_format(
+async def test_execute_code_failure_returns_error_format(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -273,7 +273,7 @@ def test_execute_code_failure_returns_error_format(
         },
     )
 
-    result = execute_code("print(1/0)")
+    result = await execute_code("print(1/0)")
     assert "❌" in result or "failed" in result.lower()
     assert "ZeroDivisionError" in result or "division by zero" in result
 
@@ -281,7 +281,7 @@ def test_execute_code_failure_returns_error_format(
     assert last_log["success"] is False
 
 
-def test_execute_code_broker_unavailable_returns_error(
+async def test_execute_code_broker_unavailable_returns_error(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -289,13 +289,13 @@ def test_execute_code_broker_unavailable_returns_error(
     broker = _mock_broker(monkeypatch, {})
     broker.side_effect = BrokerError("connection refused")
 
-    result = execute_code("print('hi')")
+    result = await execute_code("print('hi')")
     assert result.startswith("❌ ERROR: code execution service unavailable")
     # A transport failure is exceptional: nothing is logged as an execution.
     assert patched_ks_persistence.data["analysis_log"] == []
 
 
-def test_execute_code_python_with_data_files(
+async def test_execute_code_python_with_data_files(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -309,7 +309,7 @@ def test_execute_code_python_with_data_files(
         {"success": True, "output": "", "execution_time": 0.1, "plots": []},
     )
 
-    execute_code("pass")
+    await execute_code("pass")
 
     call_kwargs = broker.call_args.kwargs
     assert call_kwargs["data_path"] == str((state_job_dir / "a.csv").resolve())
@@ -322,7 +322,7 @@ def test_execute_code_python_with_data_files(
     }
 
 
-def test_execute_code_python_data_load_failure(
+async def test_execute_code_python_data_load_failure(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -342,13 +342,13 @@ def test_execute_code_python_data_load_failure(
     # so make sure the file exists so we hit the load branch.
     missing.write_text("dummy")
 
-    result = execute_code("print('hi')")
+    result = await execute_code("print('hi')")
     assert "❌ ERROR: Cannot execute code" in result
     assert "data file failed to load" in result
     broker.assert_not_called()
 
 
-def test_execute_code_cache_hits_on_second_call(
+async def test_execute_code_cache_hits_on_second_call(
     monkeypatch: pytest.MonkeyPatch,
     state_job_dir: Path,
     patched_ks_persistence: KnowledgeState,
@@ -371,8 +371,8 @@ def test_execute_code_cache_hits_on_second_call(
         {"success": True, "output": "", "execution_time": 0, "plots": []},
     )
 
-    execute_code("pass")
-    execute_code("pass")
+    await execute_code("pass")
+    await execute_code("pass")
 
     assert call_count["n"] == 1
 
@@ -411,7 +411,7 @@ async def test_execute_python_via_subprocess(
         text = _text(response)
         assert "hello world" in text
 
-        reloaded = KnowledgeState.load_from_database_sync(str(job_id))
+        reloaded = await KnowledgeState.load_from_database(str(job_id))
         last_log = reloaded.data["analysis_log"][-1]
         assert last_log["action"] == "execute_code"
         assert last_log["success"] is True
@@ -448,7 +448,7 @@ async def test_execute_rust_via_subprocess(
         text = _text(response)
         assert "hi from rust" in text
 
-        reloaded = KnowledgeState.load_from_database_sync(str(job_id))
+        reloaded = await KnowledgeState.load_from_database(str(job_id))
         last_log = reloaded.data["analysis_log"][-1]
         assert last_log["action"] == "execute_code"
         assert last_log["success"] is True
@@ -493,7 +493,7 @@ async def test_execute_python_with_plot_via_subprocess(
         plots = sorted((job_dir / "provenance").glob("plot_*.png"))
         assert plots, "no plot files were written by the executor"
 
-        reloaded = KnowledgeState.load_from_database_sync(str(job_id))
+        reloaded = await KnowledgeState.load_from_database(str(job_id))
         last_log = reloaded.data["analysis_log"][-1]
         assert last_log["success"] is True
         assert len(last_log["plots"]) >= 1
@@ -542,7 +542,7 @@ async def test_execute_python_with_data_file_via_subprocess(
         assert "rows: 2" in text
         assert "first: sentinel-42" in text
 
-        reloaded = KnowledgeState.load_from_database_sync(str(job_id))
+        reloaded = await KnowledgeState.load_from_database(str(job_id))
         last_log = reloaded.data["analysis_log"][-1]
         assert last_log["success"] is True
 
@@ -630,7 +630,7 @@ async def test_execute_python_failure_via_subprocess(
         text = _text(response)
         assert "ZeroDivisionError" in text or "division by zero" in text
 
-        reloaded = KnowledgeState.load_from_database_sync(str(job_id))
+        reloaded = await KnowledgeState.load_from_database(str(job_id))
         last_log = reloaded.data["analysis_log"][-1]
         assert last_log["action"] == "execute_code"
         assert last_log["success"] is False

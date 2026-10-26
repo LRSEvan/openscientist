@@ -313,7 +313,7 @@ class TestDiscoveryCancellationAndFailure:
             patch("openscientist.orchestrator.discovery._append_iteration_artifacts"),
             patch("openscientist.orchestrator.discovery._sync_version_metadata"),
             patch(
-                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch("openscientist.orchestrator.discovery.increment_ks_iteration"),
@@ -398,7 +398,7 @@ class TestDiscoveryCancellationAndFailure:
             patch("openscientist.orchestrator.discovery._append_iteration_artifacts"),
             patch("openscientist.orchestrator.discovery._sync_version_metadata"),
             patch(
-                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch("openscientist.orchestrator.discovery.increment_ks_iteration"),
@@ -562,7 +562,8 @@ class TestGuardedStatusWrites:
 class TestIncrementKsIteration:
     """Tests for atomic iteration increment."""
 
-    def test_increments_iteration(self):
+    @pytest.mark.asyncio
+    async def test_increments_iteration(self):
         from openscientist.knowledge_state import KnowledgeState
 
         ks = KnowledgeState("job1", "Q?", 10)
@@ -570,19 +571,20 @@ class TestIncrementKsIteration:
 
         with (
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database",
             ) as mock_save,
         ):
-            increment_ks_iteration("job1")
+            await increment_ks_iteration("job1")
 
         assert ks.data["iteration"] == 4
-        mock_save.assert_called_once_with("job1")
+        mock_save.assert_awaited_once_with("job1")
 
-    def test_preserves_other_fields(self):
+    @pytest.mark.asyncio
+    async def test_preserves_other_fields(self):
         from openscientist.knowledge_state import KnowledgeState
 
         ks = KnowledgeState("job1", "Q?", 10)
@@ -592,14 +594,14 @@ class TestIncrementKsIteration:
 
         with (
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database",
             ),
         ):
-            increment_ks_iteration("job1")
+            await increment_ks_iteration("job1")
 
         assert ks.data["iteration"] == 2
         assert len(ks.data["findings"]) == 1
@@ -1293,7 +1295,7 @@ class TestReportGenerationPhase:
                 outcome=TurnOutcome.COMPLETED, output="", tool_calls=0, transcript=[]
             )
 
-        with patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks):
+        with patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks):
             await discovery._set_consensus_answer(
                 SimpleNamespace(
                     run_iteration=fake_run,
@@ -1327,7 +1329,7 @@ class TestReportGenerationPhase:
                 outcome=TurnOutcome.COMPLETED, output="", tool_calls=0, transcript=[]
             )
 
-        with patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks):
+        with patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks):
             await discovery._set_consensus_answer(
                 SimpleNamespace(
                     run_iteration=fake_run,
@@ -1358,7 +1360,7 @@ class TestReportGenerationPhase:
                 outcome=TurnOutcome.COMPLETED, output="", tool_calls=0, transcript=[]
             )
 
-        with patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks):
+        with patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks):
             await discovery._set_consensus_answer(
                 SimpleNamespace(
                     run_iteration=fake_run,
@@ -1386,7 +1388,7 @@ class TestReportGenerationPhase:
             )
 
         with (
-            patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks),
+            patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks),
             patch.object(discovery, "build_report_prompt", return_value="R"),
             patch.object(discovery, "_save_report_transcript"),
             patch.object(discovery, "_ensure_report_written", return_value=True),
@@ -1421,7 +1423,7 @@ class TestReportGenerationPhase:
             )
 
         with (
-            patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks),
+            patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks),
             patch.object(discovery, "build_report_prompt", return_value="R"),
             patch.object(discovery, "build_report_retry_prompt", return_value="RETRY"),
             patch.object(discovery, "_save_report_transcript"),
