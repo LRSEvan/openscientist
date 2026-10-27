@@ -30,6 +30,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, CodexConfig, Sandbox
+from openai_codex.generated.v2_all import (
+    AgentMessageThreadItem,
+    ItemCompletedNotification,
+    MessagePhase,
+    ThreadItem,
+    ThreadTokenUsageUpdatedNotification,
+    Turn,
+    TurnCompletedNotification,
+    TurnStatus,
+)
 
 from openscientist.agent.base import (
     AbstractAgent,
@@ -81,7 +91,7 @@ def _toml_str(value: str) -> str:
 
 
 class _TokenBreakdown(Protocol):
-    """The nested per-turn counts read off the SDK's ``TokenUsageBreakdown``.
+    """The nested counts read off the SDK's ``TokenUsageBreakdown``.
 
     Structural rather than nominal so the mapper stays checkable while tests
     substitute stubs. Typing these four is what keeps a rename or a change of
@@ -98,11 +108,37 @@ class _TokenBreakdown(Protocol):
     def reasoning_output_tokens(self) -> int: ...
 
 
-class _TurnUsage(Protocol):
-    """The SDK's ``ThreadTokenUsage``, of which only ``last`` is per-turn."""
+def _grown(before: TokenUsage, after: TokenUsage) -> TokenUsage | None:
+    """What a running total gained, or None when any count fell, which is how
+    codex restarts its total once the context window fills."""
+    grown = TokenUsage(
+        input_tokens=after.input_tokens - before.input_tokens,
+        output_tokens=after.output_tokens - before.output_tokens,
+        cache_read_tokens=after.cache_read_tokens - before.cache_read_tokens,
+        reasoning_tokens=after.reasoning_tokens - before.reasoning_tokens,
+    )
+    counts = (
+        grown.input_tokens,
+        grown.output_tokens,
+        grown.cache_read_tokens,
+        grown.reasoning_tokens,
+    )
+    return None if min(counts) < 0 else grown
 
-    @property
-    def last(self) -> _TokenBreakdown | None: ...
+
+def _final_response(items: list[ThreadItem]) -> str | None:
+    """The turn's answer, chosen as the SDK chooses ``TurnResult.final_response``:
+    the last final-answer message, else the last message without a phase."""
+    fallback: str | None = None
+    for item in reversed(items):
+        message = item.root
+        if not isinstance(message, AgentMessageThreadItem):
+            continue
+        if message.phase == MessagePhase.final_answer:
+            return message.text
+        if message.phase is None and fallback is None:
+            fallback = message.text
+    return fallback
 
 
 class CodexAgent(AbstractAgent[CodexCompatible]):
@@ -112,6 +148,9 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
         super().__init__(config, provider)
         self._codex: AsyncCodex | None = None
         self._thread: AsyncThread | None = None
+        # The thread's running total at its last usage report, which codex
+        # sends after every model request of a turn.
+        self._thread_total = TokenUsage()
 
     backend = AgentBackend.CODEX
     file_write_tool = "apply_patch"
@@ -284,33 +323,66 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
                 approval_mode=ApprovalMode.deny_all,
                 cwd=str(self._job_dir()),
             )
+            self._thread_total = TokenUsage()
             logger.info("Codex thread started")
         return self._thread
 
     @staticmethod
-    def _usage_from_payload(usage: _TurnUsage) -> TokenUsage:
-        """Normalize the turn's token usage to ``TokenUsage``.
+    def _usage_from_breakdown(counts: _TokenBreakdown) -> TokenUsage:
+        """Normalize the SDK's token counts to ``TokenUsage``.
 
-        The SDK reports per-turn usage as ``usage.last`` (a
-        ``TokenUsageBreakdown``) whose counts nest: ``input_tokens`` includes
-        ``cached_input_tokens`` and ``output_tokens`` includes
-        ``reasoning_output_tokens`` (Responses-API shape). Both sub-counts are
-        subtracted here so the buckets stay non-overlapping and still sum to
-        the payload's ``total_tokens``. ``usage.total`` is the running thread
-        total, which we do not use since ``_token_usage`` accumulates per turn.
+        The counts nest: ``input_tokens`` includes ``cached_input_tokens`` and
+        ``output_tokens`` includes ``reasoning_output_tokens`` (Responses-API
+        shape). Both sub-counts are subtracted here so the buckets stay
+        non-overlapping and still sum to the breakdown's ``total_tokens``.
         """
-        last = usage.last
-        if last is None:
-            return TokenUsage()
         return TokenUsage(
-            input_tokens=last.input_tokens - last.cached_input_tokens,
-            output_tokens=max(last.output_tokens - last.reasoning_output_tokens, 0),
-            cache_read_tokens=last.cached_input_tokens,
+            input_tokens=counts.input_tokens - counts.cached_input_tokens,
+            output_tokens=max(counts.output_tokens - counts.reasoning_output_tokens, 0),
+            cache_read_tokens=counts.cached_input_tokens,
             # The SDK exposes no cache-write count in either lifetime tier.
             cache_write_tokens=0,
             cache_write_1h_tokens=0,
-            reasoning_tokens=last.reasoning_output_tokens,
+            reasoning_tokens=counts.reasoning_output_tokens,
         )
+
+    def _count_usage(self, thread_total: _TokenBreakdown) -> None:
+        """Add what the thread spent since its last usage report.
+
+        The report's ``last`` covers only the latest model request, and a turn
+        makes one request per tool call round, so the turn's spend is the growth
+        of the thread's running ``total``. Reports repeat on rate-limit updates,
+        which adds nothing."""
+        total = self._usage_from_breakdown(thread_total)
+        grown = _grown(self._thread_total, total)
+        if grown is not None:
+            self._token_usage += grown
+        self._thread_total = total
+
+    async def _run_turn(
+        self, thread: AsyncThread, prompt: str
+    ) -> tuple[list[ThreadItem], str | None]:
+        """Start a turn and read its notifications until it completes, counting
+        usage as it is reported, so a turn that is cut or cancelled keeps what it
+        spent. Returns the turn's items and its answer, and raises if the turn
+        failed."""
+        turn = await thread.turn(prompt)
+        items: list[ThreadItem] = []
+        completed: Turn | None = None
+        async for event in turn.stream():
+            payload = event.payload
+            if isinstance(payload, ThreadTokenUsageUpdatedNotification):
+                self._count_usage(payload.token_usage.total)
+            elif isinstance(payload, ItemCompletedNotification) and payload.turn_id == turn.id:
+                items.append(payload.item)
+            elif isinstance(payload, TurnCompletedNotification) and payload.turn.id == turn.id:
+                completed = payload.turn
+        if completed is None:
+            raise RuntimeError("turn completed event not received")
+        if completed.status == TurnStatus.failed:
+            message = completed.error.message if completed.error is not None else ""
+            raise RuntimeError(message or "turn failed")
+        return items, _final_response(items)
 
     @staticmethod
     def _to_transcript(items: list[Any]) -> list[TranscriptEntry]:
@@ -330,12 +402,14 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
     async def run_iteration(self, prompt: str, *, reset_session: bool = False) -> IterationResult:
         """Run one turn on the codex thread and return its result.
 
-        The turn's items are translated to a transcript and per-turn token
-        usage is accumulated.
+        The turn's items are translated to a transcript, and its token usage is
+        accumulated as codex reports it.
         """
         try:
             thread = await self._ensure_thread(reset_session)
-            result = await asyncio.wait_for(thread.run(prompt), timeout=_TURN_TIMEOUT_SECONDS)
+            items, answer = await asyncio.wait_for(
+                self._run_turn(thread, prompt), timeout=_TURN_TIMEOUT_SECONDS
+            )
         except TimeoutError:
             # Runaway turn (e.g. the model looping on an unsupported tool call).
             # Report it honestly as TIMED_OUT (work done before the cut is already
@@ -353,19 +427,16 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
                 outcome=TurnOutcome.FAILED, output="", tool_calls=0, transcript=[], error=str(e)
             )
 
-        if result.usage is not None:
-            self._token_usage += self._usage_from_payload(result.usage)
-
         tool_calls = sum(
             1
-            for item in result.items
+            for item in items
             if item.model_dump(mode="json").get("type") not in _NON_TOOL_ITEM_TYPES
         )
         return IterationResult(
             outcome=TurnOutcome.COMPLETED,
-            output=result.final_response or "",
+            output=answer or "",
             tool_calls=tool_calls,
-            transcript=self._to_transcript(result.items),
+            transcript=self._to_transcript(items),
             error="",
         )
 
