@@ -427,7 +427,7 @@ class TestProviderContainerEnvVars:
         assert "AZURE_OPENAI_API_KEY" not in env
         assert "AZURE_OPENAI_RESOURCE" not in env
 
-    def test_ollama_vars_passed_for_codex_provider(self):
+    def test_ollama_vars_passed_for_ollama_provider(self):
         settings = ProviderSettings(
             OPENSCIENTIST_PROVIDER="ollama",
             OLLAMA_BASE_URL="http://host.docker.internal:11434/v1",

@@ -144,7 +144,7 @@ class TestVersionMetadataHarness:
 
     def test_codex_probes_the_binary_the_agent_runs(self, pinned_harness, monkeypatch):
         pinned_harness("openai", "codex")
-        monkeypatch.setenv("OPENSCIENTIST_CODEX_BIN", "/opt/pinned/codex")
+        monkeypatch.setattr("codex_cli_bin.bundled_codex_path", lambda: Path("/opt/pinned/codex"))
         calls: list[list[str]] = []
 
         def fake_run(argv, **kwargs):

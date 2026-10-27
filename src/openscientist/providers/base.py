@@ -31,34 +31,6 @@ def env_from_pairs(pairs: list[tuple[str, str | None]]) -> dict[str, str]:
     return {key: value for key, value in pairs if value}
 
 
-def self_hosted_codex_provider_table(
-    *, provider_id: str, name: str, base_url: str, keyed: bool
-) -> list[str]:
-    """The ``[model_providers.<id>]`` TOML lines for a self-hosted server.
-
-    Callers pass their own ``codex_model_provider_id()`` and ``display_name``
-    so the table can never drift from the identity codex is told to select.
-    ``keyed`` is true when a credential is in play, either the provider's own
-    API key or the proxy placeholder, and drives ``requires_openai_auth``.
-    """
-    lines = [
-        f"[model_providers.{provider_id}]",
-        f'name = "{name}"',
-        f'base_url = "{base_url}"',
-        # The shipped codex fork accepts no other wire_api: its WireApi enum
-        # has a single Responses variant and rejects "chat" outright.
-        'wire_api = "responses"',
-        f"requires_openai_auth = {'true' if keyed else 'false'}",
-    ]
-    if keyed:
-        lines.append('env_key = "OPENAI_API_KEY"')
-    # A self-hosted model can stay silent for minutes during prefill before the
-    # first SSE token, tripping codex's default 5-minute idle timeout. Raise it
-    # to 1 hour, with a few reconnects as insurance.
-    lines += ["stream_idle_timeout_ms = 3600000", "stream_max_retries = 5"]
-    return lines
-
-
 class OmpModelEntry(TypedDict):
     """One model row in an omp ``models.yml`` provider block."""
 
@@ -100,7 +72,7 @@ def self_hosted_omp_model_catalog(
 
     omp resolves ``--model`` against its own catalog, which ships hosted APIs
     only, so a self-hosted server's model cannot be selected until it is
-    declared. This is the omp analog of ``self_hosted_codex_provider_table``.
+    declared.
     ``auth`` accepts only apiKey, none or oauth.
     """
     entry: OmpProviderEntry = {

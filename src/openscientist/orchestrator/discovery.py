@@ -608,13 +608,13 @@ async def _load_runtime_context(job_dir: Path) -> dict[str, Any]:
 
 
 def _harness_binary(harness: AgentBackend) -> str:
-    """The binary the harness agent will launch, via the agents' own resolvers
-    so env overrides stay honoured.
+    """The binary the harness agent will launch: the one the codex SDK is pinned
+    to, or omp through its own resolver so env overrides stay honoured.
     """
     if harness is AgentBackend.CODEX:
-        from openscientist.agent.codex_agent import _resolve_codex_bin
+        from codex_cli_bin import bundled_codex_path  # type: ignore[import-untyped]
 
-        return _resolve_codex_bin() or "codex"
+        return str(bundled_codex_path())
     from openscientist.agent.omp_agent import _resolve_omp_bin
 
     return _resolve_omp_bin()

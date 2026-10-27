@@ -12,11 +12,8 @@ prompt is delivered as an ``AGENTS.md`` in the working directory (codex's
 project-doc mechanism, symmetric to how ``ClaudeCodeAgent`` writes
 ``CLAUDE.md``).
 
-The official package ships its codex binary only as a musl-tagged wheel
-(``openai-codex-cli-bin``), which does not install on glibc hosts, so that
-dependency is dropped (see ``pyproject.toml``) and the binary is provisioned
-separately and selected via ``CodexConfig.codex_bin`` (see
-``_resolve_codex_bin``).
+The SDK launches the codex binary it is pinned to, installed with it as
+``openai-codex-cli-bin``, so the binary always speaks the SDK's protocol.
 
 Each turn's items are translated to transcript entries by the shared ``CODEX``
 deserializer (see ``_to_transcript``).
@@ -58,26 +55,12 @@ _MCP_SERVER_NAME = "openscientist-tools"
 # else (commandExecution, mcpToolCall, fileChange, ...) counts as a tool call.
 _NON_TOOL_ITEM_TYPES = frozenset({"userMessage", "agentMessage", "reasoning"})
 
-# Hard wall-clock bound on a single agent turn. A weak model can get stuck
-# retrying an unsupported tool call (e.g. apply_patch) and never end the turn,
-# which would otherwise run until the job timeout. When exceeded, the turn is
-# cut and the loop continues. Tool calls completed before the cut are already
-# persisted. Override with OPENSCIENTIST_CODEX_TURN_TIMEOUT (seconds).
+# Hard wall-clock bound on a single agent turn. A model can get stuck retrying
+# a tool call and never end the turn, which would otherwise run until the job
+# timeout. When exceeded, the turn is cut and the loop continues. Tool calls
+# completed before the cut are already persisted. Override with
+# OPENSCIENTIST_CODEX_TURN_TIMEOUT (seconds).
 _TURN_TIMEOUT_SECONDS = int(os.environ.get("OPENSCIENTIST_CODEX_TURN_TIMEOUT", "900"))
-
-
-def _resolve_codex_bin() -> str | None:
-    """Locate the codex executable for the SDK to launch.
-
-    An explicit ``OPENSCIENTIST_CODEX_BIN`` wins, otherwise fall back to a
-    ``codex`` on ``PATH``. Returns None to let ``CodexConfig`` apply its own
-    default (which will raise a clear error if no binary is found), since the
-    bundled-binary dependency is intentionally not installed.
-    """
-    override = os.environ.get("OPENSCIENTIST_CODEX_BIN")
-    if override:
-        return override
-    return shutil.which("codex")
 
 
 def _toml_str(value: str) -> str:
@@ -250,7 +233,7 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
 
     def _make_codex(self) -> AsyncCodex:
         """Build an ``AsyncCodex`` whose app-server reads the per-job config
-        home and the provider's auth env, and launches our provisioned binary."""
+        home and the provider's auth env."""
         env = {
             **os.environ,
             **self._provider.codex_sdk_env(),
@@ -258,7 +241,6 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
         }
         return AsyncCodex(
             CodexConfig(
-                codex_bin=_resolve_codex_bin(),
                 env=env,
                 cwd=str(self._job_dir()),
             )

@@ -60,9 +60,9 @@ def get_provider() -> Provider:
 
     Returns:
         Provider instance. Anthropic/CBORG/Vertex/Bedrock/Foundry are
-        ClaudeCompatible, OpenAI/Azure-OpenAI/Ollama are CodexCompatible, and vLLM
-        and llama.cpp are self-hosted OpenAiWireCompatible (omp only, not Codex
-        backends).
+        ClaudeCompatible, OpenAI/Azure-OpenAI are CodexCompatible, and Ollama,
+        vLLM and llama.cpp are self-hosted OpenAiWireCompatible (omp only, not
+        Codex backends).
 
     Raises:
         ValueError: If provider is unknown or misconfigured

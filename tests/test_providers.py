@@ -127,10 +127,10 @@ class TestAgentBackendForProvider:
 
         assert backend_for_provider_id("openai") is AgentBackend.CODEX
         assert backend_for_provider_id("azure-openai") is AgentBackend.CODEX
-        assert backend_for_provider_id("ollama") is AgentBackend.CODEX
-        # vLLM is OpenAI-wire but not a Codex backend, so omp is its only harness.
+        # Ollama, vLLM and llama.cpp are OpenAI-wire but not Codex backends, so
+        # omp is their only harness.
+        assert backend_for_provider_id("ollama") is AgentBackend.OMP
         assert backend_for_provider_id("vllm") is AgentBackend.OMP
-        # llama.cpp is likewise OpenAI-wire but not a Codex backend.
         assert backend_for_provider_id("llamacpp") is AgentBackend.OMP
 
     def test_claude_compatible_providers_map_to_claude_code(self):

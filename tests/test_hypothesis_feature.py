@@ -513,11 +513,11 @@ class TestStatsBadgesHypotheses:
         assert self._badge_value(badges, "Provider") == "Azure OpenAI Service"
         assert self._get_badge(badges, "Model") is None
 
-    def test_ollama_job_shows_codex_and_ollama_provider(self) -> None:
+    def test_ollama_job_shows_omp_and_ollama_provider(self) -> None:
         from openscientist.webapp_components.pages.job_detail import _stats_badges
 
         badges = _stats_badges(self._make_job(llm_provider="ollama"), lit_count=0)
-        assert self._badge_value(badges, "Agent") == "Codex"
+        assert self._badge_value(badges, "Agent") == "Oh My Pi"
         assert self._badge_value(badges, "Provider") == "Ollama (local)"
 
     def test_ollama_job_with_model_shows_provider_and_model(self) -> None:
@@ -527,7 +527,7 @@ class TestStatsBadgesHypotheses:
             self._make_job(llm_provider="ollama", llm_model="gpt-oss:20b"), lit_count=0
         )
         # Provider (where it is hosted) and model (which one ran) appear together.
-        assert self._badge_value(badges, "Agent") == "Codex"
+        assert self._badge_value(badges, "Agent") == "Oh My Pi"
         assert self._badge_value(badges, "Provider") == "Ollama (local)"
         assert self._badge_value(badges, "Model") == "gpt-oss:20b"
 
