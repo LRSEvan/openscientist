@@ -33,6 +33,7 @@ from openscientist.exec_broker_client import (
     EXEC_TOKEN_ENV,
     container_broker_base_url,
 )
+from openscientist.job_chat import CHAT_TURN_ENV
 from openscientist.job_container.db_login import (
     AGENT_LOGIN_LABEL,
     close_agent_login,
@@ -269,6 +270,7 @@ class JobContainerRunner:
         name: str,
         container_type: str,
         lifetime_seconds: int,
+        chat_turn: str | None = None,
     ) -> Container:
         """Build the hardened launch config and start a detached agent container.
         Shared by discovery/report launches and one-off chat turns.
@@ -300,6 +302,7 @@ class JobContainerRunner:
                 container_type=container_type,
                 database_url=login.database_url,
                 login_role=login.role,
+                chat_turn=chat_turn,
             )
         except BaseException:
             close_agent_login(login.role)
@@ -316,6 +319,7 @@ class JobContainerRunner:
         container_type: str,
         database_url: str,
         login_role: str,
+        chat_turn: str | None,
     ) -> Container:
         cs = settings.container
         env, volumes, agent_network, agent_memory, agent_cpu, agent_platform = (
@@ -330,6 +334,8 @@ class JobContainerRunner:
         network = self._get_network(agent_network)
         cap_add, run_user, entrypoint, firewall_env = self._airgap_firewall_config(settings)
         env.update(firewall_env)
+        if chat_turn is not None:
+            env[CHAT_TURN_ENV] = chat_turn
 
         return self._docker.containers.run(
             image=cs.agent_image,
@@ -357,12 +363,14 @@ class JobContainerRunner:
             },
         )
 
-    def run_chat_turn(self, job_id: str, job_dir: Path, *, timeout: int = 300) -> None:
+    def run_chat_turn(
+        self, job_id: str, job_dir: Path, chat_turn: str, *, timeout: int = 300
+    ) -> None:
         """Run one chat turn in an ephemeral hardened container and wait for it.
 
-        Inherits the job launch posture. Prompt and reply cross through files in
-        job_dir, not the database. Raises on timeout or non-zero exit, and the
-        container is always removed."""
+        Inherits the job launch posture. Prompt and reply cross through the
+        turn's files in job_dir, not the database. Raises on timeout or non-zero
+        exit, and the container is always removed."""
         name = f"openscientist-chat-{job_id[:SHORT_COMMIT_LENGTH]}-{os.urandom(4).hex()}"
         container = self._start_agent_container(
             job_id=job_id,
@@ -371,6 +379,7 @@ class JobContainerRunner:
             name=name,
             container_type="chat",
             lifetime_seconds=timeout,
+            chat_turn=chat_turn,
         )
         try:
             try:
