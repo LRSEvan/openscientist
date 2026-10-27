@@ -7,6 +7,7 @@ import asyncio
 import socket
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -87,6 +88,34 @@ async def test_a_taken_port_stops_the_listener_naming_its_setting(
     port_setting(setting, held_port)
     with pytest.raises(ListenerBindError, match=f"{held_port}.*{setting}"):
         await start()
+
+
+@pytest.mark.parametrize("listener", ["broker", "proxy"])
+async def test_a_taken_port_stops_the_web_from_starting(
+    listener: str,
+    held_port: int,
+    port_setting: Callable[[str, int], None],
+    proxied_provider: None,
+    listeners: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every other startup failure is logged and the web carries on, but agent
+    jobs cannot run without both listeners."""
+    from fastapi import FastAPI
+
+    from openscientist import skill_scheduler, web_app
+    from openscientist.database import engine
+
+    for name, (setting, _start) in _LISTENERS.items():
+        port_setting(setting, held_port if name == listener else _free_port())
+    monkeypatch.setattr(engine, "get_engine", lambda: None)
+    monkeypatch.setattr(web_app, "_verify_db_connection_and_rls", AsyncMock())
+    monkeypatch.setattr(web_app, "_ensure_default_skill_sources", AsyncMock())
+    monkeypatch.setattr(skill_scheduler, "start_skill_scheduler", AsyncMock())
+
+    with pytest.raises(ListenerBindError, match=str(held_port)):
+        async with web_app._create_lifespan()(FastAPI()):
+            pass
 
 
 async def _answers(port: int) -> bool:
