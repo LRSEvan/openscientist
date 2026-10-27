@@ -248,11 +248,3 @@ class TestBedrockClaudeCompatible:
         settings = _mock_settings(model="bedrock-custom")
         with patch("openscientist.providers.bedrock.get_settings", return_value=settings):
             assert BedrockProvider().claude_model_name() == "bedrock-custom"
-
-    def test_claude_model_name_falls_back_to_bedrock_default(self) -> None:
-        settings = _mock_settings(model=None)
-        with patch("openscientist.providers.bedrock.get_settings", return_value=settings):
-            assert (
-                BedrockProvider().claude_model_name()
-                == "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-            )

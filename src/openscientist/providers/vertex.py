@@ -106,7 +106,7 @@ class VertexProvider(ClaudeCompatible):
 
     def claude_model_name(self) -> str:
         """Model name for ClaudeAgentOptions.model."""
-        return get_settings().provider.model or "claude-sonnet-4-5@20250929"
+        return get_settings().provider.model or "claude-sonnet-5-5"
 
     def airgap_egress(self) -> AirgapPosture:
         region = get_settings().provider.cloud_ml_region
@@ -124,7 +124,7 @@ class VertexProvider(ClaudeCompatible):
         settings = get_settings()
 
         if not settings.provider.model:
-            warnings.append("OPENSCIENTIST_MODEL not set (will use claude-sonnet-4-5@20250929)")
+            warnings.append("OPENSCIENTIST_MODEL not set (will use claude-sonnet-5-5)")
 
         if not settings.provider.vertex_region_claude_4_5_sonnet:
             warnings.append("VERTEX_REGION_CLAUDE_4_5_SONNET not set (may cause region issues)")
