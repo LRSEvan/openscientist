@@ -584,6 +584,16 @@ class ContainerSettings(BaseSettings):
         alias="OPENSCIENTIST_HOST_PROJECT_DIR",
         description="Host path for project directory. Required when using agent containers.",
     )
+    llm_proxy_port: int = Field(
+        default=8081,
+        alias="OPENSCIENTIST_LLM_PROXY_PORT",
+        description="Port of the web's LLM key-replacement proxy, which agent containers call.",
+    )
+    exec_broker_port: int = Field(
+        default=8082,
+        alias="OPENSCIENTIST_EXEC_BROKER_PORT",
+        description="Port of the web's execution broker, which agent containers call.",
+    )
 
 
 class PhenixSettings(BaseSettings):

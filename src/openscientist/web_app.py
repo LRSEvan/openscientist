@@ -28,6 +28,7 @@ from openscientist.database.login_guard import (
     leaked_database_secrets,
 )
 from openscientist.job_manager import JobManager
+from openscientist.listener import ListenerBindError
 from openscientist.security import register_scanner_block_middleware
 from openscientist.settings import get_settings
 from openscientist.version import get_version_string
@@ -437,11 +438,14 @@ async def _start_background_tasks(engine: AsyncEngine) -> None:
     except Exception as e:
         logger.warning("Failed to start skill sync scheduler: %s", e)
 
-    # Start the LLM key-replacement proxy
+    # Start the LLM key-replacement proxy. Agent jobs need it and the execution
+    # broker, so a port that cannot be bound stops the web from starting.
     try:
         from openscientist.llm_proxy import start_llm_proxy
 
         await start_llm_proxy()
+    except ListenerBindError:
+        raise
     except Exception as e:
         logger.warning("Failed to start LLM proxy: %s", e)
 
@@ -451,6 +455,8 @@ async def _start_background_tasks(engine: AsyncEngine) -> None:
 
         await start_exec_broker()
         logger.info("Execution broker started")
+    except ListenerBindError:
+        raise
     except Exception as e:
         logger.warning("Failed to start execution broker: %s", e)
 
@@ -493,6 +499,8 @@ def _create_lifespan() -> Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
             engine = get_engine()
             await _start_background_tasks(engine)
+        except ListenerBindError:
+            raise
         except Exception as e:
             logger.error("Failed to initialize database: %s", e)
             logger.warning("Application will continue but database features may not work")

@@ -9,7 +9,8 @@ from typing import Any
 
 import httpx
 
-EXEC_BROKER_PORT = 8082
+from openscientist.settings import get_settings
+
 _WEB_HOST_ENV = "OPENSCIENTIST_WEB_HOST"
 _DEFAULT_WEB_HOST = "openscientist"
 
@@ -28,7 +29,7 @@ class BrokerError(RuntimeError):
 def container_broker_base_url() -> str:
     """Broker base URL as reached from a sibling job container on the compose network."""
     host = os.environ.get(_WEB_HOST_ENV, _DEFAULT_WEB_HOST)
-    return f"http://{host}:{EXEC_BROKER_PORT}"
+    return f"http://{host}:{get_settings().container.exec_broker_port}"
 
 
 def execute_code_via_broker(
