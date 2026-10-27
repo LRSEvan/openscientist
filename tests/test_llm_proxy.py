@@ -424,25 +424,6 @@ class TestCodexConfigRedirect:
         toml = provider.codex_config_overrides()
         assert 'base_url = "https://myres.openai.azure.com/openai/v1"' in toml
 
-    def test_ollama_config_points_at_proxy(self, active_provider):
-        provider = active_provider(
-            OPENSCIENTIST_PROVIDER="ollama",
-            OLLAMA_BASE_URL="http://ollama:11434/v1",
-            OPENSCIENTIST_LLM_PROXY_URL="http://openscientist:8081",
-        )
-        toml = provider.codex_config_overrides()
-        assert 'base_url = "http://openscientist:8081"' in toml
-        assert "requires_openai_auth = true" in toml
-        assert 'env_key = "OPENAI_API_KEY"' in toml
-
-    def test_ollama_config_keyless_without_proxy(self, active_provider):
-        provider = active_provider(
-            OPENSCIENTIST_PROVIDER="ollama", OLLAMA_BASE_URL="http://ollama:11434/v1"
-        )
-        toml = provider.codex_config_overrides()
-        assert 'base_url = "http://ollama:11434/v1"' in toml
-        assert "requires_openai_auth = false" in toml
-
 
 class TestProxyBaseUrl:
     def test_default_and_override(self, monkeypatch):

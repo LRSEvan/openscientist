@@ -101,9 +101,8 @@ class ProviderSettings(BaseSettings):
         default=10, alias="AZURE_OPENAI_STREAM_MAX_RETRIES"
     )
 
-    # Ollama (Codex agent backend, open-weight models served locally through
-    # Ollama's OpenAI-compatible Responses endpoint). Local and keyless, so
-    # codex is told the provider needs no OpenAI auth.
+    # Ollama (omp-driven, open-weight models served locally through Ollama's
+    # OpenAI-compatible endpoint). Local and keyless.
     ollama_base_url: str = Field(default="http://localhost:11434/v1", alias="OLLAMA_BASE_URL")
 
     # vLLM (omp-driven, open-weight models served by a self-hosted vLLM server
