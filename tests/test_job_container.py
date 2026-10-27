@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from docker import errors as docker_errors
+from openscientist.job_chat import CHAT_TURN_ENV
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL, AgentLogin
 from openscientist.job_container.runner import (
     AGENT_APP_DIR,
@@ -161,7 +162,7 @@ class TestContainerDatabaseLogin:
         mock_client.containers.run.return_value = container
         a, b, c, d = self._launch_patches()
         with a, b, c, d, pytest.raises(RuntimeError, match="exited with code 1"):
-            self._runner(mock_client).run_chat_turn("job-123", Path("/app/jobs/job-123"))
+            self._runner(mock_client).run_chat_turn("job-123", Path("/app/jobs/job-123"), "t1")
         agent_login.opened.assert_called_once_with("job-123", lifetime_seconds=300)
         agent_login.closed.assert_called_once_with(_LOGIN.role)
 
@@ -967,7 +968,7 @@ class TestChatTurnLaunch:
             ),
             patch.object(Path, "exists", return_value=True),
         ):
-            JobContainerRunner().run_chat_turn("job-123", Path("/app/jobs/job-123"))
+            JobContainerRunner().run_chat_turn("job-123", Path("/app/jobs/job-123"), "t1")
         return mock_client, mock_container
 
     def test_chat_turn_launches_hardened_container(self) -> None:
@@ -980,6 +981,7 @@ class TestChatTurnLaunch:
         # The chat container carries the per-job derived secret, never the master.
         assert env["OPENSCIENTIST_SECRET_KEY"] != "master-key"
         assert env["OPENSCIENTIST_RUN_MODE"] == "chat"
+        assert env[CHAT_TURN_ENV] == "t1"
         mock_container.wait.assert_called_once()
         mock_container.remove.assert_called_once_with(force=True)
 

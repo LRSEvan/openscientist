@@ -11,7 +11,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,10 +21,19 @@ from openscientist.knowledge_state import KnowledgeState
 
 logger = logging.getLogger(__name__)
 
-# The web side and the chat-turn container exchange one turn through these files
-# in the mounted job_dir, so the container needs no database access of its own.
-_CHAT_REQUEST_FILE = ".chat_request.json"
-_CHAT_RESPONSE_FILE = ".chat_response.json"
+# The web side and the chat-turn container exchange one turn through a request
+# and a response file in the mounted job_dir, so the container needs no database
+# access of its own. Each turn names its files after a fresh id, which the
+# container receives in this variable, because turns on one job can overlap.
+CHAT_TURN_ENV = "OPENSCIENTIST_CHAT_TURN"
+
+
+def _chat_turn_files(job_dir: Path, chat_turn: str) -> tuple[Path, Path]:
+    """The request and response files of one chat turn."""
+    return (
+        job_dir / f".chat_request_{chat_turn}.json",
+        job_dir / f".chat_response_{chat_turn}.json",
+    )
 
 
 async def _load_research_question_from_db(job_id: str, session: AsyncSession) -> str | None:
@@ -338,15 +347,14 @@ async def _send_message_via_container(
     from openscientist.job_container.runner import JobContainerRunner
 
     request = await _build_chat_request(session, job_id, message)
-    request_path = job_dir / _CHAT_REQUEST_FILE
-    response_path = job_dir / _CHAT_RESPONSE_FILE
-    response_path.unlink(missing_ok=True)
+    chat_turn = uuid4().hex
+    request_path, response_path = _chat_turn_files(job_dir, chat_turn)
     request_path.write_text(json.dumps(request))
 
     logger.info("Running chat turn for job %s in a hardened container", job_id)
     try:
         # run_chat_turn blocks on the container, so run it off the event loop.
-        await asyncio.to_thread(JobContainerRunner().run_chat_turn, str(job_id), job_dir)
+        await asyncio.to_thread(JobContainerRunner().run_chat_turn, str(job_id), job_dir, chat_turn)
         if not response_path.exists():
             raise RuntimeError("Chat container produced no response")
         response = json.loads(response_path.read_text())
@@ -359,18 +367,20 @@ async def _send_message_via_container(
         response_path.unlink(missing_ok=True)
 
 
-async def run_chat_turn_async(job_dir: Path) -> dict[str, str]:
+async def run_chat_turn_async(job_dir: Path, chat_turn: str) -> dict[str, str]:
     """Container entry point for one chat turn.
 
-    Reads the request the web side wrote into job_dir, runs one agent turn with
-    the full toolset (the container holds no secrets to protect), and writes the
-    reply to the response file. Returns a status dict for the entrypoint."""
+    Reads the turn's request the web side wrote into job_dir, runs one agent turn
+    with the full toolset (the container holds no secrets to protect), and writes
+    the reply to the turn's response file. Returns a status dict for the
+    entrypoint."""
     from openscientist.agent.base import AgentConfig
     from openscientist.agent.factory import build_agent
     from openscientist.providers import get_provider
 
     job_dir = Path(job_dir)
-    request = json.loads((job_dir / _CHAT_REQUEST_FILE).read_text())
+    request_path, response_path = _chat_turn_files(job_dir, chat_turn)
+    request = json.loads(request_path.read_text())
     config = AgentConfig(
         job_dir=job_dir,
         system_prompt=request["system_prompt"],
@@ -393,5 +403,5 @@ async def run_chat_turn_async(job_dir: Path) -> dict[str, str]:
     finally:
         await executor.shutdown()
 
-    (job_dir / _CHAT_RESPONSE_FILE).write_text(json.dumps(response))
+    response_path.write_text(json.dumps(response))
     return {"status": "completed" if "output" in response else "failed"}
