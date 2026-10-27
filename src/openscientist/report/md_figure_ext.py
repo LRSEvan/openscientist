@@ -20,6 +20,7 @@ from markdown.blockprocessors import BlockProcessor  # type: ignore[import-untyp
 from markdown.extensions import Extension  # type: ignore[import-untyped]
 from markdown.treeprocessors import Treeprocessor  # type: ignore[import-untyped]
 
+from openscientist.artifact_packager import artifact_file
 from openscientist.report.processor import _parse_params, _resolve_image_src
 
 logger = logging.getLogger(__name__)
@@ -64,9 +65,11 @@ class FigureBlockProcessor(BlockProcessor):
         caption = params.get("caption", "")
         width = params.get("width", "")
 
-        image_path = self.provenance_dir / filename
-        if not image_path.exists():
-            logger.warning("Figure not found: %s", image_path)
+        # The agent writes the report, so a figure resolves only to one of the
+        # job's own artifacts, never to a path it climbs or links its way to.
+        image_path = artifact_file(self.provenance_dir.parent, f"provenance/{filename}")
+        if image_path is None:
+            logger.warning("Figure not found: %s", filename)
             if caption:
                 p = etree.SubElement(parent, "p")
                 p.text = f"[Figure: {caption}]"
@@ -113,12 +116,14 @@ class ImageSrcTreeProcessor(Treeprocessor):
                 if not src or src.startswith(("http://", "https://", "data:", "file://")):
                     continue
 
-                # Try resolving relative to provenance dir
-                image_path = self.provenance_dir / Path(src).name
-                if not image_path.exists():
-                    image_path = self.provenance_dir.parent / src
-                    if not image_path.exists():
-                        continue
+                # Try the provenance dir, then the path relative to the job dir,
+                # and only among the job's own artifacts.
+                job_dir = self.provenance_dir.parent
+                image_path = artifact_file(
+                    job_dir, f"provenance/{Path(src).name}"
+                ) or artifact_file(job_dir, src)
+                if image_path is None:
+                    continue
 
                 resolved = _resolve_image_src(image_path, self.use_base64)
                 alt = child.get("alt", "")

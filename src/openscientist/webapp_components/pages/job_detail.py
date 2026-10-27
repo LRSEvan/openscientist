@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 from nicegui import ui
@@ -277,6 +278,12 @@ def _collect_iteration_plots(
     return plots
 
 
+def _job_file_url(job_dir: Path, path: Path) -> str:
+    """The URL that serves ``path``, a file of the job in ``job_dir``, to users
+    who may see the job."""
+    return f"/web/jobs/{job_dir.name}/files/{quote(path.relative_to(job_dir).as_posix())}"
+
+
 def _render_iteration_plots(iter_provenance_dir: Path, iter_num: int) -> None:
     iteration_plots = _collect_iteration_plots(iter_provenance_dir, iter_num)
     if not iteration_plots:
@@ -296,8 +303,7 @@ def _render_iteration_plots(iter_provenance_dir: Path, iter_num: int) -> None:
                 ui.label(plot_title).classes("text-sm font-bold")
                 if description:
                     ui.label(description).classes("text-xs text-blue-700 italic")
-                plot_url = f"/{plot_file}"
-                ui.image(plot_url).classes("w-full")
+                ui.image(_job_file_url(iter_provenance_dir.parent, plot_file)).classes("w-full")
                 ui.button(
                     "Download",
                     on_click=lambda p=plot_file: ui.download(p.read_bytes(), filename=p.name),
@@ -1241,48 +1247,9 @@ def _render_report_actions(context: _JobDetailContext, report_path: Path, pdf_pa
 
 def _render_report_html_iframe(job_dir: Path) -> None:
     """Render HTML report in an iframe to avoid CSS leakage."""
-    from nicegui import app
-
-    html_path = job_dir / "final_report.html"
-    if not html_path.exists():
+    if not (job_dir / "final_report.html").exists():
         return
-
-    # Re-render with base64 images for browser display
-    try:
-        from openscientist.report.renderer import render_report_html
-
-        md_path = job_dir / "final_report.md"
-        html_content = render_report_html(md_path, job_dir, embed_images=True)
-    except Exception:
-        logger.warning("Failed to re-render HTML with base64 images, using on-disk version")
-        html_content = html_path.read_text(encoding="utf-8")
-
-    # Open external links in a new tab; leave #fragment links (TOC) alone
-    html_content = html_content.replace(
-        "</body>",
-        """<script>
-document.addEventListener('click', function(e) {
-  var a = e.target.closest('a');
-  if (!a) return;
-  var href = a.getAttribute('href') || '';
-  if (href.startsWith('#')) return;
-  e.preventDefault();
-  window.open(href, '_blank', 'noopener,noreferrer');
-});
-</script></body>""",
-        1,
-    )
-
-    # Serve as a static route and embed in iframe
-    route_path = f"/report-html/{job_dir.name}"
-
-    @app.get(route_path)
-    async def _serve_report_html():  # type: ignore[no-untyped-def]
-        from starlette.responses import HTMLResponse
-
-        return HTMLResponse(html_content)
-
-    ui.element("iframe").props(f'src="{route_path}" frameborder="0"').style(
+    ui.element("iframe").props(f'src="/web/jobs/{job_dir.name}/report.html" frameborder="0"').style(
         "width: 100%; height: 80vh; border: 1px solid #ddd; border-radius: 8px;"
     )
 
