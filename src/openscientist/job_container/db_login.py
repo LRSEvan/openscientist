@@ -16,6 +16,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import text
@@ -23,6 +24,7 @@ from sqlalchemy.engine import make_url
 
 from openscientist.async_tasks import run_sync
 from openscientist.database.session import AsyncSessionLocal
+from openscientist.job_container.run_home import remove_legacy_job_homes, remove_stale_run_homes
 from openscientist.job_container.secrets import revoke_run_credentials
 from openscientist.settings import get_settings
 
@@ -155,26 +157,39 @@ async def reap_agent_logins(live_roles: set[str] | None) -> list[str]:
     return dropped
 
 
-async def reap_leftover_agent_logins() -> list[str]:
-    """One reaper run, with the live set taken from Docker."""
+async def reap_leftover_agent_logins(jobs_dir: Path) -> list[str]:
+    """One reaper run, with the live set taken from Docker. It also removes the
+    run homes no container needs and the harness homes past runs left inside
+    job directories."""
     # Imported here because the runner imports this module.
     from openscientist.job_container.runner import JobContainerRunner
 
-    def live_roles() -> set[str] | None:
+    def live() -> tuple[set[str] | None, set[str] | None]:
         try:
-            return JobContainerRunner().live_login_roles()
+            runner = JobContainerRunner()
+            return runner.live_login_roles(), runner.live_job_ids()
         except Exception as error:
             logger.warning("Docker unavailable to the login reaper: %s", error)
-            return None
+            return None, None
 
-    return await reap_agent_logins(await asyncio.to_thread(live_roles))
+    live_roles, live_jobs = await asyncio.to_thread(live)
+    dropped = await reap_agent_logins(live_roles)
+
+    def sweep() -> None:
+        remove_stale_run_homes(jobs_dir, live_roles, older_than=_LAUNCH_GRACE)
+        remove_legacy_job_homes(jobs_dir, live_jobs)
+
+    await asyncio.to_thread(sweep)
+    return dropped
 
 
-async def run_agent_login_reaper(interval_seconds: int = REAP_INTERVAL_SECONDS) -> None:
+async def run_agent_login_reaper(
+    jobs_dir: Path, interval_seconds: int = REAP_INTERVAL_SECONDS
+) -> None:
     """Reap at once, then every ``interval_seconds``, for the web's lifetime."""
     while True:
         try:
-            await reap_leftover_agent_logins()
+            await reap_leftover_agent_logins(jobs_dir)
         except Exception as error:
             logger.error("Agent login reaper run failed: %s", error)
         await asyncio.sleep(interval_seconds)

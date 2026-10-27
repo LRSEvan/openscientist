@@ -381,8 +381,13 @@ class AbstractAgent[P: Provider](abc.ABC):
         """Per-run model override for in-page chat. Default: no override."""
         return None
 
+    #: The directory inside the job directory where the harness keeps its home,
+    #: or None. Each container run mounts a home of its own there.
+    RUN_HOME: ClassVar[str | None] = None
+
     @classmethod
-    def provision_host_prelaunch(cls, settings: Settings, job_dir: Path) -> None:
-        """Host-side, pre-container setup, run in the web/orchestrator process
-        before the container launches (hence a classmethod). Default no-op."""
+    def provision_run_home(cls, settings: Settings, home: Path) -> None:
+        """Put what the harness needs at start, such as the operator's login,
+        into ``home``, the home of one container run, in the web process before
+        the container launches (hence a classmethod). Default no-op."""
         return None

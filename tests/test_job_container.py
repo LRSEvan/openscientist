@@ -13,6 +13,7 @@ from docker import errors as docker_errors
 from openscientist.exec_broker_client import EXEC_TOKEN_ENV
 from openscientist.job_chat import CHAT_TURN_ENV
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL, AgentLogin
+from openscientist.job_container.run_home import create_run_home
 from openscientist.job_container.runner import (
     AGENT_APP_DIR,
     AGENT_GCP_CREDENTIALS_PATH,
@@ -121,7 +122,8 @@ class TestContainerDatabaseLogin:
                 return_value=Path("/app/jobs/job-123"),
             ),
             patch(
-                "openscientist.agent.factory.agent_class_for_provider_id", return_value=MagicMock()
+                "openscientist.agent.factory.agent_class_for_provider_id",
+                return_value=MagicMock(RUN_HOME=None),
             ),
         )
 
@@ -712,10 +714,10 @@ class TestGcpCredentialsMount:
 
 
 class TestCodexAuthProvisioning:
-    """`CodexAgent.provision_host_prelaunch` copies the codex CLI auth into the
-    per-job CODEX_HOME (agent-readable), instead of mounting the host file,
+    """`CodexAgent.provision_run_home` copies the codex CLI auth into the run's
+    home, its CODEX_HOME (agent-readable), instead of mounting the host file,
     which the non-root agent could not read across the uid/permission
-    boundary. It is the backend's host-side, pre-launch hook."""
+    boundary."""
 
     def _settings(self, codex_auth_host_path: str | None) -> MagicMock:
         settings = MagicMock()
@@ -727,31 +729,28 @@ class TestCodexAuthProvisioning:
 
         src = tmp_path / "host-auth.json"
         src.write_text('{"tokens": {}}')
-        job_dir = tmp_path / "job"
-        job_dir.mkdir()
+        home = create_run_home(tmp_path / "jobs", "agent_" + "1" * 32)
 
-        CodexAgent.provision_host_prelaunch(self._settings(str(src)), job_dir)
+        CodexAgent.provision_run_home(self._settings(str(src)), home)
 
-        dest = job_dir / ".codex" / "auth.json"
+        dest = home / "auth.json"
         assert dest.read_text() == '{"tokens": {}}'
         assert (dest.stat().st_mode & 0o777) == 0o644  # agent (uid 1001) can read
-        assert (dest.parent.stat().st_mode & 0o777) == 0o777  # agent can write config.toml
+        assert (home.stat().st_mode & 0o777) == 0o777  # agent can write config.toml
 
     def test_noop_when_unset(self, tmp_path: Path) -> None:
         from openscientist.agent.codex_agent import CodexAgent
 
-        job_dir = tmp_path / "job"
-        job_dir.mkdir()
-        CodexAgent.provision_host_prelaunch(self._settings(None), job_dir)
-        assert not (job_dir / ".codex").exists()
+        home = create_run_home(tmp_path / "jobs", "agent_" + "1" * 32)
+        CodexAgent.provision_run_home(self._settings(None), home)
+        assert list(home.iterdir()) == []
 
     def test_noop_when_source_missing(self, tmp_path: Path) -> None:
         from openscientist.agent.codex_agent import CodexAgent
 
-        job_dir = tmp_path / "job"
-        job_dir.mkdir()
-        CodexAgent.provision_host_prelaunch(self._settings(str(tmp_path / "nope.json")), job_dir)
-        assert not (job_dir / ".codex" / "auth.json").exists()
+        home = create_run_home(tmp_path / "jobs", "agent_" + "1" * 32)
+        CodexAgent.provision_run_home(self._settings(str(tmp_path / "nope.json")), home)
+        assert list(home.iterdir()) == []
 
 
 class TestJobSecretInjection:
@@ -879,7 +878,7 @@ class TestAirgapFirewallLaunch:
             ),
             patch(
                 "openscientist.agent.factory.agent_class_for_provider_id",
-                return_value=MagicMock(),
+                return_value=MagicMock(RUN_HOME=None),
             ),
             patch.object(Path, "exists", return_value=True),
         ):
@@ -975,7 +974,7 @@ class TestChatTurnLaunch:
             ),
             patch(
                 "openscientist.agent.factory.agent_class_for_provider_id",
-                return_value=MagicMock(),
+                return_value=MagicMock(RUN_HOME=None),
             ),
             patch.object(Path, "exists", return_value=True),
         ):

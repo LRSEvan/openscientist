@@ -710,13 +710,14 @@ class TestAuthProvisioning:
         monkeypatch.setenv("OMP_AUTH_HOST_PATH", str(src))
         get_settings.cache_clear()
         job_dir = tmp_path / "job"
-        job_dir.mkdir()
+        # Inside the container the run's home is mounted at the job's .omp-home.
+        home = job_dir / ".omp-home"
+        home.mkdir(parents=True)
         try:
-            OmpAgent.provision_host_prelaunch(get_settings(), job_dir)
+            OmpAgent.provision_run_home(get_settings(), home)
         finally:
             get_settings.cache_clear()
 
-        home = job_dir / ".omp-home"
         assert (home / "agent.db").read_text() == "db"
         assert (home / "config.yml").read_text() == "cfg"
 
