@@ -151,43 +151,6 @@ markers = [
     "network: marks tests that call a live third-party API (deselected in CI, which shares egress IPs and gets rate limited)",
 ]
 
-[tool.coverage.run]
-source = ["src/openscientist"]
-omit = [
-    "*/tests/*",
-    "*/__pycache__/*",
-    "*/.venv/*",
-    "*/site-packages/*",
-]
-relative_files = true
-
-[tool.coverage.report]
-precision = 2
-show_missing = true
-skip_covered = false
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if __name__ == .__main__.:",
-    "if TYPE_CHECKING:",
-    "@abstractmethod",
-    "@overload",
-    "except ImportError:",
-]
-# Minimum coverage threshold
-fail_under = 60
-
-[tool.coverage.html]
-directory = "htmlcov"
-
-[tool.coverage.xml]
-output = "coverage.xml"
-
-[tool.coverage.paths]
-source = ["src/openscientist"]
-
 [dependency-groups]
 dev = [
     "pytest>=9.0.0",
