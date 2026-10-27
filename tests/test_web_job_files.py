@@ -204,3 +204,93 @@ async def test_a_signed_in_user_is_resolved_through_the_webs_own_login(
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             response = await c.get(url)
     assert response.status_code == status
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_session_user_is_signed_out(shared_job: _SharedJob, db_session) -> None:
+    class _Manager:
+        jobs_dir = shared_job.job_dir.parent
+
+    async def session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    app = FastAPI()
+    app.dependency_overrides[get_session] = session
+    app.dependency_overrides[get_current_user_id] = lambda: "not-a-user-id"
+    app.include_router(router)
+    url = f"/web/jobs/{shared_job.job_id}/files/provenance/plot.png"
+    with patch("openscientist.web_app.get_job_manager", return_value=_Manager()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            response = await c.get(url)
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_an_artifact_over_the_size_limit_is_not_served(
+    shared_job: _SharedJob, request_as
+) -> None:
+    url = f"/web/jobs/{shared_job.job_id}/files/provenance/plot.png"
+    with patch("openscientist.artifact_packager.MAX_ARTIFACT_FILE_SIZE_BYTES", len(_PLOT) - 1):
+        response = await request_as(shared_job.owner, url)
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_the_report_falls_back_to_its_saved_html(shared_job: _SharedJob, request_as) -> None:
+    """A report whose figures cannot be re-rendered still shows, as last saved."""
+    with patch(
+        "openscientist.report.renderer.render_report_html", side_effect=ValueError("bad figure")
+    ):
+        response = await request_as(shared_job.owner, f"/web/jobs/{shared_job.job_id}/report.html")
+    assert response.status_code == 200
+    assert "Current report" in response.text
+    assert "window.open" in response.text
+
+
+@pytest.mark.asyncio
+async def test_the_plot_the_page_shows_reaches_its_owner(
+    shared_job: _SharedJob, request_as
+) -> None:
+    from openscientist.webapp_components.pages import job_detail
+
+    provenance = shared_job.job_dir / "provenance"
+    (provenance / "dose response #1.png").write_bytes(_PLOT)
+    (provenance / "dose response #1.json").write_text('{"iteration": 1}')
+    with patch.object(job_detail, "ui") as ui:
+        job_detail._render_iteration_plots(provenance, 1)
+    [url] = [c.args[0] for c in ui.image.call_args_list]
+
+    response = await request_as(shared_job.owner, url)
+    assert response.status_code == 200
+    assert response.content == _PLOT
+
+
+@pytest.mark.asyncio
+async def test_the_report_the_page_frames_reaches_its_owner(
+    shared_job: _SharedJob, request_as
+) -> None:
+    from openscientist.webapp_components.pages import job_detail
+
+    with patch.object(job_detail, "ui") as ui:
+        job_detail._render_report_html_iframe(shared_job.job_dir)
+    [props] = [c.args[0] for c in ui.element.return_value.props.call_args_list]
+    url = props.split('src="', 1)[1].split('"', 1)[0]
+
+    response = await request_as(shared_job.owner, url)
+    assert response.status_code == 200
+    assert "Water boils." in response.text
+
+
+@pytest.mark.asyncio
+async def test_a_job_without_a_report_frames_nothing_and_serves_nothing(
+    shared_job: _SharedJob, request_as
+) -> None:
+    from openscientist.webapp_components.pages import job_detail
+
+    (shared_job.job_dir / "final_report.html").unlink()
+    with patch.object(job_detail, "ui") as ui:
+        job_detail._render_report_html_iframe(shared_job.job_dir)
+    ui.element.assert_not_called()
+
+    response = await request_as(shared_job.owner, f"/web/jobs/{shared_job.job_id}/report.html")
+    assert response.status_code == 404
