@@ -72,7 +72,11 @@ async def main() -> int:
         if run_mode == "chat":
             from openscientist.job_chat import CHAT_TURN_ENV, run_chat_turn_async
 
-            result = await run_chat_turn_async(job_dir, os.environ[CHAT_TURN_ENV])  # noqa: env-ok
+            result = await run_chat_turn_async(
+                job_dir,
+                os.environ[CHAT_TURN_ENV],  # noqa: env-ok
+                job_id,
+            )
         elif run_mode == "report_only":
             result = await regenerate_report_async(job_dir)
         else:

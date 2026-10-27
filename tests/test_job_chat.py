@@ -661,7 +661,7 @@ async def test_run_chat_turn_async_writes_reply(temp_jobs_dir: Path):
         patch("openscientist.providers.get_provider", return_value=_ChatProvider()),
         patch("openscientist.agent.factory.build_agent", _build_agent_recorder(captured, result)),
     ):
-        status = await run_chat_turn_async(job_dir, "t1")
+        status = await run_chat_turn_async(job_dir, "t1", "00000000-0000-0000-0000-000000000001")
 
     assert status["status"] == "completed"
     response = json.loads(response_path.read_text())
@@ -688,7 +688,7 @@ async def test_run_chat_turn_async_records_error(temp_jobs_dir: Path):
         patch("openscientist.providers.get_provider", return_value=_ChatProvider()),
         patch("openscientist.agent.factory.build_agent", _build_agent_recorder(captured, result)),
     ):
-        status = await run_chat_turn_async(job_dir, "t1")
+        status = await run_chat_turn_async(job_dir, "t1", "00000000-0000-0000-0000-000000000001")
 
     assert status["status"] == "failed"
     response = json.loads(response_path.read_text())
@@ -706,7 +706,7 @@ async def test_overlapping_chat_turns_each_get_their_own_reply(temp_jobs_dir: Pa
 
     def _container(job_id, job_dir, chat_turn, *, timeout=300):
         both_requested.wait()
-        asyncio.run(run_chat_turn_async(Path(job_dir), chat_turn))
+        asyncio.run(run_chat_turn_async(Path(job_dir), chat_turn, job_id))
         both_replied.wait()
 
     from openscientist.agent import factory

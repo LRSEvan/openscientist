@@ -5,7 +5,7 @@ import hmac
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 
@@ -13,6 +13,7 @@ from docker import errors as docker_errors
 from openscientist.job_chat import CHAT_TURN_ENV
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL, AgentLogin
 from openscientist.job_container.runner import (
+    _STOP_GRACE_SECONDS,
     AGENT_APP_DIR,
     AGENT_GCP_CREDENTIALS_PATH,
     JobContainerRunner,
@@ -983,7 +984,9 @@ class TestChatTurnLaunch:
         assert env["OPENSCIENTIST_RUN_MODE"] == "chat"
         assert env[CHAT_TURN_ENV] == "t1"
         mock_container.wait.assert_called_once()
-        mock_container.remove.assert_called_once_with(force=True)
+        # Stopped with the grace a turn needs to write its cost, then removed.
+        calls = [c for c in mock_container.method_calls if c[0] in ("stop", "remove")]
+        assert calls == [call.stop(timeout=_STOP_GRACE_SECONDS), call.remove(force=True)]
 
     def test_chat_turn_raises_on_nonzero_exit(self) -> None:
         with pytest.raises(RuntimeError, match="exited with code 1"):

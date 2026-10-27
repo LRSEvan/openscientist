@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -15,8 +17,15 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from docker import errors as docker_errors
-from openscientist.agent.base import IterationResult, TokenUsage, TurnOutcome
+from openscientist.agent.base import (
+    AbstractAgent,
+    AgentConfig,
+    IterationResult,
+    TokenUsage,
+    TurnOutcome,
+)
 from openscientist.database.models import CostRecord, Job
+from openscientist.job_chat import _chat_turn_files, run_chat_turn_async
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL
 from openscientist.job_container.runner import _STOP_GRACE_SECONDS, JobContainerRunner
 from openscientist.knowledge_state import KnowledgeState
@@ -26,7 +35,9 @@ from openscientist.orchestrator.discovery import (
     regenerate_report_async,
     run_discovery_async,
 )
+from openscientist.providers.base import Provider
 from tests.db_outage import Forwarder
+from tests.helpers import StubClaudeProvider
 
 
 @pytest_asyncio.fixture
@@ -127,6 +138,7 @@ def _executor(usage: TokenUsage) -> MagicMock:
     executor.warm_model_profile = AsyncMock()
     executor.provider.display_name = "anthropic"
     executor.provider.effective_model_name.return_value = "claude-sonnet-4-5"
+    executor.config.model_override = None
     return executor
 
 
@@ -296,3 +308,73 @@ def test_cleanup_takes_the_container_down_even_when_stop_fails(tmp_path: Path) -
     container.remove.assert_called_once_with(force=True)
     closed.assert_called_once_with("agent_test")
     assert (tmp_path / "agent-container.log").read_text() == "cost written"
+
+
+def _chat_request(job_dir: Path, *, model_override: str | None) -> None:
+    _chat_turn_files(job_dir, "t1")[0].write_text(
+        json.dumps({"system_prompt": "SP", "model_override": model_override, "prompt": "hi"})
+    )
+
+
+def _agent_spending(usage: TokenUsage, then: BaseException | None = None):
+    """A `factory.build_agent` whose turn spends ``usage``, then raises ``then``."""
+    from openscientist.agent import factory
+
+    real_build_agent = factory.build_agent
+
+    def build(config: AgentConfig, provider: Provider) -> AbstractAgent[Provider]:
+        agent = real_build_agent(config, provider)
+
+        async def run_iteration(prompt: str, **kwargs: object) -> IterationResult:
+            agent._token_usage += usage
+            if then is not None:
+                raise then
+            return IterationResult(
+                outcome=TurnOutcome.COMPLETED, output="reply", tool_calls=0, transcript=[]
+            )
+
+        agent.run_iteration = run_iteration  # type: ignore[method-assign]
+        return agent
+
+    return build
+
+
+async def _models(test_engine: AsyncEngine, job: UUID) -> list[str]:
+    async with test_engine.connect() as conn:
+        rows = await conn.execute(select(CostRecord.model).where(CostRecord.job_id == job))
+    return [row[0] for row in rows]
+
+
+async def test_a_chat_turn_records_its_cost_at_its_own_model(
+    test_engine: AsyncEngine, job: UUID, tmp_path: Path
+) -> None:
+    _chat_request(tmp_path, model_override="claude-haiku-4-5")
+    spent = TokenUsage(input_tokens=120, output_tokens=12)
+    with (
+        patch("openscientist.providers.get_provider", return_value=StubClaudeProvider()),
+        patch("openscientist.agent.factory.build_agent", _agent_spending(spent)),
+    ):
+        status = await run_chat_turn_async(tmp_path, "t1", str(job))
+
+    assert status["status"] == "completed"
+    assert await _records(test_engine, job) == [("chat", None, 120, 12)]
+    assert await _models(test_engine, job) == ["claude-haiku-4-5"]
+
+
+async def test_a_stopped_chat_turn_still_records_what_it_spent(
+    test_engine: AsyncEngine, job: UUID, tmp_path: Path
+) -> None:
+    """docker stop cancels the turn, and the cost it already ran up is kept."""
+    _chat_request(tmp_path, model_override=None)
+    spent = TokenUsage(input_tokens=70, output_tokens=7)
+    with (
+        patch("openscientist.providers.get_provider", return_value=StubClaudeProvider()),
+        patch(
+            "openscientist.agent.factory.build_agent",
+            _agent_spending(spent, then=asyncio.CancelledError()),
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await run_chat_turn_async(tmp_path, "t1", str(job))
+
+    assert await _records(test_engine, job) == [("chat", None, 70, 7)]

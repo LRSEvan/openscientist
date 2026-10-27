@@ -771,8 +771,11 @@ class _CostLedger:
     def for_executor(cls, executor: AbstractAgent[Provider], job_id: str) -> _CostLedger:
         settings = get_settings()
         provider = executor.provider
+        # A chat turn can run on its own model (model_override), which then
+        # sets the price.
         model_name = (
-            settings.provider.model
+            executor.config.model_override
+            or settings.provider.model
             or settings.provider.anthropic_default_sonnet_model
             or provider.effective_model_name()
             or "unknown"
