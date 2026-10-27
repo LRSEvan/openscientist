@@ -109,7 +109,7 @@ def test_main_non_reload_runs_with_created_app(monkeypatch, tmp_path: Path) -> N
     assert kwargs["reload"] is False
 
 
-def test_register_nicegui_static_files_tolerates_duplicates(monkeypatch, tmp_path: Path) -> None:
+def test_register_nicegui_static_files_tolerates_duplicates(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
     def fake_add_static_files(route: str, directory: str) -> None:
@@ -119,10 +119,11 @@ def test_register_nicegui_static_files_tolerates_duplicates(monkeypatch, tmp_pat
 
     monkeypatch.setattr(web_app.app, "add_static_files", fake_add_static_files)
 
-    web_app._register_nicegui_static_files(tmp_path / "jobs")
+    web_app._register_nicegui_static_files()
 
+    # Job files are never static, since only users who may see the job get them.
     routes = [route for route, _ in calls]
-    assert routes == ["/jobs", "/assets"]
+    assert routes == ["/assets"]
 
 
 def test_register_robots_txt_serves_disallow_all() -> None:

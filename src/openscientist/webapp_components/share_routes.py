@@ -87,26 +87,32 @@ def _share_to_response(share: JobShare, target_user: User) -> ShareResponse:
 
 
 async def get_current_user_from_session(
-    user_id: UUID = CURRENT_USER_ID_DEP,
+    user_id: str | None = CURRENT_USER_ID_DEP,
     session: AsyncSession = SESSION_DEP,
 ) -> User:
     """
     Resolve the authenticated user for web-session routes.
 
     Args:
-        user_id: User ID extracted from session middleware.
+        user_id: User ID the sign-in stored in the browser's session storage.
         session: Request-scoped database session.
 
     Returns:
         Active user record for downstream authorization checks.
 
     Raises:
-        HTTPException: If the session references a missing user.
+        HTTPException: If the session is signed out or references a missing user.
     """
-    stmt = select(User).where(User.id == user_id)
-    result = await session.execute(stmt)
-    user = result.scalar_one_or_none()
+    try:
+        user_uuid = UUID(str(user_id)) if user_id is not None else None
+    except ValueError:
+        user_uuid = None
+    if user_uuid is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not signed in")
 
+    # The web login reads users under RLS, which shows a user only their own row.
+    await set_current_user(session, user_uuid)
+    user = (await session.execute(select(User).where(User.id == user_uuid))).scalar_one_or_none()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
