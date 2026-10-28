@@ -4,7 +4,6 @@ from unittest.mock import MagicMock, patch
 
 from openscientist.literature import (
     _parse_pubmed_xml,
-    format_literature_for_prompt,
     search_pubmed,
 )
 
@@ -118,29 +117,3 @@ class TestSearchPubmed:
 
         papers = search_pubmed("nonexistent query xyz")
         assert papers == []
-
-
-# ─── format_literature_for_prompt ─────────────────────────────────────
-
-
-class TestFormatLiteratureForPrompt:
-    """Tests for literature formatting."""
-
-    def test_no_papers(self):
-        result = format_literature_for_prompt([])
-        assert "No literature" in result
-
-    def test_formats_papers(self):
-        papers = [
-            {"pmid": "111", "title": "Paper A about things", "year": "2024"},
-            {"pmid": "222", "title": "Paper B about stuff", "year": "2023"},
-        ]
-        result = format_literature_for_prompt(papers)
-        assert "PMID 111" in result
-        assert "Paper A" in result
-        assert "2024" in result
-
-    def test_respects_max_papers(self):
-        papers = [{"pmid": str(i), "title": f"Paper {i}", "year": "2024"} for i in range(10)]
-        result = format_literature_for_prompt(papers, max_papers=3)
-        assert result.count("PMID") == 3

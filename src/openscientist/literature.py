@@ -154,26 +154,3 @@ def _parse_pubmed_xml(xml_text: str, pmids: list[str]) -> list[dict[str, Any]]:
             }
             for pmid in pmids
         ]
-
-
-def format_literature_for_prompt(papers: list[dict[str, Any]], max_papers: int = 5) -> str:
-    """
-    Format literature references for inclusion in prompts.
-
-    Args:
-        papers: List of papers
-        max_papers: Maximum number to include
-
-    Returns:
-        Formatted string
-    """
-    if not papers:
-        return "No literature references yet."
-
-    lines = ["## Relevant Literature\n"]
-    lines.extend(
-        f"- **PMID {paper['pmid']}** ({paper.get('year', 'N/A')}): {paper['title'][:100]}..."
-        for paper in papers[:max_papers]
-    )
-
-    return "\n".join(lines)
