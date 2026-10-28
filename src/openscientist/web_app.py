@@ -24,6 +24,7 @@ from nicegui import app, ui
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from openscientist.container_manager import get_container_manager
 from openscientist.database.login_guard import (
     DATABASE_SECRETS,
     database_login_problem,
@@ -31,6 +32,7 @@ from openscientist.database.login_guard import (
 )
 from openscientist.database.models import Job
 from openscientist.database.rls import APP_ROLE, tables_without_enforced_rls
+from openscientist.exceptions import MissingImageError
 from openscientist.job_manager import JobManager
 from openscientist.listener import ListenerBindError
 from openscientist.security import register_scanner_block_middleware
@@ -439,10 +441,44 @@ async def _ensure_default_skill_sources() -> None:
         logger.warning("Failed to seed default skill sources: %s", e)
 
 
+def _missing_container_images() -> list[str] | None:
+    """The agent and executor images Docker does not have, or None when Docker
+    cannot be asked."""
+    manager = get_container_manager()
+    if not manager.is_available():
+        return None
+    container = get_settings().container
+    return [
+        image
+        for image in (container.agent_image, container.executor_image)
+        if not manager.check_image_available(image)
+    ]
+
+
+async def _check_container_images() -> None:
+    """Name at startup each image a job would need and Docker lacks. Docker's
+    client blocks, so the check runs off the event loop."""
+    try:
+        missing = await asyncio.to_thread(_missing_container_images)
+    except Exception as e:
+        logger.warning("Could not check the container images: %s", e)
+        return
+    if missing is None:
+        logger.warning("Docker is not reachable, so the container images were not checked")
+    elif missing:
+        logger.error(
+            "%s Jobs and chat turns fail until the images are built.",
+            " ".join(str(MissingImageError(image)) for image in missing),
+        )
+    else:
+        logger.info("Container images present")
+
+
 async def _start_background_tasks(engine: AsyncEngine) -> None:
     """Start background tasks after database verification."""
     await _verify_db_connection_and_rls(engine)
     await _ensure_default_skill_sources()
+    await _check_container_images()
 
     # Start skill sync scheduler
     try:

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, PropertyMock, call, patch
 import pytest
 
 from docker import errors as docker_errors
+from openscientist.exceptions import MissingImageError
 from openscientist.exec_broker_client import EXEC_TOKEN_ENV
 from openscientist.job_chat import CHAT_TURN_ENV
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL, AgentLogin
@@ -28,6 +29,7 @@ from openscientist.job_container.secrets import (
 )
 from openscientist.providers.base import AirgapEgress, AirgapPosture
 from openscientist.settings import Settings
+from tests.helpers import assert_names_a_make_target
 
 
 class _FakeProvider:
@@ -165,6 +167,20 @@ class TestContainerDatabaseLogin:
         a, b, c, d = self._launch_patches()
         with a, b, c, d, pytest.raises(docker_errors.APIError):
             self._runner(mock_client).launch("job-123", Path("/app/jobs/job-123"))
+        agent_login.closed.assert_called_once_with(_LOGIN.role)
+
+    def test_a_missing_agent_image_fails_with_how_to_build_it(self, agent_login) -> None:
+        """The job's error names the image and a real target that builds it,
+        and the run still gives its login back."""
+        mock_client = MagicMock()
+        mock_client.containers.run.side_effect = docker_errors.ImageNotFound(
+            "No such image: openscientist-agent:latest"
+        )
+        a, b, c, d = self._launch_patches()
+        with a, b, c, d, pytest.raises(MissingImageError) as raised:
+            self._runner(mock_client).launch("job-123", Path("/app/jobs/job-123"))
+        assert "openscientist-agent:latest" in str(raised.value)
+        assert_names_a_make_target(str(raised.value))
         agent_login.closed.assert_called_once_with(_LOGIN.role)
 
     def test_cleanup_gives_back_the_login_of_the_removed_container(self, agent_login) -> None:

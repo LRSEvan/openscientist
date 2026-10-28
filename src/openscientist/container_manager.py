@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from openscientist.exceptions import MissingImageError
 from openscientist.job_container import to_host_path
 from openscientist.settings import get_settings
 
@@ -375,12 +376,7 @@ class ContainerManager:
 
         except docker.errors.ImageNotFound:
             logger.error("Executor image not found: %s", self.image)
-            return _container_error_result(
-                error=(
-                    f"Executor image not found: {self.image}. "
-                    "Run 'make build-executor' to build it."
-                ),
-            )
+            return _container_error_result(error=str(MissingImageError(self.image)))
 
         except docker.errors.APIError as e:
             logger.error("Docker API error: %s", e)
@@ -474,9 +470,12 @@ class ContainerManager:
 
         return removed
 
-    def check_image_available(self) -> bool:
+    def check_image_available(self, image: str | None = None) -> bool:
         """
-        Check if the executor image is available.
+        Check if an image is on the Docker host.
+
+        Args:
+            image: The image to look for, the executor image when omitted
 
         Returns:
             True if image exists, False otherwise
@@ -484,7 +483,7 @@ class ContainerManager:
         import docker.errors
 
         try:
-            self.client.images.get(self.image)
+            self.client.images.get(image or self.image)
             return True
         except docker.errors.ImageNotFound:
             return False

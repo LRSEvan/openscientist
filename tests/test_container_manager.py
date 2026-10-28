@@ -13,6 +13,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.helpers import assert_names_a_make_target
+
 
 class TestContainerManagerUnit:
     """Unit tests with mocked Docker client."""
@@ -133,7 +135,8 @@ class TestContainerManagerUnit:
             )
 
         assert result["success"] is False
-        assert "image not found" in result["error"].lower()
+        assert manager.image in result["error"]
+        assert_names_a_make_target(result["error"])
 
     def test_cleanup_job_containers(self):
         """Test cleanup of containers by job ID."""
@@ -676,7 +679,7 @@ class TestContainerManagerIntegration:
 
         manager = ContainerManager()
         if not manager.check_image_available():
-            pytest.skip("Executor image not built. Run 'make build-executor' first.")
+            pytest.skip("Executor image not built. Run 'make build' first.")
 
     def test_execute_simple_code(self):
         """Test executing simple Python code."""
