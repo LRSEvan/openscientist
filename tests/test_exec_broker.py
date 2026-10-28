@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import socket
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
 import httpx
 import pytest
 from starlette.testclient import TestClient
+from starlette.types import ASGIApp
+from uvicorn.config import Config
 
 from openscientist import exec_broker
 from openscientist.exec_broker import create_exec_broker_app
@@ -21,6 +25,7 @@ from openscientist.exec_broker_client import (
     execute_code_via_broker,
 )
 from openscientist.job_container.secrets import issue_run_credentials, revoke_run_credentials
+from openscientist.settings import get_settings
 
 _HOST_PROJECT = "/host/proj"
 
@@ -182,6 +187,52 @@ class TestExecBrokerServer:
         assert kwargs["data_path"] == "/app/jobs/job-1/data/primary.csv"
         assert kwargs["data_files"][0]["path"] == "/app/jobs/job-1/data/primary.csv"
         assert kwargs["data_files"][0]["name"] == "primary.csv"
+
+
+class TestStartExecBroker:
+    """The always-on broker listener wires the real broker app into its task."""
+
+    async def test_start_wires_broker_app_and_starts_once(self, token_for, monkeypatch) -> None:
+        configs: list[Config] = []
+        served: list[socket.socket] = []
+
+        class _FakeServer:
+            def __init__(self, config: Config) -> None:
+                configs.append(config)
+
+            async def serve(self, sockets: list[socket.socket]) -> None:
+                served.extend(sockets)
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        monkeypatch.setenv("OPENSCIENTIST_EXEC_BROKER_PORT", str(port))
+        get_settings.cache_clear()
+        monkeypatch.setattr(exec_broker, "_NoSignalServer", _FakeServer)
+        monkeypatch.setattr(exec_broker, "_broker_server", None)
+        monkeypatch.setattr(exec_broker, "_broker_task", None)
+
+        try:
+            await exec_broker.start_exec_broker()
+            await exec_broker.start_exec_broker()
+            await asyncio.sleep(0)
+
+            # One listener on the configured broker port, holding the broker app.
+            assert len(configs) == 1
+            assert exec_broker._broker_task is not None
+            assert [sock.getsockname()[1] for sock in served] == [port]
+        finally:
+            for sock in served:
+                sock.close()
+            get_settings.cache_clear()
+
+        # The wired-up app is the real broker: a live token of another job is refused.
+        token = token_for("job-2")
+        app = cast("ASGIApp", configs[0].app)
+        resp = TestClient(app).post(
+            "/execute", json=_body(job_id="job-1"), headers={EXEC_TOKEN_HEADER: token}
+        )
+        assert resp.status_code == 401
 
 
 class TestExecBrokerClient:

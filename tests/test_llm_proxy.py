@@ -1,5 +1,7 @@
 """Tests for the LLM key-replacement proxy (Claude backend)."""
 
+import asyncio
+import socket
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import cast
@@ -12,6 +14,8 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
+from starlette.types import ASGIApp
+from uvicorn.config import Config
 
 from openscientist.job_container.runner import JobContainerRunner
 from openscientist.job_container.secrets import (
@@ -562,6 +566,91 @@ class TestProxyForwarding:
         with TestClient(app) as client:
             resp = client.post("/v1/messages", headers={"x-api-key": placeholder}, content=b"{}")
         assert resp.status_code == 502
+
+
+class TestStartLlmProxy:
+    """start_llm_proxy wires the real proxy app into its listener task."""
+
+    async def test_start_wires_proxy_app_and_starts_once(
+        self, active_provider, placeholder_for, monkeypatch
+    ) -> None:
+        from openscientist import llm_proxy
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        provider = active_provider(
+            OPENSCIENTIST_PROVIDER="anthropic",
+            ANTHROPIC_API_KEY="real-key",
+            OPENSCIENTIST_LLM_PROXY_PORT=str(port),
+        )
+        assert provider.airgap_egress().mode is AirgapEgress.PROXY
+
+        configs: list[Config] = []
+        served: list[socket.socket] = []
+
+        class _FakeServer:
+            def __init__(self, config: Config) -> None:
+                configs.append(config)
+
+            async def serve(self, sockets: list[socket.socket]) -> None:
+                served.extend(sockets)
+
+        recorded: list[dict] = []
+
+        async def endpoint(request: Request) -> StreamingResponse:
+            body = await request.body()
+            recorded.append(
+                {"path": request.url.path, "headers": dict(request.headers), "body": body}
+            )
+
+            async def stream():
+                yield b"upstream-body"
+
+            return StreamingResponse(stream())
+
+        upstream_app = Starlette(routes=[Route("/{path:path}", endpoint, methods=["GET", "POST"])])
+        real_async_client = httpx.AsyncClient
+
+        def make_client(*, timeout: httpx.Timeout | None = None) -> httpx.AsyncClient:
+            # Answer the started app's upstream in-memory, offline.
+            return real_async_client(transport=httpx.ASGITransport(app=upstream_app))
+
+        monkeypatch.setattr(llm_proxy, "_NoSignalServer", _FakeServer)
+        monkeypatch.setattr(llm_proxy, "_proxy_server", None)
+        monkeypatch.setattr(llm_proxy, "_proxy_task", None)
+        monkeypatch.setattr(httpx, "AsyncClient", make_client)
+
+        await llm_proxy.start_llm_proxy()
+        await llm_proxy.start_llm_proxy()
+        await asyncio.sleep(0)
+
+        # One listener on the configured proxy port, holding the proxy app.
+        assert len(configs) == 1
+        assert llm_proxy._proxy_task is not None
+        assert [sock.getsockname()[1] for sock in served] == [port]
+        for sock in served:
+            sock.close()
+        app = cast("ASGIApp", configs[0].app)
+
+        placeholder = placeholder_for("job-1")
+        with TestClient(app) as client:
+            missing = client.post("/v1/messages", content=b"{}")
+            ok = client.post(
+                "/v1/messages",
+                headers={"x-api-key": placeholder, "anthropic-version": "2023-06-01"},
+                content=b'{"m":1}',
+            )
+        # The wired-up app is the real proxy: a credentialless request is refused,
+        # and a live run's credential is substituted with the real key.
+        assert missing.status_code == 401
+        assert ok.status_code == 200
+        assert ok.content == b"upstream-body"
+        forwarded = recorded[0]
+        assert forwarded["path"] == "/v1/messages"
+        assert forwarded["headers"]["x-api-key"] == "real-key"
+        assert forwarded["headers"]["anthropic-version"] == "2023-06-01"
+        assert forwarded["body"] == b'{"m":1}'
 
 
 class TestRunnerInjection:
