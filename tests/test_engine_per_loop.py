@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from openscientist.async_tasks import run_sync, thread_loop
 from openscientist.database.models import User
 from openscientist.database.session import (
-    AsyncSessionLocal,
+    async_session_local,
     get_admin_session,
     thread_safe_admin_session,
     thread_safe_user_session,
@@ -45,7 +45,7 @@ async def _backend_pid(open_session: Opener) -> int:
 
 def _openers(user_id: UUID) -> dict[str, Opener]:
     return {
-        "web login": AsyncSessionLocal,
+        "web login": async_session_local,
         "admin": thread_safe_admin_session,
         "admin context": get_admin_session,
         "user": partial(thread_safe_user_session, user_id),
@@ -61,7 +61,7 @@ async def test_sessions_on_one_loop_reuse_a_connection(user_id: UUID, kind: str)
 async def test_a_reused_connection_carries_no_previous_user_or_role(user_id: UUID) -> None:
     async with thread_safe_user_session(user_id) as session:
         first = (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         row = (
             await session.execute(
                 text(

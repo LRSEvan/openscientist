@@ -8,7 +8,7 @@ any thread with a running loop.
 Session Types:
     - get_session(): Standard session with RLS enforced as openscientist_app
     - get_admin_session(): Admin session that bypasses RLS via elevated role
-    - AsyncSessionLocal(): Low-level session, with no role or user of its own
+    - async_session_local(): Low-level session, with no role or user of its own
 
 get_session() connects as the main database user, and every transaction it runs
 switches to openscientist_app, a non-superuser NOLOGIN role subject to RLS.
@@ -63,10 +63,6 @@ def async_session_local() -> AsyncSession:
         call use_app_role() and set_current_user(), or use get_session() instead.
     """
     return _session(get_engine())
-
-
-# Backward-compatible alias for older imports.
-AsyncSessionLocal = async_session_local
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

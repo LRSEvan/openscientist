@@ -816,7 +816,7 @@ class TestWriteSkillsToClaudeDir:
 
         agent = ClaudeCodeAgent(AgentConfig(job_dir=tmp_path), StubClaudeProvider())
         with (
-            patch("openscientist.database.session.AsyncSessionLocal") as mock_session_cls,
+            patch("openscientist.database.session.async_session_local") as mock_session_cls,
             patch(
                 "openscientist.prompts.get_enabled_skills", new_callable=AsyncMock
             ) as mock_get_skills,

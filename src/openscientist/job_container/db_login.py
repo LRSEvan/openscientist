@@ -26,7 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from openscientist.async_tasks import run_sync
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import async_session_local
 from openscientist.job_container.run_home import remove_legacy_job_homes, remove_stale_run_homes
 from openscientist.job_container.secrets import revoke_run_credentials
 from openscientist.settings import get_settings
@@ -75,7 +75,7 @@ async def create_agent_login(job_id: str, *, lifetime_seconds: int) -> AgentLogi
     role = f"agent_{secrets.token_hex(16)}"
     password = secrets.token_urlsafe(32)
     valid_until = datetime.now(UTC) + timedelta(seconds=lifetime_seconds) + _GRACE
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         # CREATE ROLE takes no bind parameters, so the server quotes the values.
         # The statement is SQL text that errors and the server log repeat, so it
         # carries the password's SCRAM verifier, never the password.
@@ -114,7 +114,7 @@ async def drop_agent_login(role: str) -> None:
     if not _ROLE_PATTERN.fullmatch(role):
         raise ValueError(f"{role!r} is not an agent login")
     revoke_run_credentials(role)
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         await session.execute(
             text("DELETE FROM agent_job_roles WHERE role_name = :role"), {"role": role}
         )
@@ -141,7 +141,7 @@ async def reap_agent_logins(live_roles: set[str] | None) -> list[str]:
     are dropped. Only roles named like an agent login that are members of
     openscientist_agent are considered.
     """
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         rows = (
             await session.execute(
                 text(

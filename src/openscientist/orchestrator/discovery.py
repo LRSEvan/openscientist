@@ -31,7 +31,7 @@ from openscientist.agent.base import (
 from openscientist.agent.factory import agent_class_for_provider_id, get_agent
 from openscientist.database.models import JobDataFile
 from openscientist.database.models.job import Job as JobModel
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import async_session_local
 from openscientist.exceptions import OpenScientistError
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.orchestrator.iteration import (
@@ -173,7 +173,7 @@ async def _sync_version_metadata(job_id: str) -> None:
             version_info = await asyncio.to_thread(get_version_metadata)
             if not version_info:
                 return
-            async with AsyncSessionLocal() as session:
+            async with async_session_local() as session:
                 await session.execute(text(f"SET LOCAL statement_timeout = {_STAMP_TIMEOUT_MS}"))
                 await session.execute(
                     update(JobModel)
@@ -593,7 +593,7 @@ async def _load_runtime_context(job_dir: Path) -> dict[str, Any]:
     """Load runtime job metadata from the database."""
     job_uuid = UUID(job_dir.name)
 
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         job_result = await session.execute(select(JobModel).where(JobModel.id == job_uuid))
         job = job_result.scalar_one_or_none()
         if job is None:
@@ -726,7 +726,7 @@ async def _persist_job_cost_record(
         cache_write_1h_tokens=tokens.cache_write_1h_tokens,
         reasoning_tokens=tokens.reasoning_tokens,
     )
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         record = CostRecord(
             job_id=UUID(job_id),
             iteration=iteration,

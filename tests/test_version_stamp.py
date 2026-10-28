@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import delete, select
 
 from openscientist.database.models import Job
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import async_session_local
 from openscientist.orchestrator.discovery import _sync_version_metadata
 
 _VERSION_INFO = {"agent_harness": "omp", "agent_harness_version": "17.1.5"}
@@ -23,19 +23,19 @@ _VERSION_INFO = {"agent_harness": "omp", "agent_harness_version": "17.1.5"}
 
 async def _create_job(job_id: UUID) -> None:
     """Commit a job row on its own connection, as the orchestrator sees one."""
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         session.add(Job(id=job_id, research_question="Version stamp", status="running"))
         await session.commit()
 
 
 async def _delete_job(job_id: UUID) -> None:
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         await session.execute(delete(Job).where(Job.id == job_id))
         await session.commit()
 
 
 async def _stored_version_info(job_id: UUID) -> dict[str, str] | None:
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         result = await session.execute(select(Job.version_info).where(Job.id == job_id))
         return result.scalar_one_or_none()
 
@@ -67,7 +67,7 @@ async def test_a_failed_stamp_does_not_end_the_run(
             return_value=_VERSION_INFO,
         ),
         patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             side_effect=TimeoutError("statement timeout"),
         ),
         caplog.at_level(logging.WARNING),
@@ -102,7 +102,7 @@ async def test_a_hanging_stamp_gives_up_at_its_deadline(
             return_value=_VERSION_INFO,
         ),
         patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_HangingSession(),
         ),
         patch("openscientist.orchestrator.discovery._STAMP_DEADLINE_SECONDS", 0.2),

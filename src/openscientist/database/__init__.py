@@ -15,10 +15,10 @@ DATABASE_URL.
 from .base import Base, UUIDv7Mixin
 from .engine import get_admin_engine, get_engine
 from .rls import set_current_user
-from .session import AsyncSessionLocal, get_admin_session, get_session, get_session_ctx
+from .session import async_session_local, get_admin_session, get_session, get_session_ctx
 
 __all__ = [
-    "AsyncSessionLocal",
+    "async_session_local",
     "Base",
     "UUIDv7Mixin",
     "get_admin_engine",

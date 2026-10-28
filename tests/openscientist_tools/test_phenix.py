@@ -16,7 +16,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import TextContent
 from sqlalchemy import delete
 
-from openscientist.database import AsyncSessionLocal
+from openscientist.database import async_session_local
 from openscientist.database.models.job import Job
 from openscientist.knowledge_state import KnowledgeState
 from openscientist_tools import phenix as phenix_module
@@ -84,7 +84,7 @@ async def _spawned_for_job(
     *,
     env_overrides: dict[str, str] | None = None,
 ) -> AsyncGenerator[ClientSession, None]:
-    async with AsyncSessionLocal() as setup:
+    async with async_session_local() as setup:
         setup.add(
             Job(
                 id=job_id,
@@ -117,7 +117,7 @@ async def _spawned_for_job(
                 await session.initialize()
                 yield session
     finally:
-        async with AsyncSessionLocal() as cleanup:
+        async with async_session_local() as cleanup:
             await cleanup.execute(delete(Job).where(Job.id == job_id))
             await cleanup.commit()
 

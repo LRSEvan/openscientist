@@ -11,7 +11,7 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import AsyncIterator, Collection, Coroutine, Iterator
+from collections.abc import AsyncIterator, Collection, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,7 +21,7 @@ from uuid import UUID
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from openscientist.async_tasks import thread_loop
+from openscientist.async_tasks import run_sync, thread_loop
 from openscientist.container_manager import get_container_manager
 from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
@@ -122,7 +122,7 @@ def _load_progress_from_knowledge_state(
     default_findings: int,
 ) -> tuple[int, int]:
     """:func:`_load_progress` for worker threads."""
-    return _run_async(_load_progress(job_id, status, default_iterations, default_findings))
+    return run_sync(_load_progress(job_id, status, default_iterations, default_findings))
 
 
 async def _db_create_job(
@@ -340,17 +340,6 @@ async def _db_delete_job(job_id: str, user_id: UUID | None = None) -> None:
             await session.commit()
 
 
-def _run_async[T](coro: Coroutine[Any, Any, T]) -> T:
-    """Run async code from sync context.
-
-    Thin wrapper around :func:`openscientist.async_tasks.run_sync` kept for
-    internal compatibility within this module.
-    """
-    from openscientist.async_tasks import run_sync
-
-    return run_sync(coro)
-
-
 class JobManager:
     """
     Manages OpenScientist discovery jobs.
@@ -503,7 +492,7 @@ class JobManager:
 
     def _rollback_failed_job_creation(self, job_id: str, owner_uuid: UUID | None) -> None:
         try:
-            _run_async(_db_delete_job(job_id, owner_uuid))
+            run_sync(_db_delete_job(job_id, owner_uuid))
         except Exception as cleanup_error:
             logger.error("Failed to rollback DB job %s: %s", job_id, cleanup_error)
         try:
@@ -830,7 +819,7 @@ class JobManager:
                 return False
 
             try:
-                job_id = _run_async(
+                job_id = run_sync(
                     _db_next_queued_job(self.scheduler_window, set(self._running_jobs))
                 )
             except Exception as e:
@@ -1025,7 +1014,7 @@ class JobManager:
                 created_at = created_at.replace(tzinfo=UTC)
             if created_at < cutoff:
                 try:
-                    _run_async(self.delete_job(job_id))
+                    run_sync(self.delete_job(job_id))
                     deleted += 1
                 except (OSError, ValueError) as e:
                     logger.error("Failed to delete job %s: %s", job_id, e)
@@ -1087,7 +1076,7 @@ class JobManager:
 
         Jobs are sourced exclusively from the database.
         """
-        db_jobs = _run_async(_db_list_jobs(status=status, limit=limit))
+        db_jobs = run_sync(_db_list_jobs(status=status, limit=limit))
         return [self._db_model_to_job_info(job) for job in db_jobs]
 
     def _db_model_to_job_info(self, job_model: JobModel) -> JobInfo:
@@ -1114,7 +1103,7 @@ class JobManager:
         """
         Load job info from database.
         """
-        job_model = _run_async(_db_get_job(job_id))
+        job_model = run_sync(_db_get_job(job_id))
         return None if job_model is None else self._db_model_to_job_info(job_model)
 
     def _update_job_status(
@@ -1135,7 +1124,7 @@ class JobManager:
         goes through. Any other database error is raised."""
 
         def write() -> JobStatusUpdateResult:
-            return _run_async(
+            return run_sync(
                 _db_update_job_status(
                     job_id,
                     status,
@@ -1171,7 +1160,7 @@ class JobManager:
         if job_info.status not in self._CONTAINER_NOTIFIED_STATUSES:
             return
         try:
-            target = _run_async(_db_get_notification_target(job_info.job_id))
+            target = run_sync(_db_get_notification_target(job_info.job_id))
         except Exception as e:
             logger.warning("Failed to load notification target for %s: %s", job_info.job_id, e)
             return
@@ -1189,7 +1178,7 @@ class JobManager:
         cancellation_reason: str | None = None,
     ) -> None:
         """:func:`_status_notification` for worker threads."""
-        _run_async(
+        run_sync(
             _status_notification(
                 job_id,
                 status,

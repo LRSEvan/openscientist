@@ -15,7 +15,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import TextContent
 from sqlalchemy import delete
 
-from openscientist.database import AsyncSessionLocal
+from openscientist.database import async_session_local
 from openscientist.database.models.job import Job
 from openscientist.database.models.pubmed_article import PubMedArticle
 from openscientist.knowledge_state import KnowledgeState
@@ -150,7 +150,7 @@ async def test_airgap_search_reads_the_local_corpus(
     _apply_migrations_once: None,
     patched_ks_persistence: KnowledgeState,
 ) -> None:
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         session.add(
             PubMedArticle(
                 pmid=72613445,
@@ -166,7 +166,7 @@ async def test_airgap_search_reads_the_local_corpus(
         monkeypatch.setattr(get_settings().airgap, "enabled", True)
         result = await search_pubmed(query="crispr", max_results=5)
     finally:
-        async with AsyncSessionLocal() as session:
+        async with async_session_local() as session:
             await session.execute(delete(PubMedArticle).where(PubMedArticle.pmid == 72613445))
             await session.commit()
 
@@ -197,7 +197,7 @@ async def test_subprocess_smoke_real_ncbi(
 ) -> None:
     """End-to-end: subprocess MCP server hits real NCBI and writes to real DB."""
     job_id = uuid4()
-    async with AsyncSessionLocal() as session:
+    async with async_session_local() as session:
         session.add(
             Job(
                 id=job_id,
@@ -231,6 +231,6 @@ async def test_subprocess_smoke_real_ncbi(
         assert last_log["action"] == "search_pubmed"
         assert last_log["query"] == "CRISPR Cas9"
     finally:
-        async with AsyncSessionLocal() as session:
+        async with async_session_local() as session:
             await session.execute(delete(Job).where(Job.id == job_id))
             await session.commit()

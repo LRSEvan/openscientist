@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from openscientist.database.session import AsyncSessionLocal, thread_safe_admin_session
+from openscientist.database.session import async_session_local, thread_safe_admin_session
 
 _SECRET = "session-token-3f1c9a7e-not-for-logs"
 
@@ -20,7 +20,7 @@ pytestmark = pytest.mark.usefixtures("test_engine")
 
 @pytest.mark.parametrize(
     "open_session",
-    [AsyncSessionLocal, thread_safe_admin_session],
+    [async_session_local, thread_safe_admin_session],
     ids=["web login", "admin login"],
 )
 async def test_a_failed_statement_does_not_reveal_what_it_bound(

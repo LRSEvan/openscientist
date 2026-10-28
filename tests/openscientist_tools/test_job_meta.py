@@ -14,7 +14,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import TextContent
 from sqlalchemy import delete, select
 
-from openscientist.database import AsyncSessionLocal
+from openscientist.database import async_session_local
 from openscientist.database.models.job import Job
 from openscientist.knowledge_state import KnowledgeState
 from openscientist_tools.job_meta import (
@@ -36,7 +36,7 @@ async def _spawned_for_job(
 ) -> AsyncGenerator[ClientSession, None]:
     """Create a Job row, spawn the subprocess MCP server with env bound to
     that job_id, yield a connected `ClientSession`, then delete the Job."""
-    async with AsyncSessionLocal() as setup:
+    async with async_session_local() as setup:
         setup.add(
             Job(
                 id=job_id,
@@ -56,7 +56,7 @@ async def _spawned_for_job(
                 await session.initialize()
                 yield session
     finally:
-        async with AsyncSessionLocal() as cleanup:
+        async with async_session_local() as cleanup:
             await cleanup.execute(delete(Job).where(Job.id == job_id))
             await cleanup.commit()
 
@@ -189,7 +189,7 @@ async def test_set_status_via_subprocess(
         response = await mcp.call_tool("set_status", {"message": "Running subprocess test"})
         assert _text(response) == "✅ Status updated: Running subprocess test"
 
-        async with AsyncSessionLocal() as session:
+        async with async_session_local() as session:
             row = (await session.execute(select(Job).where(Job.id == job_id))).scalar_one()
             assert row.agent_status == "Running subprocess test"
 
@@ -208,7 +208,7 @@ async def test_set_job_title_via_subprocess(
         response = await mcp.call_tool("set_job_title", {"title": "Subprocess Title"})
         assert _text(response) == "✅ Job title set: Subprocess Title"
 
-        async with AsyncSessionLocal() as session:
+        async with async_session_local() as session:
             row = (await session.execute(select(Job).where(Job.id == job_id))).scalar_one()
             assert row.short_title == "Subprocess Title"
 

@@ -7,7 +7,7 @@ import logging
 from uuid import UUID
 
 from openscientist.database.models.job import Job as JobModel
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import async_session_local
 from openscientist.knowledge_state import KnowledgeState
 from openscientist_tools.server import mcp
 from openscientist_tools.state import STATE
@@ -61,7 +61,7 @@ async def set_job_title(title: str) -> str:
     except ValueError:
         return f"❌ Invalid job id: {STATE.job_id}"
     try:
-        async with AsyncSessionLocal() as session:
+        async with async_session_local() as session:
             job = await session.get(JobModel, job_uuid)
             if job is None:
                 return "❌ Job not found in database."
