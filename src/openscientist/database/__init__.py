@@ -14,13 +14,7 @@ DATABASE_URL.
 
 from .base import Base, UUIDv7Mixin
 from .engine import get_admin_engine, get_engine
-from .rls import (
-    get_current_user,
-    list_rls_policies,
-    session_with_user,
-    set_current_user,
-    verify_rls_enabled,
-)
+from .rls import list_rls_policies, set_current_user, verify_rls_enabled
 from .session import AsyncSessionLocal, get_admin_session, get_session, get_session_ctx
 
 __all__ = [
@@ -29,12 +23,10 @@ __all__ = [
     "UUIDv7Mixin",
     "get_admin_engine",
     "get_admin_session",
-    "get_current_user",
     "get_engine",
     "get_session",
     "get_session_ctx",
     "list_rls_policies",
-    "session_with_user",
     "set_current_user",
     "verify_rls_enabled",
 ]

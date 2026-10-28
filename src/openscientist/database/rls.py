@@ -5,8 +5,6 @@ Provides middleware and utilities for PostgreSQL Row-Level Security enforcement.
 RLS policies control access to database rows based on the current user context.
 """
 
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
@@ -67,67 +65,6 @@ async def set_current_user(session: AsyncSession, user_id: UUID | None) -> None:
             text("SELECT set_config('app.current_user_id', :user_id, true)"),
             {"user_id": value},
         )
-
-
-async def get_current_user(session: AsyncSession) -> UUID | None:
-    """
-    Get the current user ID from the PostgreSQL session.
-
-    Args:
-        session: SQLAlchemy async session
-
-    Returns:
-        UUID of the current user, or None if not set
-
-    Example:
-        >>> async with get_session_ctx() as session:
-        ...     user_id = await get_current_user(session)
-        ...     print(f"Current user: {user_id}")
-    """
-    result = await session.execute(text("SELECT current_setting('app.current_user_id', true)"))
-    user_id_str = result.scalar_one()
-
-    if user_id_str is None or user_id_str == "":
-        return None
-
-    return UUID(user_id_str)
-
-
-@asynccontextmanager
-async def session_with_user(
-    session: AsyncSession,
-    user_id: UUID | None,
-) -> AsyncGenerator[AsyncSession, None]:
-    """
-    Context manager that sets user context for RLS and cleans up automatically.
-
-    This is a convenience wrapper that combines session management with user
-    context setting. It ensures the user ID is properly set before queries
-    and cleared afterward.
-
-    Args:
-        session: SQLAlchemy async session
-        user_id: UUID of the current user, or None for no RLS context
-
-    Yields:
-        The same session with user context applied
-
-    Example:
-        >>> async with get_session_ctx() as session:
-        ...     async with session_with_user(session, user.id) as user_session:
-        ...         jobs = await user_session.execute(select(Job))
-        ...         # Only sees jobs visible to user
-    """
-    # Store the original user ID
-    original_user_id = await get_current_user(session)
-
-    try:
-        # Set the new user context
-        await set_current_user(session, user_id)
-        yield session
-    finally:
-        # Restore the original user context
-        await set_current_user(session, original_user_id)
 
 
 async def verify_rls_enabled(session: AsyncSession, table_name: str) -> bool:
