@@ -33,9 +33,13 @@ RUN cargo build --manifest-path /tmp/cargo-seed/Cargo.toml \
     && rm -rf /tmp/cargo-seed \
     && chmod -R a+rwX $CARGO_HOME
 
-# Install Python dependencies using uv
-COPY requirements-executor.txt .
-RUN uv pip install --system -r requirements-executor.txt
+# Install the `executor` extra from the lock. The base image already carries
+# the main dependencies.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv export --locked --no-dev --extra executor --no-emit-project --format requirements-txt \
+        -o /tmp/requirements.txt \
+    && uv pip install --system -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 # Create directories for data and output
 RUN mkdir -p /data /output && chown executor:executor /data /output
