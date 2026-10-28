@@ -1,5 +1,7 @@
 """Tests for authentication middleware behavior."""
 
+import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -21,7 +23,8 @@ def _make_fake_context(session_token: str | None = None):
             client=SimpleNamespace(
                 request=SimpleNamespace(cookies=cookies),
                 page=SimpleNamespace(path="/new", response_timeout=3.0),
-            )
+            ),
+            slot=MagicMock(),
         ),
         navigate=SimpleNamespace(to=MagicMock()),
     )
@@ -97,6 +100,71 @@ def test_require_auth_refuses_a_sync_page():
 
     with pytest.raises(TypeError, match="require_auth needs an async page"):
         middleware.require_auth(sync_page)
+
+
+def _signed_in_ui(monkeypatch, response_timeout: float) -> MagicMock:
+    """A NiceGUI stand-in for a visitor with a valid session, on a page that
+    has ``response_timeout``."""
+    ui = MagicMock()
+    ui.context.client.request.cookies = {"session_token": "good-token"}
+    ui.context.client.page.path = "/jobs"
+    ui.context.client.page.response_timeout = response_timeout
+    monkeypatch.setattr(middleware, "app", SimpleNamespace(storage=SimpleNamespace(user={})))
+    monkeypatch.setattr(middleware, "ui", ui)
+
+    async def _valid(_token: str):
+        return {"user_id": "u", "email": "visitor@example.com", "name": "Visitor"}
+
+    monkeypatch.setattr(middleware, "validate_session", _valid)
+    return ui
+
+
+async def test_a_cancelled_request_cancels_its_page_build(monkeypatch):
+    """A request cancelled mid-build, as when the visitor leaves, takes its
+    page build with it instead of leaving the build running."""
+    _signed_in_ui(monkeypatch, response_timeout=30.0)
+    building = asyncio.Event()
+    build_cancelled = asyncio.Event()
+
+    async def page():
+        building.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            build_cancelled.set()
+            raise
+
+    request = asyncio.create_task(middleware.require_auth(page)())
+    await building.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    await asyncio.wait_for(build_cancelled.wait(), timeout=5)
+
+
+async def test_a_build_failing_after_its_deadline_is_logged(monkeypatch, caplog):
+    """A build abandoned at its deadline whose cleanup then fails, as a driver
+    closing a hung connection can, still shows the outage page in time and
+    has its failure logged once it ends."""
+    ui = _signed_in_ui(monkeypatch, response_timeout=0.6)
+    release = asyncio.Event()
+
+    async def page():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise RuntimeError("closing the hung connection failed") from None
+
+    with caplog.at_level(logging.DEBUG, logger=middleware.__name__):
+        assert await asyncio.wait_for(middleware.require_auth(page)(), timeout=5) is None
+        ui.label.assert_any_call("OpenScientist cannot reach its database right now.")
+        release.set()
+        for _ in range(100):
+            if "closing the hung connection failed" in caplog.text:
+                break
+            await asyncio.sleep(0.01)
+    assert "closing the hung connection failed" in caplog.text
 
 
 def test_can_current_user_start_jobs_uses_approval_or_admin_fallback(monkeypatch):

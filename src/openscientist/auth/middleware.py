@@ -14,6 +14,7 @@ from functools import wraps
 from typing import Any
 
 from nicegui import app, ui
+from nicegui.slot import Slot
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -27,6 +28,10 @@ logger = logging.getLogger(__name__)
 #: How much of a page's ``response_timeout`` is kept for sending the outage
 #: page after a build that the database held up.
 _OUTAGE_PAGE_SECONDS = 0.5
+
+#: Builds cancelled at their deadline, held until their database driver
+#: finishes cleaning up, which on a hung connection outlasts the deadline.
+_abandoned_builds: set[asyncio.Task[Any]] = set()
 
 
 async def get_current_user(db: AsyncSession, session_token: str) -> User | None:
@@ -147,8 +152,9 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
     the database, and redirects to login if not authenticated. A database that
     accepts connects but never answers raises nothing within the page's
     ``response_timeout``, after which NiceGUI serves its own error page, so the
-    session check and the page run under a deadline just inside it and the
-    outage page shows when it expires.
+    session check and the page run as a task with a deadline just inside it.
+    When the deadline expires the task is cancelled and the outage page shows
+    at once, without waiting for the driver to release the hung connection.
 
     Args:
         func: Async page function to protect. A sync page would run its session
@@ -174,12 +180,17 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
 
         page = ui.context.client.page
         deadline = page.response_timeout - _OUTAGE_PAGE_SECONDS
+        build = asyncio.create_task(
+            _build_signed_in(ui.context.slot, session_token, func, *args, **kwargs)
+        )
         try:
-            async with asyncio.timeout(deadline) as build:
-                return await _build_signed_in(session_token, func, *args, **kwargs)
-        except TimeoutError:
-            if not build.expired():
-                raise
+            done, _ = await asyncio.wait({build}, timeout=deadline)
+        except asyncio.CancelledError:
+            _abandon(build)
+            raise
+        if done:
+            return build.result()
+        _abandon(build)
         logger.error(
             "The database did not answer within %.1f s while building %s", deadline, page.path
         )
@@ -190,26 +201,41 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
     return async_wrapper
 
 
-async def _build_signed_in(
-    session_token: str, func: Callable[..., Any], *args: Any, **kwargs: Any
-) -> Any:
-    """Build ``func``'s page for the visitor holding ``session_token``, or the
-    login redirect or outage page in its place."""
-    try:
-        user_info = await validate_session(session_token)
-    except Exception as e:
-        if not is_connection_error(e):
-            raise
-        logger.error("Database unreachable while checking a session: %s", e)
-        _show_database_unavailable()
-        return None
-    if not user_info:
-        logger.debug("Invalid session token, redirecting to login")
-        _redirect_to_login(clear_storage=True)
-        return None
+def _abandon(build: asyncio.Task[Any]) -> None:
+    """Cancel ``build`` and hold it until it ends."""
+    build.cancel()
+    _abandoned_builds.add(build)
+    build.add_done_callback(_forget_abandoned)
 
-    _store_authenticated_user(session_token, user_info)
-    return await func(*args, **kwargs)
+
+def _forget_abandoned(build: asyncio.Task[Any]) -> None:
+    _abandoned_builds.discard(build)
+    if not build.cancelled() and (error := build.exception()) is not None:
+        logger.debug("A build abandoned at its deadline ended with %r", error)
+
+
+async def _build_signed_in(
+    slot: Slot, session_token: str, func: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Build ``func``'s page into ``slot`` for the visitor holding
+    ``session_token``, or the login redirect or outage page in its place.
+    NiceGUI keeps a slot stack per task, so this task enters the page's slot."""
+    with slot:
+        try:
+            user_info = await validate_session(session_token)
+        except Exception as e:
+            if not is_connection_error(e):
+                raise
+            logger.error("Database unreachable while checking a session: %s", e)
+            _show_database_unavailable()
+            return None
+        if not user_info:
+            logger.debug("Invalid session token, redirecting to login")
+            _redirect_to_login(clear_storage=True)
+            return None
+
+        _store_authenticated_user(session_token, user_info)
+        return await func(*args, **kwargs)
 
 
 def get_current_user_id() -> str | None:
