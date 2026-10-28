@@ -4,8 +4,8 @@ API key authentication for REST API.
 Implements Bearer token authentication using API keys in the format:
     name:secret
 
-The name is stored plaintext in the database, the secret is hashed using
-bcrypt for secure storage. The full "name:secret" key is only shown once
+The name is stored plaintext in the database, the secret is stored as a
+SHA-256 hash. The full "name:secret" key is only shown once
 at creation time.
 """
 
