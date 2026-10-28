@@ -159,6 +159,16 @@ async def test_equal_hours_fall_back_to_the_oldest_queued_job(
     assert _picked(tmp_path) == {str(older)}
 
 
+def test_a_failed_pick_starts_no_job(tmp_path: Path) -> None:
+    manager = JobManager(jobs_dir=tmp_path)
+    with patch(
+        "openscientist.job_manager._db_next_queued_job", side_effect=RuntimeError("database down")
+    ):
+        started = manager._start_next_queued_job()
+    assert started is False
+    assert manager._running_jobs == {}
+
+
 async def _times(test_engine: AsyncEngine, job_id: UUID) -> tuple[datetime | None, datetime | None]:
     async with test_engine.connect() as conn:
         row = (
