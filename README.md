@@ -245,18 +245,6 @@ In `src/openscientist/web_app.py`:
 - `max_concurrent`: Maximum concurrent jobs (default: 1)
 - `jobs_dir`: Directory for job data (default: `jobs/`)
 
-### Legacy Bootstrap (Filesystem -> DB)
-
-If you have pre-database jobs on disk, run:
-
-```bash
-docker compose exec openscientist python -m openscientist.job_manager bootstrap --jobs-dir /app/jobs --dry-run
-docker compose exec openscientist python -m openscientist.job_manager bootstrap --jobs-dir /app/jobs
-```
-
-Jobs with unresolved ownership are migrated as orphaned (`owner_id=NULL`) and
-can be assigned later from the admin UI.
-
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and deployment.

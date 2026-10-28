@@ -1255,22 +1255,6 @@ def main() -> None:
     # Summary
     subparsers.add_parser("summary", help="Get job summary")
 
-    # Bootstrap filesystem jobs into DB
-    bootstrap_parser = subparsers.add_parser(
-        "bootstrap",
-        help="Bootstrap filesystem jobs into the database",
-    )
-    bootstrap_parser.add_argument(
-        "--jobs-dir",
-        default="jobs",
-        help="Directory containing job folders (default: jobs)",
-    )
-    bootstrap_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Scan and report without writing database changes",
-    )
-
     args = parser.parse_args()
 
     # Set up logging
@@ -1278,16 +1262,6 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-    if args.command == "bootstrap":
-        from openscientist.bootstrap import bootstrap_jobs_from_filesystem_sync
-
-        result = bootstrap_jobs_from_filesystem_sync(
-            jobs_dir=Path(args.jobs_dir),
-            dry_run=args.dry_run,
-        )
-        print(json.dumps(result.to_dict(), indent=2))
-        return
 
     # Create job manager
     manager = JobManager()
