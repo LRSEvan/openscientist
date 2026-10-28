@@ -470,12 +470,15 @@ async def _start_background_tasks(engine: AsyncEngine) -> None:
     except Exception as e:
         logger.warning("Failed to start execution broker: %s", e)
 
-    # Drop database logins that agent containers left behind. The first run
-    # follows JobManager's startup cleanup of stale containers.
+    # Drop database logins and run homes that agent containers left behind, and
+    # harness homes past runs left in job directories. The first run follows
+    # JobManager's startup cleanup of stale containers.
     from openscientist.async_tasks import create_background_task
     from openscientist.job_container.db_login import run_agent_login_reaper
 
-    create_background_task(run_agent_login_reaper(), name="agent-login-reaper", logger=logger)
+    create_background_task(
+        run_agent_login_reaper(_state.jobs_dir), name="agent-login-reaper", logger=logger
+    )
 
 
 def _initialize_job_manager_runtime(jobs_dir: Path) -> None:

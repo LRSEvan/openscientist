@@ -104,7 +104,7 @@ class OmpAgent(AbstractAgent[Provider]):
     # defaults: omp reads auth from the subprocess env and its model from
     # config.model_override, and folds chat guidance into the system prompt.
 
-    # Host omp store files copied to rebuild the vault in the job workspace
+    # Host omp store files copied to rebuild the vault in the run's home
     # (WAL/SHM included so an un-checkpointed db stays readable).
     _OMP_STORE_FILES: ClassVar[tuple[str, ...]] = (
         "agent.db",
@@ -113,12 +113,14 @@ class OmpAgent(AbstractAgent[Provider]):
         "config.yml",
     )
 
+    RUN_HOME: ClassVar[str | None] = ".omp-home"
+
     @classmethod
-    def provision_host_prelaunch(cls, settings: Settings, job_dir: Path) -> None:
-        """Copy the host omp credential vault into the job workspace, agent-writable
-        (mounting fails on permissions for the non-root agent), and point
-        ``PI_CODING_AGENT_DIR`` at the copy. No-op unless ``omp_auth_host_path``
-        is set (the API-key path needs no vault)."""
+    def provision_run_home(cls, settings: Settings, home: Path) -> None:
+        """Copy the host omp credential vault into the run's home, agent-writable
+        (mounting fails on permissions for the non-root agent), which the agent
+        uses as ``PI_CODING_AGENT_DIR``. No-op unless ``omp_auth_host_path`` is
+        set (the API-key path needs no vault)."""
         src = settings.provider.omp_auth_host_path
         if not src:
             return
@@ -126,22 +128,19 @@ class OmpAgent(AbstractAgent[Provider]):
         if not src_path.is_dir():
             logger.warning("omp_auth_host_path %s is not a directory, skipping", src_path)
             return
-        dest = job_dir / ".omp-home"
-        dest.mkdir(parents=True, exist_ok=True)
-        dest.chmod(0o777)
         copied = 0
         for name in cls._OMP_STORE_FILES:
             f = src_path / name
             if f.exists():
-                target = dest / name
+                target = home / name
                 shutil.copy2(f, target)
                 # Agent opens the SQLite vault read-write, so it must be writable.
                 target.chmod(0o666)
                 copied += 1
-        logger.info("Provisioned omp auth (%d files) into %s", copied, dest)
+        logger.info("Provisioned omp auth (%d files) into %s", copied, home)
 
     def _omp_home(self) -> Path:
-        return self._job_dir() / ".omp-home"
+        return self._job_dir() / str(self.RUN_HOME)
 
     def _job_dir(self) -> Path:
         # Absolute: omp resolves a relative --cwd against its own launch cwd.
@@ -253,7 +252,7 @@ class OmpAgent(AbstractAgent[Provider]):
             return
         home = self._omp_home()
         if not home.exists():
-            # Only when we create it: the vault provisioner already made it
+            # Only when we create it: a container run's home is already
             # agent-writable, and chmod on a root-owned dir fails for the agent.
             home.mkdir(parents=True, exist_ok=True)
             home.chmod(0o777)

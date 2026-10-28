@@ -28,7 +28,7 @@ from openscientist.container_manager import get_container_manager
 from openscientist.database import AsyncSessionLocal
 from openscientist.database.models.job import Job
 from openscientist.exec_broker_client import BrokerError
-from openscientist.job_container.secrets import make_exec_placeholder
+from openscientist.job_container.secrets import issue_run_credentials, revoke_run_credentials
 from openscientist.knowledge_state import KnowledgeState
 from openscientist_tools import code_exec as code_exec_module
 from openscientist_tools.code_exec import execute_code
@@ -63,10 +63,7 @@ def exec_broker_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Generato
         container=SimpleNamespace(container_app_dir=str(tmp_path), host_project_dir=None),
     )
     monkeypatch.setattr(exec_broker, "get_settings", lambda: fake_settings)
-    app = exec_broker.create_exec_broker_app(
-        master_key=lambda: fake_settings.secret_key,
-        manager=get_container_manager,
-    )
+    app = exec_broker.create_exec_broker_app(manager=get_container_manager)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -84,15 +81,21 @@ def exec_broker_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Generato
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+        while _issued_roles:
+            revoke_run_credentials(_issued_roles.pop())
+
+
+#: Login roles of the runs :func:`_broker_env` started, ended with the broker.
+_issued_roles: list[str] = []
 
 
 def _broker_env(job_id: UUID, broker_url: str) -> dict[str, str]:
-    """Subprocess env pointing the tool at the test broker with a valid token."""
+    """Subprocess env pointing the tool at the test broker with a live run's token."""
+    role = f"agent_{uuid4().hex}"
+    _issued_roles.append(role)
     return {
         "OPENSCIENTIST_EXEC_BROKER_URL": broker_url,
-        "OPENSCIENTIST_EXEC_TOKEN": make_exec_placeholder(
-            os.environ["OPENSCIENTIST_SECRET_KEY"], str(job_id)
-        ),
+        "OPENSCIENTIST_EXEC_TOKEN": issue_run_credentials(str(job_id), role).exec_token,
     }
 
 

@@ -21,6 +21,11 @@ from openscientist.job_container.db_login import (
     drop_agent_login,
     reap_agent_logins,
 )
+from openscientist.job_container.secrets import (
+    broker_accepts,
+    issue_run_credentials,
+    proxy_accepts,
+)
 
 
 async def _connect(database_url: str) -> asyncpg.Connection:
@@ -124,6 +129,15 @@ async def test_dropping_a_login_ends_its_open_sessions(job_id: UUID) -> None:
     finally:
         if not conn.is_closed():
             conn.terminate()
+
+
+@pytest.mark.asyncio
+async def test_dropping_a_login_ends_its_runs_proxy_and_broker_credentials(job_id: UUID) -> None:
+    login = await create_agent_login(str(job_id), lifetime_seconds=300)
+    credentials = issue_run_credentials(str(job_id), login.role)
+    await drop_agent_login(login.role)
+    assert not proxy_accepts(credentials.llm_placeholder)
+    assert not broker_accepts(str(job_id), credentials.exec_token)
 
 
 @pytest.mark.asyncio

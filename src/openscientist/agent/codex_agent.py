@@ -27,7 +27,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, CodexConfig, Sandbox
 from openai_codex.generated.v2_all import (
@@ -178,18 +178,17 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
     # child via config.toml (no process-env routing), folds the chat guidance
     # into the system prompt, writes no chat file, and has no model override.
 
+    RUN_HOME: ClassVar[str | None] = ".codex"
+
     @classmethod
-    def provision_host_prelaunch(cls, settings: Settings, job_dir: Path) -> None:
-        """Place the codex CLI auth into the per-job CODEX_HOME so the non-root
-        agent (uid 1001) can read it.
+    def provision_run_home(cls, settings: Settings, home: Path) -> None:
+        """Copy the codex CLI auth into the run's home, its CODEX_HOME, readable
+        by the non-root agent (uid 1001).
 
         Mounting the host auth file directly fails on the uid/permission
-        boundary (the host file is mode 600 owned by another user), so we copy
-        it in agent-readable. ``job_dir`` is the runner-local path to the job
-        directory (the same path ``setup.py`` writes into), not the
-        host-translated bind-mount path, so the copy works whether the web
-        server runs on the host or in a container. No-op unless
-        ``codex_auth_host_path`` is set (the API-key path needs no file).
+        boundary (the host file is mode 600 owned by another user), so it is
+        copied in agent-readable. No-op unless ``codex_auth_host_path`` is set
+        (the API-key path needs no file).
         """
         src = settings.provider.codex_auth_host_path
         if not src:
@@ -198,11 +197,7 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
         if not src_path.exists():
             logger.warning("codex_auth_host_path %s does not exist, skipping", src_path)
             return
-        codex_home = job_dir / ".codex"
-        codex_home.mkdir(parents=True, exist_ok=True)
-        # World-writable so the agent can also write config.toml into CODEX_HOME.
-        codex_home.chmod(0o777)
-        dest = codex_home / "auth.json"
+        dest = home / "auth.json"
         shutil.copy2(src_path, dest)
         dest.chmod(0o644)
         logger.info("Provisioned codex auth into %s", dest)
@@ -214,7 +209,7 @@ class CodexAgent(AbstractAgent[CodexCompatible]):
         return self._config.job_dir.resolve()
 
     def _codex_home(self) -> Path:
-        return self._job_dir() / ".codex"
+        return self._job_dir() / str(self.RUN_HOME)
 
     def _mcp_env(self) -> dict[str, str]:
         """Full environment for the tools MCP server, written into the codex

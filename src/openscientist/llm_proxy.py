@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
-from openscientist.job_container.secrets import verify_job_placeholder
+from openscientist.job_container.secrets import proxy_accepts
 from openscientist.listener import bind_listener
 from openscientist.providers import get_provider
 from openscientist.providers.base import AirgapEgress, LlmUpstream
@@ -71,15 +71,15 @@ def _presented_credential(request: Request) -> str | None:
 
 def create_llm_proxy_app(
     *,
-    master_key: Callable[[], str],
     upstream: Callable[[], LlmUpstream],
     client: httpx.AsyncClient,
 ) -> Starlette:
-    """Build the proxy ASGI app. The callables are resolved per request."""
+    """Build the proxy ASGI app. The callables are resolved per request, and only
+    a live run's credential is accepted."""
 
     async def handler(request: Request) -> Response:
         credential = _presented_credential(request)
-        if credential is None or not verify_job_placeholder(master_key(), credential):
+        if credential is None or not proxy_accepts(credential):
             return Response("unauthorized", status_code=401)
         try:
             target = upstream()
@@ -158,11 +158,7 @@ async def start_llm_proxy() -> None:
     port = get_settings().container.llm_proxy_port
     sock = bind_listener(port, name="LLM proxy", setting="OPENSCIENTIST_LLM_PROXY_PORT")
     client = httpx.AsyncClient(timeout=httpx.Timeout(None))
-    app = create_llm_proxy_app(
-        master_key=lambda: get_settings().secret_key,
-        upstream=_active_upstream,
-        client=client,
-    )
+    app = create_llm_proxy_app(upstream=_active_upstream, client=client)
     config = uvicorn.Config(app, log_level="warning")
     _proxy_server = _NoSignalServer(config)
     _proxy_task = asyncio.create_task(_proxy_server.serve(sockets=[sock]))
