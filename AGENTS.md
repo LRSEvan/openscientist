@@ -21,19 +21,17 @@ Follow the pull request policy in [`CONTRIBUTING.md`](CONTRIBUTING.md#pull-reque
 
 ```text
 src/openscientist/
-├── agent/            # AgentExecutor protocol and ClaudeCodeAgent
+├── agent/            # AbstractAgent and the Claude Code, Codex and omp backends
 ├── api/              # FastAPI REST endpoints
 ├── auth/             # Authentication (OAuth, sessions, middleware)
 ├── database/         # SQLAlchemy models and migrations
 ├── job/              # Job lifecycle, scheduling, and types
 ├── job_container/    # Container-per-job isolation
-├── mcp_server/       # MCP server for agent tools
 ├── orchestrator/     # Discovery orchestration (setup, iteration, report)
 ├── providers/        # LLM provider abstractions (Anthropic, Vertex, etc.)
-├── tools/            # @tool-decorated callables for SDK agent path
 ├── webapp_components/# NiceGUI pages and components
-├── prompts.py        # Agent system prompts
-├── settings.py       # Pydantic settings with TOML support
+├── prompts/          # Agent system prompts
+├── settings.py       # Pydantic settings
 └── web_app.py        # Main application entry point
 ```
 
@@ -52,8 +50,8 @@ export ANTHROPIC_API_KEY="..."  # or other provider credentials
 docker compose run --rm db-bootstrap
 uv run alembic upgrade head
 
-# Start development server
-uv run python -m openscientist.web_app --reload
+# Start development server (OPENSCIENTIST_DEV_MODE=true enables auto-reload)
+uv run python -m openscientist.web_app
 ```
 
 ## Testing
@@ -178,22 +176,6 @@ When you need a new UI pattern used in multiple places:
 - NiceGUI-based UI
 - Pages in `pages/` subdirectory
 - Shared components in `utils/`
-
-## Development Tools
-
-See `tools/README.md` for helper scripts.
-
-### tile_screenshots.py
-
-Creates tiled images from screenshots for documenting UI flows:
-
-```bash
-uv run python tools/tile_screenshots.py \
-  screenshots/*.png \
-  -o output.png \
-  -a annotations.json \
-  -c 2
-```
 
 ## Environment Variables
 

@@ -223,10 +223,7 @@ class VertexProvider(ClaudeCompatible):
 
         except Exception as e:
             logger.warning("Could not fetch Vertex AI billing data: %s", e)
-            logger.warning(
-                "Ensure BigQuery billing export is enabled in GCP Console. "
-                "See docs/VERTEX_SETUP.md for setup instructions."
-            )
+            logger.warning("Ensure BigQuery billing export is enabled in GCP Console.")
             # Return None if billing data unavailable (permissions, export not enabled, etc.)
             total_spend = None
             recent_spend = None
