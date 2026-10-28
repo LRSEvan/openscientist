@@ -429,6 +429,13 @@ class JobContainerRunner:
                 raise RuntimeError(f"Chat container exited with code {exit_code}: {logs[-2000:]}")
         finally:
             try:
+                # A turn cut at the time limit writes its cost when stopped, so
+                # a forced removal would lose it.
+                container.stop(timeout=_STOP_GRACE_SECONDS)
+            except docker_errors.APIError as error:
+                if not self._is_not_found_error(error):
+                    logger.warning("Failed to stop chat container %s: %s", name, error)
+            try:
                 container.remove(force=True)
             except docker_errors.APIError as error:
                 if not self._is_not_found_error(error):

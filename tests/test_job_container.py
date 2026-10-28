@@ -5,7 +5,7 @@ import hmac
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 
@@ -15,6 +15,7 @@ from openscientist.job_chat import CHAT_TURN_ENV
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL, AgentLogin
 from openscientist.job_container.run_home import create_run_home
 from openscientist.job_container.runner import (
+    _STOP_GRACE_SECONDS,
     AGENT_APP_DIR,
     AGENT_GCP_CREDENTIALS_PATH,
     JobContainerRunner,
@@ -957,12 +958,21 @@ class TestChatTurnLaunch:
             airgap=SimpleNamespace(enabled=False),
         )
 
-    def _run_chat(self, settings: SimpleNamespace, *, exit_code: int = 0):
+    def _run_chat(
+        self,
+        settings: SimpleNamespace,
+        *,
+        exit_code: int = 0,
+        stop_error: Exception | None = None,
+    ):
         mock_client = MagicMock()
         mock_container = MagicMock()
         mock_container.short_id = "abc123"
         mock_container.wait.return_value = {"StatusCode": exit_code}
         mock_container.logs.return_value = b"container log"
+        mock_container.labels = {AGENT_LOGIN_LABEL: _LOGIN.role}
+        if stop_error is not None:
+            mock_container.stop.side_effect = stop_error
         mock_client.containers.run.return_value = mock_container
         with (
             patch("openscientist.job_container.runner.docker.from_env", return_value=mock_client),
@@ -993,8 +1003,34 @@ class TestChatTurnLaunch:
         assert env["OPENSCIENTIST_RUN_MODE"] == "chat"
         assert env[CHAT_TURN_ENV] == "t1"
         mock_container.wait.assert_called_once()
-        mock_container.remove.assert_called_once_with(force=True)
+        # Stopped with the grace a turn needs to write its cost, then removed.
+        calls = [c for c in mock_container.method_calls if c[0] in ("stop", "remove")]
+        assert calls == [call.stop(timeout=_STOP_GRACE_SECONDS), call.remove(force=True)]
 
     def test_chat_turn_raises_on_nonzero_exit(self) -> None:
         with pytest.raises(RuntimeError, match="exited with code 1"):
             self._run_chat(self._settings(), exit_code=1)
+
+    def test_chat_turn_removes_container_and_drops_login_when_stop_fails(
+        self,
+        agent_login: SimpleNamespace,
+    ) -> None:
+        _, mock_container = self._run_chat(
+            self._settings(),
+            stop_error=docker_errors.APIError("stop failed"),
+        )
+        # A failed stop must not lose the cleanup either.
+        mock_container.remove.assert_called_once_with(force=True)
+        agent_login.closed.assert_called_once_with(_LOGIN.role)
+
+    def test_chat_turn_tolerates_stop_when_container_is_gone(
+        self,
+        agent_login: SimpleNamespace,
+    ) -> None:
+        _, mock_container = self._run_chat(
+            self._settings(),
+            stop_error=docker_errors.NotFound("no such container"),
+        )
+        # A container already gone is swallowed silently, cleanup still runs.
+        mock_container.remove.assert_called_once_with(force=True)
+        agent_login.closed.assert_called_once_with(_LOGIN.role)

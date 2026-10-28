@@ -245,3 +245,18 @@ async def test_provider_section_shows_the_provider_cost_numbers() -> None:
     # The provider cost API is a blocking call, so the panel fetches it off the loop thread.
     assert lookbacks == [24]
     assert cost_threads and cost_threads[0] != loop_thread
+
+
+async def test_a_chat_record_is_labelled_chat() -> None:
+    record = _record(
+        input_tokens=1,
+        output_tokens=1,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        reasoning_tokens=0,
+    )
+    record.operation_type = "chat"
+
+    _, table = await _render([record])
+
+    assert table.call_args.kwargs["rows"][0]["iteration"] == "chat"

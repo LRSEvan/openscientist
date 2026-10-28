@@ -341,9 +341,10 @@ async def _send_message_via_container(
     """Run one chat turn in a hardened, ephemeral container.
 
     The web side builds the request and (in send_chat_message) persists the chat
-    rows, since it holds the RLS context. The container only reads a request file
-    and writes a reply file in the mounted job_dir, so it touches no database and
-    holds no master key, provider credential, or Docker socket."""
+    rows, since it holds the RLS context. The container reads a request file and
+    writes a reply file in the mounted job_dir, and its own database login,
+    pinned to this job, records the turn's cost. It holds no master key,
+    provider credential, or Docker socket."""
     from openscientist.job_container.runner import JobContainerRunner
 
     request = await _build_chat_request(session, job_id, message)
@@ -367,15 +368,16 @@ async def _send_message_via_container(
         response_path.unlink(missing_ok=True)
 
 
-async def run_chat_turn_async(job_dir: Path, chat_turn: str) -> dict[str, str]:
+async def run_chat_turn_async(job_dir: Path, chat_turn: str, job_id: str) -> dict[str, str]:
     """Container entry point for one chat turn.
 
     Reads the turn's request the web side wrote into job_dir, runs one agent turn
-    with the full toolset (the container holds no secrets to protect), and writes
-    the reply to the turn's response file. Returns a status dict for the
-    entrypoint."""
+    with the full toolset (the container holds no secrets to protect), writes the
+    turn's cost through the container's own database login, and writes the reply
+    to the turn's response file. Returns a status dict for the entrypoint."""
     from openscientist.agent.base import AgentConfig
     from openscientist.agent.factory import build_agent
+    from openscientist.orchestrator.discovery import _CostLedger, _finalize_executor
     from openscientist.providers import get_provider
 
     job_dir = Path(job_dir)
@@ -390,6 +392,8 @@ async def run_chat_turn_async(job_dir: Path, chat_turn: str) -> dict[str, str]:
     executor.apply_runtime_environment()
     executor.write_chat_context()
 
+    ledger = _CostLedger.for_executor(executor, job_id)
+    ledger.begin("chat", None)
     response: dict[str, str] = {}
     try:
         result = await executor.run_iteration(request["prompt"], reset_session=True)
@@ -401,7 +405,7 @@ async def run_chat_turn_async(job_dir: Path, chat_turn: str) -> dict[str, str]:
         logger.error("Chat turn failed: %s", e, exc_info=True)
         response = {"error": str(e)}
     finally:
-        await executor.shutdown()
+        await _finalize_executor(executor, ledger)
 
     response_path.write_text(json.dumps(response))
     return {"status": "completed" if "output" in response else "failed"}

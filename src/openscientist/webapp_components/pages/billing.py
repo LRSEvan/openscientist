@@ -22,11 +22,11 @@ async def render_billing_panel() -> None:
 
 
 def _iteration_label(record: CostRecord) -> str:
-    """The iteration a record covers, "report" for the report phase, and blank
-    for a record that covers a whole run."""
+    """The iteration a record covers, the phase for a report or chat record, and
+    blank for a record that covers a whole run."""
     if record.iteration is not None:
         return str(record.iteration)
-    return "report" if record.operation_type == "report" else ""
+    return record.operation_type if record.operation_type in ("report", "chat") else ""
 
 
 async def _render_db_cost_section() -> None:
