@@ -1,12 +1,15 @@
 """Tests for UI components module."""
 
+import contextlib
 import html
 import re
 from contextlib import suppress
 from pathlib import Path
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from uuid import UUID, uuid4
 
-from openscientist.job_manager import JobStatus
+from openscientist.job_manager import JobManager, JobStatus
 from openscientist.webapp_components.ui_components import (
     OPENSCIENTIST_GITHUB_URL,
     OPENSCIENTIST_PAPER_URL,
@@ -423,3 +426,91 @@ class TestBadgeStylesRegisteredOnceAtBootstrap:
                 render_thinking_status("Searching PubMed...")
 
         mock_add.assert_not_called()
+
+
+class TestRenderDeleteDialog:
+    """The delete dialog loads the job's current state on show, and its confirm
+    handler cancels an active job before deleting it."""
+
+    @staticmethod
+    def _mock_ui() -> MagicMock:
+        def factory(*_args: object, **_kwargs: object) -> MagicMock:
+            element = MagicMock()
+            element.__enter__ = MagicMock(return_value=element)
+            element.__exit__ = MagicMock(return_value=False)
+            element.classes.return_value = element
+            return element
+
+        mock = MagicMock()
+        for name in ("card", "column", "row", "element", "expansion"):
+            setattr(mock, name, factory)
+        return mock
+
+    @staticmethod
+    def _running_manager(job_id: str) -> SimpleNamespace:
+        from openscientist.job.types import JobInfo
+
+        return SimpleNamespace(
+            get_job=AsyncMock(
+                return_value=JobInfo(
+                    job_id=job_id,
+                    research_question="Q?",
+                    status=JobStatus.RUNNING,
+                    created_at="2026-01-01T00:00:00",
+                )
+            ),
+            cancel_job=AsyncMock(),
+            delete_job=AsyncMock(),
+            ACTIVE_STATUSES=JobManager.ACTIVE_STATUSES,
+        )
+
+    async def test_showing_the_dialog_uses_the_job_s_current_state(self):
+        from openscientist.webapp_components.ui_components import render_delete_dialog
+
+        job_id = "12345678-1234-1234-1234-123456789012"
+        mock_ui = self._mock_ui()
+        manager = self._running_manager(job_id)
+        with patch("openscientist.webapp_components.ui_components.ui", mock_ui):
+            dialog = render_delete_dialog(job_id, manager)
+            show_calls = [c for c in dialog.on.call_args_list if c.args and c.args[0] == "show"]
+            assert show_calls, "the dialog must reload its content when shown"
+            await show_calls[0].args[1]()
+
+        # The dialog warns that the running job is cancelled before deletion.
+        labels = [c.args[0] for c in mock_ui.label.call_args_list if c.args]
+        assert "Delete Job" in labels
+        assert "This job is currently active and will be cancelled before deletion." in labels
+        manager.get_job.assert_awaited_once_with(job_id)
+
+    async def test_confirm_cancels_the_active_job_before_deleting_it(self):
+        from openscientist.webapp_components import ui_components as uc
+
+        job_id = str(uuid4())
+        owner = str(uuid4())
+        mock_ui = self._mock_ui()
+        manager = self._running_manager(job_id)
+        deleted = {"value": False}
+        actions: dict[str, object] = {}
+
+        @contextlib.asynccontextmanager
+        async def _admin_session():
+            session = MagicMock()
+            session.get = AsyncMock(return_value=SimpleNamespace(owner_id=UUID(owner)))
+            yield session
+
+        with (
+            patch.object(uc, "ui", mock_ui),
+            patch.object(uc, "get_current_user_id", return_value=owner),
+            patch.object(uc, "get_admin_session", _admin_session),
+            patch.object(
+                uc, "render_dialog_actions", side_effect=lambda **kwargs: actions.update(kwargs)
+            ),
+        ):
+            uc.render_delete_dialog(job_id, manager, on_deleted=lambda: deleted.update(value=True))
+            await actions["on_confirm"]()  # type: ignore[arg-type]
+
+        manager.cancel_job.assert_awaited_once_with(job_id)
+        manager.delete_job.assert_awaited_once_with(job_id)
+        assert deleted["value"] is True
+        messages = [c.args[0] for c in mock_ui.notify.call_args_list if c.args]
+        assert f"Job {job_id[-8:]} deleted successfully" in messages

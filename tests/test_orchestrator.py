@@ -556,6 +556,192 @@ class TestGuardedStatusWrites:
             )
 
 
+class TestDiscoveryCompletion:
+    """A finished run reports the progress persisted in the knowledge state."""
+
+    @staticmethod
+    def _runtime(job_id: str, max_iterations: int) -> dict:
+        return {
+            "job_id": job_id,
+            "research_question": "Question?",
+            "max_iterations": max_iterations,
+            "use_hypotheses": False,
+            "investigation_mode": "autonomous",
+            "data_files": [],
+        }
+
+    @staticmethod
+    def _executor(outcomes: list) -> MagicMock:
+        from openscientist.agent.base import TokenUsage
+
+        executor = MagicMock()
+        executor.total_tokens = TokenUsage()
+        executor.shutdown = AsyncMock()
+        executor.prepare_job_workspace = AsyncMock()
+        executor.warm_model_profile = AsyncMock()
+        executor.run_iteration = AsyncMock(side_effect=outcomes)
+        return executor
+
+    @pytest.mark.asyncio
+    async def test_run_discovery_completes_and_reports_the_persisted_progress(self, tmp_path):
+        from openscientist.agent.base import IterationResult, TurnOutcome
+        from openscientist.knowledge_state import KnowledgeState
+        from openscientist.orchestrator.discovery import run_discovery_async
+
+        job_id = str(uuid4())
+        (tmp_path / job_id).mkdir(parents=True, exist_ok=True)
+
+        ks = KnowledgeState(job_id, "Question?", 3)
+        ks.add_finding("A finding", "evidence")
+        ks.data["iteration"] = 3
+
+        outcomes = [
+            IterationResult(
+                outcome=TurnOutcome.COMPLETED, output="iteration done", tool_calls=0, transcript=[]
+            )
+            for _ in range(3)
+        ]
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._load_runtime_context",
+                new_callable=AsyncMock,
+                return_value=self._runtime(job_id, 3),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=self._executor(outcomes),
+            ) as mock_executor,
+            patch(
+                "openscientist.orchestrator.discovery._run_report_generation_phase",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._persist_final_status",
+                new_callable=AsyncMock,
+                return_value="completed",
+            ),
+            patch("openscientist.orchestrator.discovery.update_job_status", new_callable=AsyncMock),
+            patch("openscientist.orchestrator.discovery._append_iteration_artifacts"),
+            patch("openscientist.orchestrator.discovery._sync_version_metadata"),
+            patch(
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
+                return_value=ks,
+            ),
+            patch("openscientist.orchestrator.discovery.increment_ks_iteration") as mock_increment,
+            patch(
+                "openscientist.orchestrator.discovery._get_job_status",
+                new_callable=AsyncMock,
+                return_value="running",
+                create=True,
+            ),
+        ):
+            result = await run_discovery_async(tmp_path / job_id)
+
+        # Every iteration ran, the persisted iteration counter advanced, and the
+        # result the caller sees carries the knowledge state's own progress.
+        assert mock_executor.return_value.run_iteration.await_count == 3
+        assert mock_increment.await_count == 2
+        assert result == {
+            "job_id": job_id,
+            "status": "completed",
+            "iterations": ks.data["iteration"],
+            "findings": len(ks.data["findings"]),
+        }
+
+    @pytest.mark.asyncio
+    async def test_regenerate_report_completes_and_reports_the_persisted_progress(self, tmp_path):
+        from openscientist.knowledge_state import KnowledgeState
+        from openscientist.orchestrator.discovery import regenerate_report_async
+
+        job_id = str(uuid4())
+        (tmp_path / job_id).mkdir(parents=True, exist_ok=True)
+
+        ks = KnowledgeState(job_id, "Question?", 2)
+        ks.add_finding("A finding", "evidence")
+        ks.data["iteration"] = 2
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._load_runtime_context",
+                new_callable=AsyncMock,
+                return_value=self._runtime(job_id, 2),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=self._executor([]),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._run_report_generation_phase",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._persist_final_status",
+                new_callable=AsyncMock,
+                return_value="completed",
+            ),
+            patch("openscientist.orchestrator.discovery.update_job_status", new_callable=AsyncMock),
+            patch("openscientist.orchestrator.discovery._sync_version_metadata"),
+            patch(
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
+                return_value=ks,
+            ),
+        ):
+            result = await regenerate_report_async(tmp_path / job_id)
+
+        assert result == {
+            "job_id": job_id,
+            "status": "completed",
+            "iterations": ks.data["iteration"],
+            "findings": len(ks.data["findings"]),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_failed_regeneration_still_reports_the_persisted_progress(self, tmp_path):
+        from openscientist.knowledge_state import KnowledgeState
+        from openscientist.orchestrator.discovery import regenerate_report_async
+
+        job_id = str(uuid4())
+        (tmp_path / job_id).mkdir(parents=True, exist_ok=True)
+
+        ks = KnowledgeState(job_id, "Question?", 2)
+        ks.add_finding("A finding", "evidence")
+        ks.data["iteration"] = 2
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._load_runtime_context",
+                new_callable=AsyncMock,
+                return_value=self._runtime(job_id, 2),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=self._executor([]),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._run_report_generation_phase",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("report exploded"),
+            ),
+            patch("openscientist.orchestrator.discovery.update_job_status", new_callable=AsyncMock),
+            patch("openscientist.orchestrator.discovery._sync_version_metadata"),
+            patch(
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
+                return_value=ks,
+            ),
+        ):
+            result = await regenerate_report_async(tmp_path / job_id)
+
+        # The caller still learns the persisted progress behind the failure.
+        assert result == {
+            "job_id": job_id,
+            "status": "failed",
+            "iterations": ks.data["iteration"],
+            "findings": len(ks.data["findings"]),
+            "error": "report exploded",
+        }
+
+
 # ─── increment_ks_iteration ──────────────────────────────────────────
 
 

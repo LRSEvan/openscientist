@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -99,3 +100,68 @@ class TestDownloadArtifactsZipStreamsOverHttp:
             job_detail._download_artifacts_zip("job-1")
 
         mock_ui.download.assert_called_once_with("/web/jobs/job-1/artifacts.zip")
+
+
+class TestDownloadPdfReport:
+    """The report PDF is rendered off the event loop and handed to the browser."""
+
+    async def test_pdf_render_runs_off_the_loop_and_downloads_the_file(self, tmp_path) -> None:
+        report_path = tmp_path / "final_report.md"
+        report_path.write_text("# Report\n\nSome text", encoding="utf-8")
+        pdf_path = tmp_path / "final_report.pdf"
+
+        loop_thread = threading.get_ident()
+        render_threads: list[int] = []
+
+        def fake_markdown_to_pdf(source, target) -> None:
+            render_threads.append(threading.get_ident())
+            target.write_bytes(b"PDF-CONTENT")
+
+        with (
+            patch.object(job_detail, "ui") as mock_ui,
+            patch.object(job_detail, "markdown_to_pdf", side_effect=fake_markdown_to_pdf),
+        ):
+            await job_detail._download_pdf_report(report_path, pdf_path, "job-9")
+
+        mock_ui.download.assert_called_once_with(b"PDF-CONTENT", filename="job-9_report.pdf")
+        assert not (tmp_path / "_final_report_stripped.md").exists()
+        # Rendering a long report takes seconds of CPU, so it must not run on the loop thread.
+        assert render_threads and render_threads[0] != loop_thread
+
+
+class TestRegenerateConfirmDialog:
+    """The confirmation dialog's Regenerate button runs the admin action."""
+
+    async def test_confirm_closes_the_dialog_and_launches_the_action(self) -> None:
+        context = SimpleNamespace(
+            job_id="job-1",
+            job_info=SimpleNamespace(status=JobStatus.COMPLETED),
+            job_manager=SimpleNamespace(regenerate_report=AsyncMock()),
+        )
+
+        def _ctx_factory():
+            element = MagicMock()
+            element.__enter__ = MagicMock(return_value=element)
+            element.__exit__ = MagicMock(return_value=False)
+            element.classes.return_value = element
+            return element
+
+        mock_ui = MagicMock()
+        for name in ("card", "row", "column"):
+            setattr(mock_ui, name, _ctx_factory)
+
+        with (
+            patch.object(job_detail, "ui", mock_ui),
+            patch.object(job_detail, "is_current_user_admin", return_value=True),
+        ):
+            job_detail._confirm_regenerate_report(context)  # type: ignore[arg-type]
+            regenerate = [
+                c for c in mock_ui.button.call_args_list if c.args and c.args[0] == "Regenerate"
+            ][0]
+            await regenerate.kwargs["on_click"]()
+
+        context.job_manager.regenerate_report.assert_awaited_once_with("job-1")  # type: ignore[attr-defined]
+        mock_ui.notify.assert_called_with(
+            "Regenerating report. This page will update when it finishes.", type="positive"
+        )
+        mock_ui.navigate.to.assert_called_once_with("/job/job-1")

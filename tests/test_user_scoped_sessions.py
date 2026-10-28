@@ -6,7 +6,8 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -208,3 +209,127 @@ async def test_a_users_rights_on_the_job_page_follow_their_share(
     assert await job_detail._resolve_job_permissions(
         alices_job.job_id, str(alices_job.owner), own
     ) == (True, True)
+
+
+_PAGE_UI_KINDS = (
+    "card",
+    "column",
+    "row",
+    "element",
+    "expansion",
+    "scroll_area",
+    "tabs",
+    "tab",
+    "tab_panels",
+    "tab_panel",
+    "dialog",
+    "textarea",
+    "button",
+)
+
+
+def _page_ui_mock() -> tuple[MagicMock, dict[str, list[MagicMock]]]:
+    """A NiceGUI stand-in: container elements are context managers, and every
+    element is recorded per kind so tests can reach widget state."""
+    created: dict[str, list[MagicMock]] = {}
+
+    def make(kind: str):
+        def factory(*_args: object, **_kwargs: object) -> MagicMock:
+            element = MagicMock()
+            element.__enter__ = MagicMock(return_value=element)
+            element.__exit__ = MagicMock(return_value=False)
+            element.classes.return_value = element
+            created.setdefault(kind, []).append(element)
+            return element
+
+        return MagicMock(side_effect=factory)
+
+    mock = MagicMock()
+    for kind in _PAGE_UI_KINDS:
+        setattr(mock, kind, make(kind))
+    return mock, created
+
+
+@pytest.mark.asyncio
+async def test_the_job_page_follows_the_job_from_feedback_to_completion(
+    alices_job: _Fixture, test_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    from openscientist.auth import middleware
+    from openscientist.job.types import JobInfo, JobStatus
+    from openscientist.job_manager import JobManager
+    from openscientist.webapp_components.utils import client_guard
+
+    job_id = alices_job.job_id
+    mock_ui, created = _page_ui_mock()
+    job_info = JobInfo(
+        job_id=job_id,
+        research_question="Alice's question",
+        status=JobStatus.AWAITING_FEEDBACK,
+        created_at="2026-01-01T00:00:00+00:00",
+        started_at="2026-01-02T00:00:00+00:00",
+    )
+    manager = SimpleNamespace(
+        jobs_dir=tmp_path,
+        get_job=AsyncMock(return_value=job_info),
+        cancel_job=AsyncMock(),
+        delete_job=AsyncMock(),
+        ACTIVE_STATUSES=JobManager.ACTIVE_STATUSES,
+    )
+    storage: dict[str, object] = {
+        "session_token": "test-token",
+        "user_id": str(alices_job.owner),
+        "email": "alice@scoped.test",
+        "name": "Alice",
+        "is_admin": False,
+        "is_approved": True,
+        "can_start_jobs": True,
+        "authenticated": True,
+    }
+    fake_app = SimpleNamespace(storage=SimpleNamespace(user=storage))
+
+    async def _validated(_token: str) -> dict[str, object]:
+        return {
+            "user_id": str(alices_job.owner),
+            "email": "alice@scoped.test",
+            "name": "Alice",
+            "is_admin": False,
+            "is_approved": True,
+            "can_start_jobs": True,
+        }
+
+    with (
+        patch("openscientist.web_app.get_job_manager", return_value=manager),
+        patch.object(job_detail, "ui", mock_ui),
+        patch("openscientist.webapp_components.ui_components.ui", mock_ui),
+        patch("openscientist.webapp_components.ui_components.app", fake_app),
+        patch.object(client_guard, "is_client_connected", return_value=True),
+        patch.object(client_guard, "ui", mock_ui),
+        patch.object(middleware, "app", fake_app),
+        patch.object(middleware, "_get_session_token", return_value="test-token"),
+        patch.object(middleware, "validate_session", _validated),
+    ):
+        # Alice opens her job's page: the page renders with the feedback panel.
+        await job_detail.job_detail_page(job_id)
+        labels = [c.args[0] for c in mock_ui.label.call_args_list if c.args]
+        assert "Iteration 1 Complete - Awaiting Your Input" in labels
+        assert mock_ui.page_title.called
+
+        # Alice types feedback and clicks "Submit & Continue": the feedback is
+        # persisted and the job resumes running.
+        created["textarea"][0].value = "Recheck the evidence"
+        submit = [
+            c for c in mock_ui.button.call_args_list if c.args and c.args[0] == "Submit & Continue"
+        ][0].kwargs["on_click"]
+        await submit()
+        assert await _feedback(job_id) == ["Recheck the evidence"]
+        assert await _status(test_engine, job_id) == "running"
+
+        # The poll timer follows the job: once it completes, the page reloads.
+        poll = mock_ui.timer.call_args_list[0].args[1]
+        async with test_engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE jobs SET status = 'completed' WHERE id = :id"), {"id": job_id}
+            )
+        await poll()
+        mock_ui.navigate.to.assert_called_with(f"/job/{job_id}")
+        mock_ui.timer.return_value.deactivate.assert_called()

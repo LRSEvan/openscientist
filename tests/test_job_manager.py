@@ -1,6 +1,7 @@
 """Tests for job_manager module."""
 
 import asyncio
+import threading
 from collections.abc import Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
@@ -686,6 +687,99 @@ class TestJobManagerCreationSafety:
         assert kwargs["llm_provider"] == "anthropic"
         assert kwargs["llm_config"] == {"model": "claude-sonnet-4-5"}
 
+    async def test_create_job_with_auto_start_launches_the_job_off_the_loop(self, tmp_path):
+        manager = _new_manager(tmp_path)
+        job_id = str(uuid4())
+        created_job = JobInfo(
+            job_id=job_id,
+            research_question="Start me",
+            status=JobStatus.PENDING,
+            created_at="2026-01-01T00:00:00",
+        )
+        settings = SimpleNamespace(
+            provider=SimpleNamespace(
+                provider_id="Anthropic",
+                model=None,
+                anthropic_default_sonnet_model="claude-sonnet-4-5",
+            )
+        )
+        starts: list[tuple[str, int]] = []
+
+        def record_start(jid: str) -> None:
+            starts.append((jid, threading.get_ident()))
+
+        loop_thread = threading.get_ident()
+
+        with (
+            patch.object(
+                manager, "get_job", new_callable=AsyncMock, side_effect=[None, created_job]
+            ),
+            patch.object(manager, "_check_budget_before_creation"),
+            patch.object(manager, "_create_job_files"),
+            patch("openscientist.settings.get_settings", return_value=settings),
+            patch.object(manager, "_create_db_job_record", new_callable=AsyncMock),
+            patch.object(manager, "start_job", side_effect=record_start),
+        ):
+            info = await manager.create_job(
+                job_id=job_id,
+                research_question="Start me",
+                data_files=[],
+                auto_start=True,
+            )
+
+        assert info is created_job
+        # An auto-started job is started, and its DB-bound launch runs off the loop thread.
+        assert starts == [(job_id, starts[0][1])]
+        assert starts[0][1] != loop_thread
+
+
+class TestJobManagerSummary:
+    """Tests for the job summary."""
+
+    async def test_get_job_summary_counts_statuses_and_pulls_cost_off_the_loop(self, tmp_path):
+        manager = _new_manager(tmp_path)
+        db_jobs = [
+            _make_db_job("completed", "2026-02-01T00:00:00"),
+            _make_db_job("running", "2026-02-02T00:00:00"),
+        ]
+        loop_thread = threading.get_ident()
+        cost_threads: list[int] = []
+        seen_lookbacks: list[int] = []
+
+        def fake_get_cost_info(lookback_hours: int = 24):
+            seen_lookbacks.append(lookback_hours)
+            cost_threads.append(threading.get_ident())
+            return SimpleNamespace(total_spend_usd=12.5)
+
+        fake_provider = SimpleNamespace(
+            get_cost_info=fake_get_cost_info,
+            evaluate_budget=lambda info: {"errors": [], "warnings": []},
+        )
+
+        with (
+            patch(
+                "openscientist.job_manager._db_list_jobs",
+                new_callable=AsyncMock,
+                return_value=db_jobs,
+            ),
+            patch(
+                "openscientist.job_manager._load_progress",
+                new_callable=AsyncMock,
+                return_value=(0, 0),
+            ),
+            patch("openscientist.job_manager.get_provider", return_value=fake_provider),
+        ):
+            summary = await manager.get_job_summary()
+
+        assert summary["total_jobs"] == 2
+        assert summary["status_counts"]["completed"] == 1
+        assert summary["status_counts"]["running"] == 1
+        assert summary["cost_info"].total_spend_usd == 12.5
+        assert summary["budget_check"] == {"errors": [], "warnings": []}
+        # The provider's blocking cost call runs on a worker thread, with the 24h window.
+        assert seen_lookbacks == [24]
+        assert cost_threads and cost_threads[0] != loop_thread
+
 
 class TestJobManagerCLI:
     """Tests for job_manager CLI argument handling."""
@@ -715,6 +809,79 @@ class TestJobManagerCLI:
         )
         stdout = capsys.readouterr().out
         assert '"created_jobs": 1' in stdout
+
+    def test_list_command_prints_the_job_table(self, monkeypatch, capsys):
+        from openscientist.job_manager import main
+
+        job_info = JobInfo(
+            job_id="j-1234",
+            research_question="Q?",
+            status=JobStatus.RUNNING,
+            created_at="2026-01-01T00:00:00",
+        )
+        fake = MagicMock()
+        fake.list_jobs = AsyncMock(return_value=[job_info])
+        monkeypatch.setattr("openscientist.job_manager.JobManager", MagicMock(return_value=fake))
+        monkeypatch.setattr("sys.argv", ["job_manager.py", "list"])
+
+        main()
+
+        fake.list_jobs.assert_awaited_once_with(status=None, limit=None)
+        stdout = capsys.readouterr().out
+        assert "j-1234" in stdout
+        assert "running" in stdout
+
+    def test_get_command_prints_the_job_json(self, monkeypatch, capsys):
+        from openscientist.job_manager import main
+
+        job_id = str(uuid4())
+        job_info = JobInfo(
+            job_id=job_id,
+            research_question="Q?",
+            status=JobStatus.COMPLETED,
+            created_at="2026-01-01T00:00:00",
+        )
+        fake = MagicMock()
+        fake.get_job = AsyncMock(return_value=job_info)
+        monkeypatch.setattr("openscientist.job_manager.JobManager", MagicMock(return_value=fake))
+        monkeypatch.setattr("sys.argv", ["job_manager.py", "get", job_id])
+
+        main()
+
+        fake.get_job.assert_awaited_once_with(job_id)
+        assert f'"job_id": "{job_id}"' in capsys.readouterr().out
+
+    def test_delete_command_deletes_the_job(self, monkeypatch, capsys):
+        from openscientist.job_manager import main
+
+        job_id = str(uuid4())
+        fake = MagicMock()
+        fake.delete_job = AsyncMock()
+        monkeypatch.setattr("openscientist.job_manager.JobManager", MagicMock(return_value=fake))
+        monkeypatch.setattr("sys.argv", ["job_manager.py", "delete", job_id])
+
+        main()
+
+        fake.delete_job.assert_awaited_once_with(job_id)
+        assert f"Deleted job {job_id}" in capsys.readouterr().out
+
+    def test_summary_command_prints_the_counts(self, monkeypatch, capsys):
+        from openscientist.job_manager import main
+
+        summary = {
+            "total_jobs": 3,
+            "status_counts": {"running": 1},
+            "cost_info": None,
+            "budget_check": None,
+        }
+        fake = MagicMock()
+        fake.get_job_summary = AsyncMock(return_value=summary)
+        monkeypatch.setattr("openscientist.job_manager.JobManager", MagicMock(return_value=fake))
+        monkeypatch.setattr("sys.argv", ["job_manager.py", "summary"])
+
+        main()
+
+        assert '"total_jobs": 3' in capsys.readouterr().out
 
 
 class TestEffectiveModel:

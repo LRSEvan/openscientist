@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from openscientist.auth import middleware
 
 
@@ -85,6 +87,16 @@ async def test_require_auth_accepts_valid_session_and_populates_storage(monkeypa
     assert storage["is_approved"] is False
     assert storage["can_start_jobs"] is True
     fake_ui.navigate.to.assert_not_called()
+
+
+def test_require_auth_refuses_a_sync_page():
+    """A sync page would check the session on the event loop, so the decorator refuses it."""
+
+    def sync_page() -> None:
+        pass
+
+    with pytest.raises(TypeError, match="require_auth needs an async page"):
+        middleware.require_auth(sync_page)
 
 
 def test_can_current_user_start_jobs_uses_approval_or_admin_fallback(monkeypatch):
