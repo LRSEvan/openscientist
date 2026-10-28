@@ -7,6 +7,8 @@ import threading
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from functools import partial
+from pathlib import Path
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -22,6 +24,7 @@ from openscientist.database.session import (
     thread_safe_admin_session,
     thread_safe_user_session,
 )
+from openscientist.job_manager import JobManager
 
 Opener = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
@@ -115,5 +118,27 @@ async def test_run_sync_calls_in_a_thread_loop_share_a_connection_until_it_ends(
             return [run_sync(_pid_in_new_session()) for _ in range(2)]
 
     pids = await asyncio.wait_for(asyncio.to_thread(job_thread), timeout=30)
+    assert pids[0] == pids[1]
+    assert not await _is_connected(test_engine, pids[0])
+
+
+async def test_a_job_shares_one_pooled_connection_until_it_finishes(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    manager = JobManager(jobs_dir=tmp_path)
+    pids: list[int] = []
+
+    def container(_job_id: str, run_mode: str = "discovery") -> None:
+        pids.extend(run_sync(_pid_in_new_session()) for _ in range(2))
+
+    # Finishing a job starts the next queued one, which would be another test's.
+    with (
+        patch.object(manager, "_run_job_in_container", side_effect=container),
+        patch.object(manager, "_start_next_queued_job"),
+    ):
+        await asyncio.wait_for(asyncio.to_thread(manager._run_job, "job-1"), timeout=30)
+
+    assert len(pids) == 2
     assert pids[0] == pids[1]
     assert not await _is_connected(test_engine, pids[0])

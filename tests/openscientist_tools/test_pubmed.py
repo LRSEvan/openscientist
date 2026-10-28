@@ -17,7 +17,9 @@ from sqlalchemy import delete
 
 from openscientist.database import AsyncSessionLocal
 from openscientist.database.models.job import Job
+from openscientist.database.models.pubmed_article import PubMedArticle
 from openscientist.knowledge_state import KnowledgeState
+from openscientist.settings import get_settings
 from openscientist_tools.pubmed import search_pubmed
 from openscientist_tools.state import STATE
 
@@ -140,6 +142,43 @@ def test_parse_pubmed_xml_title_with_inline_markup() -> None:
     )
     papers = _parse_pubmed_xml(xml, ["1"])
     assert papers[0]["title"] == "LAMA5 links matrix to a niche."
+
+
+async def test_airgap_search_reads_the_local_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+    test_database_url: str,
+    _apply_migrations_once: None,
+    patched_ks_persistence: KnowledgeState,
+) -> None:
+    async with AsyncSessionLocal() as session:
+        session.add(
+            PubMedArticle(
+                pmid=72613445,
+                title="CRISPR gene editing in mice",
+                abstract="A study of CRISPR off-target effects.",
+                authors="Doe",
+                journal="Nature",
+                year=2020,
+            )
+        )
+        await session.commit()
+    try:
+        monkeypatch.setattr(get_settings().airgap, "enabled", True)
+        result = await search_pubmed(query="crispr", max_results=5)
+    finally:
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(PubMedArticle).where(PubMedArticle.pmid == 72613445))
+            await session.commit()
+
+    assert result.startswith("Found 1 papers for query: 'crispr'")
+    assert "CRISPR gene editing in mice" in result
+    assert "PMID: 72613445" in result
+    literature = patched_ks_persistence.data["literature"]
+    assert len(literature) == 1
+    assert literature[0]["pmid"] == "72613445"
+    last_log = patched_ks_persistence.data["analysis_log"][-1]
+    assert last_log["action"] == "search_pubmed"
+    assert last_log["results_count"] == 1
 
 
 # Opt-in: this is the only test here that calls NCBI for real, and NCBI rate
