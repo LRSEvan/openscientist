@@ -182,6 +182,7 @@ async def test_an_unexpected_validation_error_is_not_treated_as_an_outage(
     """A non-connection error is not an outage and not a sign-out, so it
     reaches the caller instead of being dressed up as either."""
     ran = False
+    stored = dict(visitor)
 
     async def page() -> None:
         nonlocal ran
@@ -196,7 +197,9 @@ async def test_an_unexpected_validation_error_is_not_treated_as_an_outage(
     assert not ran
     # no "database unreachable" screen
     middleware.ui.button.assert_not_called()  # type: ignore[attr-defined]
+    assert call(_OUTAGE) not in middleware.ui.label.call_args_list  # type: ignore[attr-defined]
     middleware.ui.navigate.to.assert_not_called()  # type: ignore[attr-defined]
+    assert visitor == stored
 
 
 async def _session_exists(test_engine: AsyncEngine, token: UUID) -> bool:
