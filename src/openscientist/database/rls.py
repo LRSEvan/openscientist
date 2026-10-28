@@ -5,12 +5,12 @@ Provides middleware and utilities for PostgreSQL Row-Level Security enforcement.
 RLS policies control access to database rows based on the current user context.
 """
 
-from typing import Any
+from collections.abc import Collection
 from uuid import UUID
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from sqlalchemy.orm import Session, SessionTransaction
 
 #: The role user sessions run as. The policies on user data are written for it.
@@ -67,81 +67,16 @@ async def set_current_user(session: AsyncSession, user_id: UUID | None) -> None:
         )
 
 
-async def verify_rls_enabled(session: AsyncSession, table_name: str) -> bool:
-    """
-    Check if RLS is enabled on a specific table.
-
-    Useful for debugging and verification during development and testing.
-
-    Args:
-        session: SQLAlchemy async session
-        table_name: Name of the table to check
-
-    Returns:
-        True if RLS is enabled on the table, False otherwise
-
-    Example:
-        >>> async with get_session_ctx() as session:
-        ...     is_protected = await verify_rls_enabled(session, "jobs")
-        ...     print(f"Jobs table RLS: {is_protected}")
-    """
-    result = await session.execute(
+async def tables_without_enforced_rls(conn: AsyncConnection, tables: Collection[str]) -> list[str]:
+    """The tables among ``tables`` that are missing from the public schema, or
+    whose RLS is not both enabled and forced, sorted by name."""
+    result = await conn.execute(
         text(
-            """
-            SELECT relrowsecurity
-            FROM pg_class
-            WHERE relname = :table_name
-        """
+            "SELECT relname FROM pg_class"
+            " WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'"
+            " AND relrowsecurity AND relforcerowsecurity AND relname = ANY(:tables)"
         ),
-        {"table_name": table_name},
+        {"tables": list(tables)},
     )
-    row = result.first()
-    return row is not None and row[0] is True
-
-
-async def list_rls_policies(session: AsyncSession, table_name: str) -> list[dict[str, Any]]:
-    """
-    List all RLS policies defined on a table.
-
-    Returns detailed information about each policy including name, command,
-    and definition. Useful for debugging and documentation.
-
-    Args:
-        session: SQLAlchemy async session
-        table_name: Name of the table to check
-
-    Returns:
-        List of dictionaries containing policy information
-
-    Example:
-        >>> async with get_session_ctx() as session:
-        ...     policies = await list_rls_policies(session, "jobs")
-        ...     for policy in policies:
-        ...         print(f"{policy['name']}: {policy['cmd']}")
-    """
-    result = await session.execute(
-        text(
-            """
-            SELECT
-                polname as name,
-                polcmd as cmd,
-                pg_get_expr(polqual, polrelid) as using_expr,
-                pg_get_expr(polwithcheck, polrelid) as check_expr
-            FROM pg_policy
-            JOIN pg_class ON pg_class.oid = pg_policy.polrelid
-            WHERE pg_class.relname = :table_name
-            ORDER BY polname
-        """
-        ),
-        {"table_name": table_name},
-    )
-
-    return [
-        {
-            "name": row[0],
-            "cmd": row[1],  # '*' (ALL), 'r' (SELECT), 'w' (UPDATE), 'a' (INSERT), 'd' (DELETE)
-            "using": row[2],
-            "check": row[3],
-        }
-        for row in result
-    ]
+    enforced = set(result.scalars())
+    return sorted(set(tables) - enforced)
