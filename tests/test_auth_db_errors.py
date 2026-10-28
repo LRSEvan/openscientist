@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 from uuid import UUID, uuid4
 
 import pytest
@@ -48,6 +49,7 @@ def visitor(session_token: UUID, monkeypatch: pytest.MonkeyPatch) -> dict[str, o
     ui = MagicMock()
     ui.context.client.request.cookies = {"session_token": str(session_token)}
     ui.context.client.page.path = "/jobs"
+    ui.context.client.page.response_timeout = _RESPONSE_TIMEOUT
     monkeypatch.setattr(middleware, "app", SimpleNamespace(storage=SimpleNamespace(user=storage)))
     monkeypatch.setattr(middleware, "ui", ui)
     return storage
@@ -68,6 +70,65 @@ async def test_a_page_during_an_outage_keeps_the_visitor_signed_in(
     assert not ran
     assert visitor == stored
     middleware.ui.navigate.to.assert_not_called()  # type: ignore[attr-defined]
+
+
+_RESPONSE_TIMEOUT = 1.5
+_OUTAGE = "OpenScientist cannot reach its database right now."
+
+
+async def _build_within_test_bound(page: Callable[[], Awaitable[None]]) -> float:
+    """Build ``page`` through ``require_auth``, returning how long it took. The
+    test fails, instead of waiting out asyncpg's 60 s connect timeout, when the
+    build has no bound of its own."""
+    started = time.monotonic()
+    await asyncio.wait_for(middleware.require_auth(page)(), timeout=10)
+    return time.monotonic() - started
+
+
+async def test_a_page_while_the_database_hangs_shows_the_outage_page_in_time(
+    database: Forwarder, visitor: dict[str, object]
+) -> None:
+    ran = False
+
+    async def page() -> None:
+        nonlocal ran
+        ran = True
+
+    stored = dict(visitor)
+    database.hang()
+    took = await _build_within_test_bound(page)
+    assert took < _RESPONSE_TIMEOUT
+    assert not ran
+    middleware.ui.label.assert_any_call(_OUTAGE)  # type: ignore[attr-defined]
+    assert visitor == stored
+
+
+async def test_a_hang_after_the_session_check_also_shows_the_outage_page(
+    database: Forwarder, visitor: dict[str, object]
+) -> None:
+    finished = False
+
+    async def page() -> None:
+        nonlocal finished
+        database.hang()
+        await middleware.validate_session(str(visitor["session_token"]))
+        finished = True
+
+    took = await _build_within_test_bound(page)
+    assert took < _RESPONSE_TIMEOUT
+    assert not finished
+    middleware.ui.label.assert_any_call(_OUTAGE)  # type: ignore[attr-defined]
+
+
+async def test_a_timeout_raised_by_the_page_itself_is_not_an_outage(
+    database: Forwarder, visitor: dict[str, object]
+) -> None:
+    async def page() -> None:
+        raise TimeoutError("the page's own deadline")
+
+    with pytest.raises(TimeoutError, match="the page's own deadline"):
+        await middleware.require_auth(page)()
+    assert call(_OUTAGE) not in middleware.ui.label.call_args_list  # type: ignore[attr-defined]
 
 
 async def test_a_signed_in_visitor_reaches_the_page(
@@ -106,6 +167,7 @@ async def test_a_visitor_with_a_garbage_token_is_sent_to_login(
     ui = MagicMock()
     ui.context.client.request.cookies = {"session_token": token}
     ui.context.client.page.path = "/jobs"
+    ui.context.client.page.response_timeout = _RESPONSE_TIMEOUT
     monkeypatch.setattr(middleware, "app", SimpleNamespace(storage=SimpleNamespace(user=storage)))
     monkeypatch.setattr(middleware, "ui", ui)
     await middleware.require_auth(page)()
@@ -120,6 +182,7 @@ async def test_an_unexpected_validation_error_is_not_treated_as_an_outage(
     """A non-connection error is not an outage and not a sign-out, so it
     reaches the caller instead of being dressed up as either."""
     ran = False
+    stored = dict(visitor)
 
     async def page() -> None:
         nonlocal ran
@@ -134,7 +197,9 @@ async def test_an_unexpected_validation_error_is_not_treated_as_an_outage(
     assert not ran
     # no "database unreachable" screen
     middleware.ui.button.assert_not_called()  # type: ignore[attr-defined]
+    assert call(_OUTAGE) not in middleware.ui.label.call_args_list  # type: ignore[attr-defined]
     middleware.ui.navigate.to.assert_not_called()  # type: ignore[attr-defined]
+    assert visitor == stored
 
 
 async def _session_exists(test_engine: AsyncEngine, token: UUID) -> bool:

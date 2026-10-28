@@ -5,6 +5,7 @@ Provides authentication decorators and user context management.
 Supports cookie-backed session authentication.
 """
 
+import asyncio
 import inspect
 import logging
 from collections.abc import Callable
@@ -22,6 +23,10 @@ from openscientist.database.retry import is_connection_error
 from openscientist.database.session import get_admin_session
 
 logger = logging.getLogger(__name__)
+
+#: How much of a page's ``response_timeout`` is kept for sending the outage
+#: page after a build that the database held up.
+_OUTAGE_PAGE_SECONDS = 0.5
 
 
 async def get_current_user(db: AsyncSession, session_token: str) -> User | None:
@@ -139,7 +144,11 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
     Decorator to require authentication for a page.
 
     Checks for valid session token (from cookie or storage), validates it against
-    the database, and redirects to login if not authenticated.
+    the database, and redirects to login if not authenticated. A database that
+    accepts connects but never answers raises nothing within the page's
+    ``response_timeout``, after which NiceGUI serves its own error page, so the
+    session check and the page run under a deadline just inside it and the
+    outage page shows when it expires.
 
     Args:
         func: Async page function to protect. A sync page would run its session
@@ -163,27 +172,44 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
             _redirect_to_login()
             return None
 
-        # Validate session against database
+        page = ui.context.client.page
+        deadline = page.response_timeout - _OUTAGE_PAGE_SECONDS
         try:
-            user_info = await validate_session(session_token)
-        except Exception as e:
-            if not is_connection_error(e):
+            async with asyncio.timeout(deadline) as build:
+                return await _build_signed_in(session_token, func, *args, **kwargs)
+        except TimeoutError:
+            if not build.expired():
                 raise
-            logger.error("Database unreachable while checking a session: %s", e)
-            _show_database_unavailable()
-            return None
-        if not user_info:
-            logger.debug("Invalid session token, redirecting to login")
-            _redirect_to_login(clear_storage=True)
-            return None
-
-        # Store user info in app.storage.user for easy access
-        _store_authenticated_user(session_token, user_info)
-
-        # Call the decorated function
-        return await func(*args, **kwargs)
+        logger.error(
+            "The database did not answer within %.1f s while building %s", deadline, page.path
+        )
+        ui.context.client.content.clear()
+        _show_database_unavailable()
+        return None
 
     return async_wrapper
+
+
+async def _build_signed_in(
+    session_token: str, func: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Build ``func``'s page for the visitor holding ``session_token``, or the
+    login redirect or outage page in its place."""
+    try:
+        user_info = await validate_session(session_token)
+    except Exception as e:
+        if not is_connection_error(e):
+            raise
+        logger.error("Database unreachable while checking a session: %s", e)
+        _show_database_unavailable()
+        return None
+    if not user_info:
+        logger.debug("Invalid session token, redirecting to login")
+        _redirect_to_login(clear_storage=True)
+        return None
+
+    _store_authenticated_user(session_token, user_info)
+    return await func(*args, **kwargs)
 
 
 def get_current_user_id() -> str | None:
