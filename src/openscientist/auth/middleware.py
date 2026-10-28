@@ -258,16 +258,6 @@ def is_current_user_admin() -> bool:
     return bool(app.storage.user.get("is_admin", False))
 
 
-def is_current_user_approved() -> bool:
-    """
-    Check if the current authenticated user is approved to start jobs.
-
-    Returns:
-        True if approved, False otherwise
-    """
-    return bool(app.storage.user.get("is_approved", False))
-
-
 def can_current_user_start_jobs() -> bool:
     """
     Check if the current user can start jobs.
