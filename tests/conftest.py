@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -38,6 +39,7 @@ from tests.db_logins import (
     reset_database_state,
     run_bootstrap,
 )
+from tests.db_outage import Forwarder
 
 
 # Clear any cached settings after environment setup
@@ -218,9 +220,9 @@ def test_database_url(postgres_container: PostgresContainer | None) -> str:
     1. TEST_DATABASE_URL if explicitly set
     2. Testcontainer PostgreSQL (auto-started)
 
-    Also propagates the real URL to env/settings so that code paths using
-    AsyncSessionLocal(thread_safe=True) connect to the testcontainer DB
-    instead of the dummy placeholder URL set at import time.
+    Also propagates the real URL to env/settings so that the app's own sessions
+    connect to the testcontainer DB instead of the dummy placeholder URL set at
+    import time.
     """
     # Check for explicit test database URL
     test_url = os.getenv("TEST_DATABASE_URL")
@@ -237,22 +239,12 @@ def test_database_url(postgres_container: PostgresContainer | None) -> str:
         sync_url: str = postgres_container.get_connection_url()
         url = sync_url.replace("postgresql+psycopg2://", "postgresql+asyncpg://")
 
-    # Propagate the real URL so thread-safe session factories connect correctly
+    # Propagate the real URL to the app's sessions
     os.environ["DATABASE_URL"] = url
     os.environ["ADMIN_DATABASE_URL"] = login_url(url, "openscientist_admin", ADMIN_PASSWORD)
     from openscientist.settings import clear_settings_cache
 
     clear_settings_cache()
-
-    # Reset engine/session factory globals so they pick up the new URL
-    import openscientist.database.engine as engine_mod
-    import openscientist.database.session as session_mod
-
-    engine_mod._engine = None
-    engine_mod._admin_engine = None
-    session_mod._session_factory = None
-    session_mod._admin_session_factory = None
-
     return url
 
 
@@ -308,6 +300,24 @@ async def test_engine(
 
     yield engine
     await engine.dispose()
+
+
+@pytest.fixture
+def database(test_engine: AsyncEngine) -> Generator[Forwarder, None, None]:
+    """Point every app login at a forwarder to the test database, which starts
+    up. ``database.down()`` refuses connects until ``database.up()``."""
+    names = ("DATABASE_URL", "ADMIN_DATABASE_URL")
+    saved = {name: os.environ[name] for name in names}
+    target = make_url(saved["DATABASE_URL"])
+    forwarder = Forwarder((target.host or "127.0.0.1", target.port or 5432))
+    for name in names:
+        url = make_url(saved[name]).set(host="127.0.0.1", port=forwarder.port)
+        os.environ[name] = url.render_as_string(hide_password=False)
+    reset_database_state()
+    yield forwarder
+    forwarder.down()
+    os.environ.update(saved)
+    reset_database_state()
 
 
 @pytest_asyncio.fixture

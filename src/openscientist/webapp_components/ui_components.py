@@ -1999,14 +1999,10 @@ def render_delete_dialog(
     with ui.dialog() as dialog, ui.card().classes("w-96"):
         content_container = ui.column().classes("w-full")
 
-        @ui.refreshable
-        def render_dialog_content() -> None:
+        async def render_dialog_content() -> None:
+            job_info = await job_manager.get_job(job_id)
+            is_active = job_info and job_info.status in job_manager.ACTIVE_STATUSES
             content_container.clear()
-            job_info = job_manager.get_job(job_id)
-            is_active = job_info and job_info.status in [
-                JobStatus.RUNNING,
-                JobStatus.QUEUED,
-            ]
 
             with content_container:
                 ui.label("Delete Job").classes("text-h6 font-bold")
@@ -2024,8 +2020,6 @@ def render_delete_dialog(
                     "This action cannot be undone. All job data and findings will be permanently deleted."
                 ).classes("text-caption text-red-600")
 
-        render_dialog_content()
-
         async def on_confirm() -> None:
             dialog.close()
             try:
@@ -2041,14 +2035,11 @@ def render_delete_dialog(
                     return
 
                 # Check if job needs to be cancelled first
-                job_info = job_manager.get_job(job_id)
-                if job_info and job_info.status in [
-                    JobStatus.RUNNING,
-                    JobStatus.QUEUED,
-                ]:
-                    job_manager.cancel_job(job_id)
+                job_info = await job_manager.get_job(job_id)
+                if job_info and job_info.status in job_manager.ACTIVE_STATUSES:
+                    await job_manager.cancel_job(job_id)
 
-                job_manager.delete_job(job_id)
+                await job_manager.delete_job(job_id)
                 short_id = job_id[-8:] if len(job_id) > 8 else job_id
                 ui.notify(f"Job {short_id} deleted successfully", type="positive")
                 if on_deleted:
@@ -2070,8 +2061,8 @@ def render_delete_dialog(
             confirm_props="color=negative",
         )
 
-        # Refresh content when dialog opens to show current job status
-        dialog.on_value_change(lambda e: render_dialog_content.refresh() if e.value else None)
+        # Load the content each time the dialog opens, to show the current job status
+        dialog.on("show", render_dialog_content)
 
     return dialog
 

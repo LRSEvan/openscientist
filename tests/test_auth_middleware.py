@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from openscientist.auth import middleware
 
 
@@ -26,8 +28,8 @@ def _make_fake_context(session_token: str | None = None):
     return fake_app, fake_ui, storage
 
 
-def test_require_auth_sync_rejects_invalid_cookie_session(monkeypatch):
-    """Sync-protected pages must validate sessions against the database."""
+async def test_require_auth_rejects_invalid_cookie_session(monkeypatch):
+    """Protected pages must validate sessions against the database."""
     fake_app, fake_ui, storage = _make_fake_context(session_token="bad-token")
     monkeypatch.setattr(middleware, "app", fake_app)
     monkeypatch.setattr(middleware, "ui", fake_ui)
@@ -39,19 +41,19 @@ def test_require_auth_sync_rejects_invalid_cookie_session(monkeypatch):
 
     called = {"value": False}
 
-    def protected_page():
+    async def protected_page():
         called["value"] = True
 
     wrapped = middleware.require_auth(protected_page)
-    wrapped()
+    await wrapped()
 
     assert called["value"] is False
     fake_ui.navigate.to.assert_called_once_with("/login")
     assert storage.get("return_to") == "/new"
 
 
-def test_require_auth_sync_accepts_valid_session_and_populates_storage(monkeypatch):
-    """Sync-protected pages should execute only after successful validation."""
+async def test_require_auth_accepts_valid_session_and_populates_storage(monkeypatch):
+    """Protected pages should execute only after successful validation."""
     fake_app, fake_ui, storage = _make_fake_context(session_token="good-token")
     monkeypatch.setattr(middleware, "app", fake_app)
     monkeypatch.setattr(middleware, "ui", fake_ui)
@@ -70,12 +72,12 @@ def test_require_auth_sync_accepts_valid_session_and_populates_storage(monkeypat
 
     called = {"value": False}
 
-    def protected_page():
+    async def protected_page():
         called["value"] = True
         return "ok"
 
     wrapped = middleware.require_auth(protected_page)
-    result = wrapped()
+    result = await wrapped()
 
     assert result == "ok"
     assert called["value"] is True
@@ -85,6 +87,16 @@ def test_require_auth_sync_accepts_valid_session_and_populates_storage(monkeypat
     assert storage["is_approved"] is False
     assert storage["can_start_jobs"] is True
     fake_ui.navigate.to.assert_not_called()
+
+
+def test_require_auth_refuses_a_sync_page():
+    """A sync page would check the session on the event loop, so the decorator refuses it."""
+
+    def sync_page() -> None:
+        pass
+
+    with pytest.raises(TypeError, match="require_auth needs an async page"):
+        middleware.require_auth(sync_page)
 
 
 def test_can_current_user_start_jobs_uses_approval_or_admin_fallback(monkeypatch):

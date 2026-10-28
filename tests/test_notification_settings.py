@@ -12,8 +12,6 @@ from sqlalchemy import text, update
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-import openscientist.database.engine as engine_module
-import openscientist.database.session as session_module
 from openscientist.database import get_session_ctx
 from openscientist.database.models import User
 from openscientist.database.rls import set_current_user
@@ -31,9 +29,7 @@ class _Users:
 
 @pytest_asyncio.fixture
 async def users(test_engine: AsyncEngine) -> AsyncGenerator[_Users, None]:
-    """Two committed users, and a shared engine bound to this test's loop."""
-    engine_module._engine = None
-    session_module._session_factory = None
+    """Two committed users."""
     async with AsyncSession(test_engine, expire_on_commit=False) as session:
         alice = User(email=f"alice-{uuid4().hex}@ntfy.test", name="Alice")
         bob = User(email=f"bob-{uuid4().hex}@ntfy.test", name="Bob")
@@ -44,10 +40,6 @@ async def users(test_engine: AsyncEngine) -> AsyncGenerator[_Users, None]:
         await conn.execute(
             text("DELETE FROM users WHERE id = ANY(:ids)"), {"ids": [alice.id, bob.id]}
         )
-    if engine_module._engine is not None:
-        await engine_module._engine.dispose()
-    engine_module._engine = None
-    session_module._session_factory = None
 
 
 async def _ntfy_enabled(test_engine: AsyncEngine, user_id: UUID) -> bool:

@@ -5,6 +5,7 @@ Provides REST API endpoints for creating, listing, monitoring, and managing
 OpenScientist scientific analysis jobs.
 """
 
+import asyncio
 import logging
 import tempfile
 from datetime import datetime
@@ -37,6 +38,7 @@ from openscientist.database.models import Job, User
 from openscientist.database.rls import set_current_user
 from openscientist.database.session import get_session
 from openscientist.file_loader import FileTooBigError, validate_uploaded_file
+from openscientist.job.types import JobStatus
 from openscientist.job_manager import JobManager
 
 logger = logging.getLogger(__name__)
@@ -385,7 +387,7 @@ async def create_job(
     try:
         with tempfile.TemporaryDirectory(prefix="openscientist_api_upload_") as upload_tmp:
             data_files = await _persist_uploaded_files(upload_files, Path(upload_tmp))
-            job_manager.create_job(
+            await job_manager.create_job(
                 job_id=str(job_uuid),
                 research_question=job_data.research_question,
                 data_files=data_files,
@@ -565,7 +567,7 @@ async def cancel_job(
             detail="Only the job owner can cancel a job",
         )
 
-    if job.status not in ["pending", "running", "queued"]:
+    if JobStatus(job.status) not in JobManager.ACTIVE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel job with status '{job.status}'",
@@ -574,14 +576,10 @@ async def cancel_job(
     # Cancel via JobManager
     job_manager = _get_job_manager()
     try:
-        job_manager.cancel_job(str(job.id))
-        logger.info("Cancelled job %s for user %s", job.id, user.email)
-    except Exception as e:
-        logger.exception("Failed to cancel job %s", job.id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to cancel job",
-        ) from e
+        await job_manager.cancel_job(str(job.id))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    logger.info("Cancelled job %s for user %s", job.id, user.email)
 
 
 @router.get("/{job_id}/report")
@@ -633,7 +631,8 @@ async def download_report(
             stripped_path = job_dir / "_final_report_stripped.md"
             stripped_path.write_text(stripped, encoding="utf-8")
             try:
-                markdown_to_pdf(stripped_path, pdf_path)
+                # Rendering a long report takes seconds of CPU.
+                await asyncio.to_thread(markdown_to_pdf, stripped_path, pdf_path)
             finally:
                 stripped_path.unlink(missing_ok=True)
 

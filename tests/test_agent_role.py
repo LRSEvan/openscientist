@@ -18,8 +18,6 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-import openscientist.database.engine as engine_module
-import openscientist.database.session as session_module
 from openscientist.agent.base import TokenUsage
 from openscientist.database.models import CostRecord, Job, JobDataFile, User
 from openscientist.knowledge_state import KnowledgeState
@@ -183,19 +181,14 @@ def container_database(login_url: str) -> object:
     """Run the container's own code with DATABASE_URL set to the job login."""
     saved = os.environ.get("DATABASE_URL")
 
-    def reset() -> None:
-        get_settings.cache_clear()
-        engine_module._engine = None
-        session_module._session_factory = None
-
     os.environ["DATABASE_URL"] = login_url
-    reset()
+    get_settings.cache_clear()
     yield None
     if saved is None:
         os.environ.pop("DATABASE_URL", None)
     else:
         os.environ["DATABASE_URL"] = saved
-    reset()
+    get_settings.cache_clear()
 
 
 async def _owners_count(test_engine: AsyncEngine, table: str, job_id: UUID) -> int:
@@ -306,7 +299,7 @@ async def test_container_code_runs_as_the_job_login(
     ks.set_agent_status("Working")
     await ks.save_to_database(str(jobs.own))
 
-    await update_job_status(tmp_path / str(jobs.own), "running")
+    await update_job_status(tmp_path / str(jobs.own), "running", allowed_from=("pending",))
     await _persist_job_cost_record(str(jobs.own), TokenUsage(input_tokens=5), "vllm", "m")
     with patch(
         "openscientist.orchestrator.discovery.get_version_metadata",
@@ -355,3 +348,24 @@ async def test_container_code_runs_as_the_job_login(
     assert row.version_info == {"agent_harness": "omp"}
     assert row.agent_status == "Working"
     assert await _owners_count(test_engine, "cost_records", jobs.own) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_job_login_records_when_its_job_ends(
+    jobs: _Jobs, test_engine: AsyncEngine, container_database: object, tmp_path: Path
+) -> None:
+    """The scheduler weighs owners by slot-hours, so the container's final write
+    must also record the end of the run."""
+    from openscientist.orchestrator.iteration import update_job_status
+
+    async with test_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE jobs SET status = 'running', started_at = now() WHERE id = :id"),
+            {"id": jobs.own},
+        )
+    assert await update_job_status(tmp_path / str(jobs.own), "completed", allowed_from=("running",))
+    async with test_engine.connect() as conn:
+        ended = await conn.scalar(
+            text("SELECT ended_at FROM jobs WHERE id = :id"), {"id": jobs.own}
+        )
+    assert ended is not None

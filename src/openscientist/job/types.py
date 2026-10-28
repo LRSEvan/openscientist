@@ -29,7 +29,12 @@ class JobStatus(StrEnum):
 
 @dataclass
 class JobStatusUpdateResult:
-    """Result of updating job status, includes data needed for notifications."""
+    """Result of updating job status, includes data needed for notifications.
+
+    ``applied`` is False when the job was not in a status the write may leave.
+    """
+
+    applied: bool = False
 
     ntfy_enabled: bool = False
     ntfy_topic: str | None = None

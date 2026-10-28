@@ -99,6 +99,16 @@ class TokenUsage:
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
         )
 
+    def __sub__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            input_tokens=self.input_tokens - other.input_tokens,
+            output_tokens=self.output_tokens - other.output_tokens,
+            cache_write_tokens=self.cache_write_tokens - other.cache_write_tokens,
+            cache_write_1h_tokens=self.cache_write_1h_tokens - other.cache_write_1h_tokens,
+            cache_read_tokens=self.cache_read_tokens - other.cache_read_tokens,
+            reasoning_tokens=self.reasoning_tokens - other.reasoning_tokens,
+        )
+
     def __iadd__(self, other: TokenUsage) -> TokenUsage:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
@@ -302,7 +312,7 @@ class AbstractAgent[P: Provider](abc.ABC):
         from openscientist.prompts import get_enabled_skills
 
         try:
-            async with AsyncSessionLocal(thread_safe=True) as session:
+            async with AsyncSessionLocal() as session:
                 skills = await get_enabled_skills(session)
         except Exception as e:
             logger.warning("Failed to load enabled skills: %s", e)

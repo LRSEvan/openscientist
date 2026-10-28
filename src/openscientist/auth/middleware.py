@@ -8,7 +8,6 @@ Supports cookie-backed session authentication.
 import inspect
 import logging
 from collections.abc import Callable
-from contextlib import suppress
 from datetime import UTC, datetime
 from functools import wraps
 from typing import Any
@@ -18,8 +17,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from openscientist.async_tasks import run_sync
 from openscientist.database.models import Session, User
+from openscientist.database.retry import is_connection_error
 from openscientist.database.session import get_admin_session
 
 logger = logging.getLogger(__name__)
@@ -38,21 +37,17 @@ async def get_current_user(db: AsyncSession, session_token: str) -> User | None:
     Returns:
         User object if session is valid, None otherwise
     """
-    try:
-        stmt = (
-            select(User)
-            .join(Session)
-            .where(
-                Session.id == session_token,
-                Session.expires_at > datetime.now(UTC),
-            )
-            .options(selectinload(User.administrator))
+    stmt = (
+        select(User)
+        .join(Session)
+        .where(
+            Session.id == session_token,
+            Session.expires_at > datetime.now(UTC),
         )
-        result = await db.execute(stmt)
-        return result.scalar_one_or_none()
-    except Exception as e:
-        logger.error("Error getting current user: %s", e)
-        return None
+        .options(selectinload(User.administrator))
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 async def validate_session(session_token: str) -> dict[str, Any] | None:
@@ -63,26 +58,22 @@ async def validate_session(session_token: str) -> dict[str, Any] | None:
         session_token: Session token to validate
 
     Returns:
-        Dictionary with user_id, email, name, admin/approval flags if valid, None otherwise
+        Dictionary with user_id, email, name, admin/approval flags if valid, None otherwise.
+        A database error is raised, so it never reads as a missing session.
     """
-    try:
-        async with get_admin_session() as db:
-            user = await get_current_user(db, session_token)
-            if user:
-                is_admin = user.administrator is not None
-                can_start_jobs = bool(user.is_approved or is_admin)
-                return {
-                    "user_id": str(user.id),
-                    "email": user.email,
-                    "name": user.name,
-                    "is_admin": is_admin,
-                    "is_approved": bool(user.is_approved),
-                    "can_start_jobs": can_start_jobs,
-                }
-    except Exception as e:
-        logger.error("Session validation error: %s", e)
-
-    return None
+    async with get_admin_session() as db:
+        user = await get_current_user(db, session_token)
+        if user is None:
+            return None
+        is_admin = user.administrator is not None
+        return {
+            "user_id": str(user.id),
+            "email": user.email,
+            "name": user.name,
+            "is_admin": is_admin,
+            "is_approved": bool(user.is_approved),
+            "can_start_jobs": bool(user.is_approved or is_admin),
+        }
 
 
 def _get_session_token() -> str | None:
@@ -127,41 +118,41 @@ def _save_return_to_path() -> None:
         logger.debug("Could not save return_to path", exc_info=True)
 
 
-def _clear_user_storage(tolerate_uninitialized: bool = False) -> None:
-    """Clear NiceGUI user storage with optional tolerance for test contexts."""
-    if tolerate_uninitialized:
-        with suppress(AssertionError, AttributeError):
-            app.storage.user.clear()
-        return
-    app.storage.user.clear()
-
-
-def _redirect_to_login(
-    *,
-    clear_storage: bool = False,
-    tolerate_uninitialized_storage: bool = False,
-) -> None:
+def _redirect_to_login(*, clear_storage: bool = False) -> None:
     """Persist return path and navigate to login."""
     if clear_storage:
-        _clear_user_storage(tolerate_uninitialized=tolerate_uninitialized_storage)
+        app.storage.user.clear()
     _save_return_to_path()
     ui.navigate.to("/login")
+
+
+def _show_database_unavailable() -> None:
+    """Tell the visitor the database is unreachable, leaving their sign-in alone."""
+    with ui.column().classes("w-full items-center mt-16 gap-4"):
+        ui.label("OpenScientist cannot reach its database right now.").classes("text-h6")
+        ui.label("You are still signed in. Try again in a moment.").classes("text-grey-7")
+        ui.button("Retry", icon="refresh", on_click=ui.navigate.reload)
 
 
 def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
     """
     Decorator to require authentication for a page.
 
-    Checks for valid session token (from cookie or storage) and redirects to
-    login if not authenticated. For async functions, validates session against
-    database.
+    Checks for valid session token (from cookie or storage), validates it against
+    the database, and redirects to login if not authenticated.
 
     Args:
-        func: Page function to protect
+        func: Async page function to protect. A sync page would run its session
+            check on the event loop and block every other request, so it is refused.
 
     Returns:
         Wrapped function that checks authentication
+
+    Raises:
+        TypeError: ``func`` is not a coroutine function.
     """
+    if not inspect.iscoroutinefunction(func):
+        raise TypeError(f"require_auth needs an async page, and {func.__qualname__} is sync")
 
     @wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -173,7 +164,14 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
             return None
 
         # Validate session against database
-        user_info = await validate_session(session_token)
+        try:
+            user_info = await validate_session(session_token)
+        except Exception as e:
+            if not is_connection_error(e):
+                raise
+            logger.error("Database unreachable while checking a session: %s", e)
+            _show_database_unavailable()
+            return None
         if not user_info:
             logger.debug("Invalid session token, redirecting to login")
             _redirect_to_login(clear_storage=True)
@@ -185,34 +183,7 @@ def require_auth(func: Callable[..., Any]) -> Callable[..., Any]:
         # Call the decorated function
         return await func(*args, **kwargs)
 
-    @wraps(func)
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        # Strictly validate every protected sync page against the database.
-        session_token = _get_session_token()
-        if not session_token:
-            logger.debug("No session cookie, redirecting to login")
-            _redirect_to_login(clear_storage=True, tolerate_uninitialized_storage=True)
-            return None
-
-        try:
-            user_info = run_sync(validate_session(session_token))
-        except Exception:
-            logger.error("Session validation failed in sync auth path", exc_info=True)
-            user_info = None
-
-        if not user_info:
-            logger.debug("Invalid session token in sync path, redirecting to login")
-            _redirect_to_login(clear_storage=True, tolerate_uninitialized_storage=True)
-            return None
-
-        _store_authenticated_user(session_token, user_info)
-
-        return func(*args, **kwargs)
-
-    # Return appropriate wrapper based on function type
-    if inspect.iscoroutinefunction(func):
-        return async_wrapper
-    return sync_wrapper
+    return async_wrapper
 
 
 def get_current_user_id() -> str | None:

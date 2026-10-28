@@ -5,21 +5,29 @@ This module provides FastAPI routes for OAuth login and callback handling,
 which integrate with NiceGUI's underlying FastAPI application.
 """
 
+import asyncio
 import hashlib
 import logging
 import secrets
+import threading
 import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from nicegui import app
 from sqlalchemy import select
 
 from openscientist.auth.oauth import get_oauth_client
 from openscientist.auth.providers import GitHubProvider, GoogleProvider, MockProvider, OrcidProvider
 from openscientist.auth.routes import create_or_update_user, create_session
 from openscientist.database.models import Administrator, ReviewToken, Session, User
-from openscientist.database.session import get_admin_session
+from openscientist.database.retry import is_connection_error, retry_sync
+from openscientist.database.session import (
+    SessionOpener,
+    get_admin_session,
+    thread_safe_admin_session,
+)
 from openscientist.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -322,25 +330,58 @@ async def oauth_callback(provider: str, request: Request) -> RedirectResponse:
         return RedirectResponse(url="/login?error=oauth_failed")
 
 
+async def _delete_session(open_session: SessionOpener, session_token: str) -> None:
+    async with open_session() as db:
+        session = (
+            await db.execute(select(Session).where(Session.id == session_token))
+        ).scalar_one_or_none()
+        if session:
+            await db.delete(session)
+            await db.commit()
+
+
+def _revoke_session_later(session_token: str) -> None:
+    """Delete the session once the database is back, so the token dies with
+    the sign-out even when the database was unreachable at that moment."""
+
+    def revoke() -> None:
+        try:
+            retry_sync(
+                lambda: asyncio.run(_delete_session(thread_safe_admin_session, session_token)),
+                what="revoking a signed-out session",
+            )
+        except Exception:
+            logger.exception("Could not revoke a signed-out session")
+            return
+        logger.info("Revoked a session signed out while the database was unreachable")
+
+    threading.Thread(target=revoke, name="session-revoke", daemon=True).start()
+
+
+def _forget_stored_session() -> None:
+    """Pages fall back to the token NiceGUI stores per browser, so signing out
+    clears that copy too."""
+    try:
+        storage = app.storage.user
+    except RuntimeError:
+        return  # outside a NiceGUI request there is no stored copy
+    storage.clear()
+
+
 @router.get("/logout")
 async def logout(request: Request) -> RedirectResponse:
     """Handle logout by invalidating session."""
     session_token = request.cookies.get("session_token")
 
     if session_token:
-        # Invalidate session in database
         try:
-            async with get_admin_session() as db:
-                stmt = select(Session).where(Session.id == session_token)
-                result = await db.execute(stmt)
-                session = result.scalar_one_or_none()
-
-                if session:
-                    await db.delete(session)
-                    await db.commit()
-                    logger.info("Deleted session: %s", session_token)
+            await _delete_session(get_admin_session, session_token)
         except Exception as e:
-            logger.error("Error deleting session: %s", e)
+            if not is_connection_error(e):
+                raise
+            logger.error("Database unreachable at sign-out, revoking the session later: %s", e)
+            _revoke_session_later(session_token)
+    _forget_stored_session()
 
     # Clear session cookie and redirect
     response = RedirectResponse(url="/login")

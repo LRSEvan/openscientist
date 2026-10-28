@@ -9,8 +9,10 @@ import asyncio
 import importlib
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import uvicorn
@@ -186,8 +188,10 @@ def _register_api_routes(host_app: FastAPI) -> None:
     """Register REST API routes with the host FastAPI app."""
     try:
         from openscientist.api import api_router
+        from openscientist.api.errors import register_database_error_handlers
 
         host_app.include_router(api_router)
+        register_database_error_handlers(host_app)
         logger.info("REST API routes registered at /api/v1")
     except Exception as e:
         logger.warning("Failed to register API routes: %s", e)
@@ -302,6 +306,15 @@ def _register_apple_touch_icon_redirect(host_app: FastAPI) -> None:
         return RedirectResponse("/assets/apple-touch-icon.png", status_code=301)
 
 
+def _new_job_manager(jobs_dir: Path) -> JobManager:
+    settings = get_settings()
+    return JobManager(
+        jobs_dir=jobs_dir,
+        max_concurrent=settings.max_concurrent_jobs,
+        scheduler_window=timedelta(hours=settings.scheduler_window_hours),
+    )
+
+
 def get_job_manager() -> JobManager:
     """
     Get the global job manager instance, initializing if needed.
@@ -314,10 +327,7 @@ def get_job_manager() -> JobManager:
     """
     if _state.job_manager is None:
         logger.warning("Job manager was None, initializing now (likely due to module reload)")
-        _state.job_manager = JobManager(
-            jobs_dir=_state.jobs_dir,
-            max_concurrent=get_settings().max_concurrent_jobs,
-        )
+        _state.job_manager = _new_job_manager(_state.jobs_dir)
     return _state.job_manager
 
 
@@ -471,10 +481,11 @@ async def _start_background_tasks(engine: AsyncEngine) -> None:
 def _initialize_job_manager_runtime(jobs_dir: Path) -> None:
     if _state.job_manager is not None:
         return
-    _state.job_manager = JobManager(
-        jobs_dir=jobs_dir,
-        max_concurrent=get_settings().max_concurrent_jobs,
-    )
+    _state.job_manager = _new_job_manager(jobs_dir)
+    # Recovery waits out a database that is still down, so startup does not.
+    threading.Thread(
+        target=_state.job_manager.recover_after_restart, name="job-recovery", daemon=True
+    ).start()
 
 
 def _register_nicegui_static_files() -> None:

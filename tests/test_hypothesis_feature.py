@@ -854,7 +854,7 @@ class TestNewJobPageStructure:
 class TestEndToEndHypothesesFlow:
     """Test the full create → persist → read flow for use_hypotheses."""
 
-    def test_create_db_job_record_passes_use_hypotheses_to_db_create_job(
+    async def test_create_db_job_record_passes_use_hypotheses_to_db_create_job(
         self, tmp_path: Path
     ) -> None:
         """_create_db_job_record(use_hypotheses=True) calls _db_create_job with use_hypotheses=True."""
@@ -869,7 +869,7 @@ class TestEndToEndHypothesesFlow:
         with patch(
             "openscientist.job_manager._db_create_job", new_callable=AsyncMock
         ) as mock_db_create:
-            jm._create_db_job_record(
+            await jm._create_db_job_record(
                 job_id=job_id,
                 research_question="Test",
                 max_iterations=3,

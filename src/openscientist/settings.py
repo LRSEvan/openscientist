@@ -327,6 +327,12 @@ class DatabaseSettings(BaseSettings):
     # Debug settings
     sql_echo: bool = Field(default=False, alias="SQL_ECHO")
 
+    # Seconds each connect waits for an unreachable database. The job runner
+    # sets it for agent containers, and the web fails fast.
+    connect_retry_seconds: float = Field(
+        default=0, ge=0, alias="OPENSCIENTIST_DB_CONNECT_RETRY_SECONDS"
+    )
+
     @property
     def effective_database_url(self) -> str:
         """Get the database URL."""
@@ -743,6 +749,10 @@ class Settings(BaseSettings):
     # Server settings
     port: int = Field(default=8080, alias="PORT")
     max_concurrent_jobs: int = Field(default=1, alias="OPENSCIENTIST_MAX_CONCURRENT_JOBS")
+    # Hours of slot use the queue weighs each owner's queued jobs by
+    scheduler_window_hours: float = Field(
+        default=24, gt=0, alias="OPENSCIENTIST_SCHEDULER_WINDOW_HOURS"
+    )
     base_url: str = Field(
         default="http://localhost:8080",
         alias="OPENSCIENTIST_BASE_URL",

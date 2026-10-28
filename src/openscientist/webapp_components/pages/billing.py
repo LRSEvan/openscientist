@@ -1,5 +1,6 @@
 """Billing and cost tracking panel."""
 
+import asyncio
 import logging
 
 from nicegui import ui
@@ -17,7 +18,15 @@ async def render_billing_panel() -> None:
     """Render the billing panel (for use as an admin subtab)."""
     with ui.column().classes("w-full gap-6"):
         await _render_db_cost_section()
-        _render_provider_cost_section()
+        await _render_provider_cost_section()
+
+
+def _iteration_label(record: CostRecord) -> str:
+    """The iteration a record covers, "report" for the report phase, and blank
+    for a record that covers a whole run."""
+    if record.iteration is not None:
+        return str(record.iteration)
+    return "report" if record.operation_type == "report" else ""
 
 
 async def _render_db_cost_section() -> None:
@@ -52,6 +61,7 @@ async def _render_db_cost_section() -> None:
 
     columns = [
         {"name": "job_id", "label": "Job", "field": "job_id", "align": "left"},
+        {"name": "iteration", "label": "Iteration", "field": "iteration", "align": "right"},
         {"name": "model", "label": "Model", "field": "model", "align": "left"},
         {"name": "provider", "label": "Provider", "field": "provider", "align": "left"},
         {
@@ -91,6 +101,7 @@ async def _render_db_cost_section() -> None:
         {
             "id": str(r.id),
             "job_id": "..." + str(r.job_id)[-8:],
+            "iteration": _iteration_label(r),
             "model": r.model,
             "provider": r.provider,
             "input_tokens": r.input_tokens,
@@ -106,14 +117,15 @@ async def _render_db_cost_section() -> None:
     ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
 
 
-def _render_provider_cost_section() -> None:
+async def _render_provider_cost_section() -> None:
     """Provider-level cost API."""
     with ui.card().classes("w-full max-w-4xl"):
         ui.label("Provider Cost API").classes("text-h6 mb-4")
 
         try:
             provider = get_provider()
-            cost_info = provider.get_cost_info(lookback_hours=24)
+            # Provider cost APIs are blocking HTTP calls, with a timeout of 10 s each.
+            cost_info = await asyncio.to_thread(provider.get_cost_info, lookback_hours=24)
             budget_check = provider.evaluate_budget(cost_info)
 
             with ui.row().classes("w-full gap-8 mb-4"):

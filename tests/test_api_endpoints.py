@@ -765,7 +765,7 @@ class TestJobEndpoints:
         app = _build_authenticated_app(db_session, test_user_db)
         # Mock the job manager
         mock_job_manager = MagicMock()
-        mock_job_manager.cancel_job = MagicMock()
+        mock_job_manager.cancel_job = AsyncMock()
 
         with patch(
             "openscientist.api.endpoints.jobs._get_job_manager", return_value=mock_job_manager
@@ -804,7 +804,7 @@ class TestJobEndpoints:
 
         app = _build_authenticated_app(db_session, test_user_db)
         mock_job_manager = MagicMock()
-        mock_job_manager.cancel_job = MagicMock()
+        mock_job_manager.cancel_job = AsyncMock()
 
         with patch(
             "openscientist.api.endpoints.jobs._get_job_manager", return_value=mock_job_manager
@@ -843,7 +843,7 @@ class TestJobEndpoints:
 
         app = _build_authenticated_app(db_session, test_user_db)
         mock_job_manager = MagicMock()
-        mock_job_manager.cancel_job = MagicMock()
+        mock_job_manager.cancel_job = AsyncMock()
 
         with patch(
             "openscientist.api.endpoints.jobs._get_job_manager", return_value=mock_job_manager
@@ -918,7 +918,7 @@ class TestJobEndpoints:
 
         # Mock job manager
         mock_job_manager = MagicMock()
-        mock_job_manager.create_job = MagicMock()
+        mock_job_manager.create_job = AsyncMock()
         mock_loaded_job = SimpleNamespace(
             id=uuid.uuid4(),
             research_question="What is the structure of protein X?",
@@ -1009,7 +1009,7 @@ class TestJobEndpoints:
             captured_uploads["contents"] = [p.read_text(encoding="utf-8") for p in uploaded]
 
         mock_job_manager = MagicMock()
-        mock_job_manager.create_job = MagicMock(side_effect=capture_create_job)
+        mock_job_manager.create_job = AsyncMock(side_effect=capture_create_job)
         mock_loaded_job = SimpleNamespace(
             id=uuid.uuid4(),
             research_question="Multipart Job",
@@ -1104,7 +1104,7 @@ class TestJobEndpoints:
             captured_names.extend([p.name for p in kwargs["data_files"]])
 
         mock_job_manager = MagicMock()
-        mock_job_manager.create_job = MagicMock(side_effect=capture_create_job)
+        mock_job_manager.create_job = AsyncMock(side_effect=capture_create_job)
         mock_loaded_job = SimpleNamespace(
             id=uuid.uuid4(),
             research_question="Duplicate Uploads",

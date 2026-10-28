@@ -9,14 +9,17 @@ The buckets it surfaces are pinned here.
 from __future__ import annotations
 
 import contextlib
+import threading
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from nicegui import ui
 
 from openscientist.database.models import CostRecord
+from openscientist.providers.base import CostInfo
 from openscientist.webapp_components.pages import billing
 
 _PRICED_BUCKETS = (
@@ -28,14 +31,19 @@ _PRICED_BUCKETS = (
 )
 
 
-def _record(**buckets: int) -> CostRecord:
+def _record(
+    *,
+    iteration: int | None = None,
+    operation_type: str = "discovery",
+    **buckets: int,
+) -> CostRecord:
     return CostRecord(
         id=uuid4(),
         job_id=uuid4(),
         created_at=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
         updated_at=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
-        iteration=None,
-        operation_type="discovery",
+        iteration=iteration,
+        operation_type=operation_type,
         provider="anthropic",
         model="claude-opus-4-6",
         cost_usd=21.75,
@@ -132,6 +140,7 @@ async def test_per_record_table_carries_every_priced_bucket() -> None:
     kwargs = table.call_args.kwargs
     assert [column["field"] for column in kwargs["columns"]] == [
         "job_id",
+        "iteration",
         "model",
         "provider",
         *_PRICED_BUCKETS,
@@ -146,3 +155,93 @@ async def test_per_record_table_carries_every_priced_bucket() -> None:
         200_000,
         40,
     ]
+
+
+async def test_the_iteration_column_names_the_phase_each_record_covers() -> None:
+    """A per-iteration record shows its number, the report its name, and a
+    whole-run record nothing, so the table explains where each cost went."""
+    records = [
+        _record(
+            iteration=2,
+            input_tokens=1,
+            output_tokens=2,
+            cache_read_tokens=3,
+            cache_write_tokens=4,
+            reasoning_tokens=5,
+        ),
+        _record(
+            operation_type="report",
+            input_tokens=6,
+            output_tokens=7,
+            cache_read_tokens=8,
+            cache_write_tokens=9,
+            reasoning_tokens=10,
+        ),
+        _record(
+            input_tokens=11,
+            output_tokens=12,
+            cache_read_tokens=13,
+            cache_write_tokens=14,
+            reasoning_tokens=15,
+        ),
+    ]
+
+    _, table = await _render(records)
+
+    rows = table.call_args.kwargs["rows"]
+    assert [row["iteration"] for row in rows] == ["2", "report", ""]
+
+
+def _panel_ui_mock() -> MagicMock:
+    """A NiceGUI stand-in whose container elements serve as context managers."""
+
+    def factory(*_args: object, **_kwargs: object) -> MagicMock:
+        element = MagicMock()
+        element.__enter__ = MagicMock(return_value=element)
+        element.__exit__ = MagicMock(return_value=False)
+        element.classes.return_value = element
+        return element
+
+    mock = MagicMock()
+    for name in ("card", "column", "row", "element"):
+        setattr(mock, name, factory)
+    return mock
+
+
+async def test_provider_section_shows_the_provider_cost_numbers() -> None:
+    """The provider cost panel surfaces the numbers the provider API reports."""
+    cost_info = CostInfo(
+        provider_name="Fake",
+        total_spend_usd=12.5,
+        recent_spend_usd=1.25,
+        recent_period_hours=24,
+    )
+    loop_thread = threading.get_ident()
+    cost_threads: list[int] = []
+    lookbacks: list[int] = []
+
+    def fake_get_cost_info(lookback_hours: int = 24) -> CostInfo:
+        lookbacks.append(lookback_hours)
+        cost_threads.append(threading.get_ident())
+        return cost_info
+
+    provider = SimpleNamespace(
+        get_cost_info=fake_get_cost_info,
+        evaluate_budget=lambda info: {"errors": [], "warnings": []},
+    )
+    mock_ui = _panel_ui_mock()
+    with (
+        patch.object(billing, "get_admin_session", lambda: _admin_session([])),
+        patch.object(billing, "render_empty_state", MagicMock()),
+        patch.object(billing, "get_provider", return_value=provider),
+        patch.object(billing, "ui", mock_ui),
+    ):
+        await billing.render_billing_panel()
+
+    labels = [call.args[0] for call in mock_ui.label.call_args_list if call.args]
+    assert "$12.50" in labels
+    assert "$1.25" in labels
+    assert "Provider: Fake" in labels
+    # The provider cost API is a blocking call, so the panel fetches it off the loop thread.
+    assert lookbacks == [24]
+    assert cost_threads and cost_threads[0] != loop_thread

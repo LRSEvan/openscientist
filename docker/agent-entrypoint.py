@@ -23,6 +23,7 @@ The container:
 import asyncio
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -55,7 +56,14 @@ async def main() -> int:
 
     logger.info("Starting agent for job %s in %s (mode=%s)", job_id, job_dir, run_mode)
 
+    # docker stop sends SIGTERM, which Python as PID 1 would ignore until the
+    # SIGKILL. Cancelling the run instead lets its cleanup write the cost.
+    main_task = asyncio.current_task()
+    if main_task is not None:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, main_task.cancel)
+
     try:
+        from openscientist.job.agent_error import write_agent_error
         from openscientist.orchestrator.discovery import (
             regenerate_report_async,
             run_discovery_async,
@@ -76,10 +84,21 @@ async def main() -> int:
             result.get("iterations", 0),
             result.get("findings", 0),
         )
-        return 0 if result.get("status") == "completed" else 1
+        if result.get("status") == "completed":
+            return 0
+        # The web sees only the exit code, so leave it the reason.
+        if result.get("error"):
+            write_agent_error(job_dir, str(result["error"]))
+        return 1
+
+    except asyncio.CancelledError:
+        # The web stopped the container and has already moved the job on.
+        logger.info("Job %s stopped", job_id)
+        return 1
 
     except Exception as e:
         logger.error("Job %s failed: %s", job_id, e, exc_info=True)
+        write_agent_error(job_dir, f"{type(e).__name__}: {e}")
         return 1
 
 

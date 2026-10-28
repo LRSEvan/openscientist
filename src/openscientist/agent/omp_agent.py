@@ -476,6 +476,7 @@ class OmpAgent(AbstractAgent[Provider]):
             self._pump(proc.stdout, stdout_buf), self._pump(proc.stderr, stderr_buf)
         )
         timed_out = False
+        cancelled: asyncio.CancelledError | None = None
         try:
             # One deadline over both awaits. Bounding only the pipe reads would
             # leave proc.wait() unbounded, so a process that closes its pipes
@@ -490,17 +491,22 @@ class OmpAgent(AbstractAgent[Provider]):
             timed_out = True
             logger.warning("omp turn exceeded %ds, cutting the turn", _TURN_TIMEOUT_SECONDS)
             await self._kill_tree(proc)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as e:
             # Stopping a job cancels this turn, and abandoning it here would leak
             # the tree exactly as the timeout used to. Signalled synchronously
             # because awaiting a graceful stop inside a cancelled task is not
-            # dependable, so there is no reliable window for SIGTERM.
+            # dependable, so there is no reliable window for SIGTERM. The cancel
+            # goes on once the partial stream's usage is counted below.
             self._signal_group(proc, signal.SIGKILL)
-            raise
+            cancelled = e
         finally:
             pump.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await pump
+        if cancelled is not None:
+            # Reaped so its pipes close while the event loop still runs.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
 
         stdout_bytes, stderr_bytes = bytes(stdout_buf), bytes(stderr_buf)
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")
@@ -549,6 +555,8 @@ class OmpAgent(AbstractAgent[Provider]):
         # tokens whether the turn completed, failed, or was cut short, and the
         # partial stream is what makes a timed-out turn's usage recoverable.
         self._token_usage += usage
+        if cancelled is not None:
+            raise cancelled
 
         # omp announces the session id in its first event but only writes the
         # session file once the turn has something to save. An id with no file
