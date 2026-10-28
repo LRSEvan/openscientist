@@ -362,57 +362,6 @@ class GitHubSkillIngester(BaseSkillIngester):
         sha: str = response.json()["sha"]
         return sha
 
-    async def list_skill_files(
-        self,
-        owner: str,
-        repo: str,
-        branch: str,
-        skills_path: str = "",
-    ) -> list[dict[str, Any]]:
-        """
-        List all markdown files in the skills directory.
-
-        Args:
-            owner: Repository owner
-            repo: Repository name
-            branch: Branch name
-            skills_path: Subdirectory containing skills
-
-        Returns:
-            List of file metadata dicts with 'path' and 'download_url'
-        """
-        # Get the tree recursively
-        url = f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{branch}"
-        params = {"recursive": "1"}
-        response = await self._github_get(url, params=params)
-        response.raise_for_status()
-
-        tree = response.json().get("tree", [])
-        skill_files = []
-
-        prefix = skills_path.strip("/") + "/" if skills_path else ""
-
-        for item in tree:
-            path = item.get("path", "")
-            if item.get("type") != "blob":
-                continue
-            if not path.lower().endswith("/skill.md"):
-                continue
-            if prefix and not path.startswith(prefix):
-                continue
-
-            # Build raw content URL
-            download_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-            skill_files.append(
-                {
-                    "path": path,
-                    "download_url": download_url,
-                    "sha": item.get("sha"),
-                }
-            )
-
-        return skill_files
-
     def _extract_skill_files_from_archive(
         self,
         archive_bytes: bytes,
