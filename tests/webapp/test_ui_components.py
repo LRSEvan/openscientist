@@ -15,12 +15,10 @@ from openscientist.webapp_components.ui_components import (
     OPENSCIENTIST_PAPER_URL,
     OPENSCIENTIST_RELEASE_URL,
     STATUS_COLORS,
-    STATUS_ICONS,
     _get_job_id_badge_html,
     _get_pubmed_badge_html,
     _inject_thinking_status_styles,
     get_project_resource_links,
-    get_status_badge_props,
     register_badge_head_html,
     render_job_id_badge,
     render_job_id_slot,
@@ -33,19 +31,13 @@ from openscientist.webapp_components.ui_components import (
 
 
 class TestStatusConstants:
-    """Tests for status color and icon mappings."""
+    """Tests for the status color mapping."""
 
     def test_status_colors_defined(self):
         """Test that all job statuses have color mappings."""
         for status in JobStatus:
             assert status in STATUS_COLORS
             assert isinstance(STATUS_COLORS[status], str)
-
-    def test_status_icons_defined(self):
-        """Test that all job statuses have icon mappings."""
-        for status in JobStatus:
-            assert status in STATUS_ICONS
-            assert isinstance(STATUS_ICONS[status], str)
 
 
 class TestProjectResourceLinks:
@@ -59,68 +51,6 @@ class TestProjectResourceLinks:
             ("Paper", OPENSCIENTIST_PAPER_URL),
             ("Latest Release", OPENSCIENTIST_RELEASE_URL),
         ]
-
-
-class TestGetStatusBadgeProps:
-    """Tests for get_status_badge_props function."""
-
-    def test_pending_status(self):
-        """Test badge props for pending status."""
-        props = get_status_badge_props(JobStatus.PENDING)
-        assert props["color"] == "gray"
-        assert props["icon"] == "○"
-        assert props["text"] == "pending"
-
-    def test_queued_status(self):
-        """Test badge props for queued status."""
-        props = get_status_badge_props(JobStatus.QUEUED)
-        assert props["color"] == "blue"
-        assert props["icon"] == "⟳"
-        assert props["text"] == "queued"
-
-    def test_running_status(self):
-        """Test badge props for running status."""
-        props = get_status_badge_props(JobStatus.RUNNING)
-        assert props["color"] == "teal"
-        assert props["icon"] == "▶"
-        assert props["text"] == "running"
-
-    def test_completed_status(self):
-        """Test badge props for completed status."""
-        props = get_status_badge_props(JobStatus.COMPLETED)
-        assert props["color"] == "green"
-        assert props["icon"] == "✓"
-        assert props["text"] == "completed"
-
-    def test_failed_status(self):
-        """Test badge props for failed status."""
-        props = get_status_badge_props(JobStatus.FAILED)
-        assert props["color"] == "red"
-        assert props["icon"] == "✗"
-        assert props["text"] == "failed"
-        assert "bg-red-600" in props["classes"]
-        assert "text-white" in props["classes"]
-
-    def test_cancelled_status(self):
-        """Test badge props for cancelled status."""
-        props = get_status_badge_props(JobStatus.CANCELLED)
-        assert props["color"] == "gray"
-        assert props["icon"] == "⊗"
-        assert props["text"] == "cancelled"
-
-    def test_awaiting_feedback_status(self):
-        """Test badge props for awaiting feedback status."""
-        props = get_status_badge_props(JobStatus.AWAITING_FEEDBACK)
-        assert props["color"] == "orange"
-        assert props["icon"] == "⏸"
-        assert props["text"] == "awaiting feedback"
-
-    def test_props_structure(self):
-        """Test that props dict has all required keys."""
-        props = get_status_badge_props(JobStatus.RUNNING)
-        required_keys = ["color", "icon", "text", "classes"]
-        for key in required_keys:
-            assert key in props
 
 
 class TestRenderStatusCellSlot:

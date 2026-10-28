@@ -141,18 +141,6 @@ STATUS_COLORS = {
     JobStatus.AWAITING_FEEDBACK: "orange",
 }
 
-# Status icons (unicode/emoji)
-STATUS_ICONS = {
-    JobStatus.PENDING: "○",
-    JobStatus.QUEUED: "⟳",
-    JobStatus.RUNNING: "▶",
-    JobStatus.GENERATING_REPORT: "⟳",
-    JobStatus.COMPLETED: "✓",
-    JobStatus.FAILED: "✗",
-    JobStatus.CANCELLED: "⊗",
-    JobStatus.AWAITING_FEEDBACK: "⏸",
-}
-
 # Category color mappings for skills
 CATEGORY_COLORS: dict[str, str] = {
     "analysis": "blue",
@@ -787,32 +775,6 @@ def render_alert_banner(
                     ui.label(f"• {detail}").classes(
                         f"{c['detail']} text-xs sm:text-sm font-mono break-words"
                     )
-
-
-def get_status_badge_props(status: JobStatus) -> dict[str, Any]:
-    """
-    Get NiceGUI badge properties for a job status.
-
-    Args:
-        status: JobStatus enum value
-
-    Returns:
-        Dict with keys: color, icon, text, classes
-    """
-    color = STATUS_COLORS.get(status, "gray")
-    icon = STATUS_ICONS.get(status, "○")
-
-    # Special styling for failed jobs
-    classes = ""
-    if status == JobStatus.FAILED:
-        classes = "bg-red-600 text-white font-bold"
-
-    return {
-        "color": color,
-        "icon": icon,
-        "text": status.value.replace("_", " "),
-        "classes": classes,
-    }
 
 
 def render_status_cell_slot() -> str:

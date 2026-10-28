@@ -151,7 +151,7 @@ render_alert_banner(
 
 ### Status Badges
 
-Use `get_status_badge_props()` and `render_status_cell_slot()` for job status display.
+Use `render_status_cell_slot()` for job status display in tables and `STATUS_COLORS` elsewhere.
 
 ### Adding New Components
 
