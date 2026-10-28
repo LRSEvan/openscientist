@@ -420,6 +420,149 @@ class TestDiscoveryCancellationAndFailure:
         assert result["status"] == "failed"
         mock_report_phase.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_coinvestigate_wait_stops_when_the_job_stopped_running(self, tmp_path):
+        """The container must not pause for feedback once the job is no longer running."""
+        from openscientist.orchestrator.discovery import (
+            _DiscoveryCancelledError,
+            _wait_for_coinvestigate_feedback,
+        )
+
+        job_dir = tmp_path / str(uuid4())
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery.update_job_status",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery.wait_for_feedback_or_timeout",
+                new_callable=AsyncMock,
+            ) as mock_wait,
+        ):
+            with pytest.raises(_DiscoveryCancelledError, match="no longer running"):
+                await _wait_for_coinvestigate_feedback(
+                    job_dir=job_dir,
+                    investigation_mode="coinvestigate",
+                    current_iteration=1,
+                    max_iterations=4,
+                )
+
+        mock_wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_coinvestigate_wait_stops_when_the_job_ended_while_waiting(
+        self, test_engine, tmp_path
+    ):
+        """A job that ended while the feedback panel was open is not resumed."""
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from openscientist.database.models import Job
+        from openscientist.orchestrator.discovery import (
+            _DiscoveryCancelledError,
+            _wait_for_coinvestigate_feedback,
+        )
+
+        async with AsyncSession(test_engine, expire_on_commit=False) as session:
+            job = Job(research_question="Q?", status="cancelled")
+            session.add(job)
+            await session.commit()
+        try:
+            job_dir = tmp_path / str(job.id)
+            job_dir.mkdir()
+            with (
+                patch(
+                    "openscientist.orchestrator.discovery.update_job_status",
+                    new_callable=AsyncMock,
+                    side_effect=[True, False],
+                ),
+                patch(
+                    "openscientist.orchestrator.discovery.wait_for_feedback_or_timeout",
+                    new_callable=AsyncMock,
+                    return_value={"outcome": "timeout", "feedback_text": None},
+                ),
+            ):
+                with pytest.raises(_DiscoveryCancelledError, match="is cancelled"):
+                    await _wait_for_coinvestigate_feedback(
+                        job_dir=job_dir,
+                        investigation_mode="coinvestigate",
+                        current_iteration=1,
+                        max_iterations=4,
+                    )
+        finally:
+            async with test_engine.begin() as conn:
+                await conn.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": job.id})
+
+    @pytest.mark.asyncio
+    async def test_executor_prep_stops_when_the_job_stopped_running(self, tmp_path):
+        """The agent workspace is not prepared once the job is no longer running."""
+        from openscientist.orchestrator.discovery import (
+            _build_and_prepare_executor,
+            _DiscoveryCancelledError,
+        )
+
+        job_dir = tmp_path / str(uuid4())
+        job_dir.mkdir()
+        runtime = {
+            "job_id": job_dir.name,
+            "use_hypotheses": False,
+            "data_files": [str(job_dir / "data.csv")],
+        }
+        executor = MagicMock()
+        executor.prepare_job_workspace = AsyncMock()
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=executor,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery.update_job_status",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            with pytest.raises(_DiscoveryCancelledError, match="no longer running"):
+                await _build_and_prepare_executor(job_dir, runtime)
+
+        executor.prepare_job_workspace.assert_not_awaited()
+
+
+# ─── guarded status writes ───────────────────────────────────────────
+
+
+class TestGuardedStatusWrites:
+    """A status write its guard refuses is reported as not applied."""
+
+    @pytest.mark.asyncio
+    async def test_update_of_an_invalid_job_id_is_not_applied(self, tmp_path):
+        from openscientist.orchestrator.iteration import update_job_status
+
+        job_dir = tmp_path / "not-a-uuid"
+        job_dir.mkdir()
+
+        assert await update_job_status(job_dir, "running", allowed_from=("running",)) is False
+
+    @pytest.mark.asyncio
+    async def test_update_is_not_applied_when_the_database_refuses(self, tmp_path):
+        from openscientist.orchestrator.iteration import update_job_status
+
+        job_dir = tmp_path / str(uuid4())
+        job_dir.mkdir()
+
+        def _broken_session():
+            raise RuntimeError("connection refused")
+
+        assert (
+            await update_job_status(
+                job_dir, "running", allowed_from=("running",), open_session=_broken_session
+            )
+            is False
+        )
+
 
 # ─── increment_ks_iteration ──────────────────────────────────────────
 

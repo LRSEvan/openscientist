@@ -3,20 +3,31 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator
+import contextlib
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import Protocol
-from unittest.mock import MagicMock, patch
-from uuid import UUID
+from types import SimpleNamespace
+from typing import Protocol, cast
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from openscientist.database.models import Job
-from openscientist.job_manager import JobManager, JobStatus, _db_update_job_status
+from openscientist import web_app
+from openscientist.database.models import Job, User
+from openscientist.job_manager import (
+    JobInfo,
+    JobManager,
+    JobStatus,
+    JobStatusUpdateResult,
+    _db_update_job_status,
+)
 from openscientist.orchestrator.discovery import _persist_final_status, _ReportOutcome
+from openscientist.webapp_components import ui_components
+from openscientist.webapp_components.pages import job_detail
 
 
 class MakeJob(Protocol):
@@ -49,6 +60,36 @@ async def make_job(test_engine: AsyncEngine) -> AsyncGenerator[MakeJob, None]:
     async with factory() as session:
         await session.execute(delete(Job).where(Job.id.in_(created)))
         await session.commit()
+
+
+class OwnJob(Protocol):
+    async def __call__(self, status: JobStatus) -> tuple[UUID, UUID]: ...
+
+
+@pytest_asyncio.fixture
+async def owned_job(
+    test_engine: AsyncEngine,
+) -> AsyncGenerator[OwnJob, None]:
+    """Committed jobs owned by a committed user, so the user's RLS session sees them."""
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    created: list[tuple[UUID, UUID]] = []
+
+    async def _make(status: JobStatus) -> tuple[UUID, UUID]:
+        async with factory() as session:
+            owner = User(email=f"owner-{uuid4().hex}@status.test", name="Owner")
+            session.add(owner)
+            await session.flush()
+            job = Job(owner_id=owner.id, research_question="Does it resume?", status=status.value)
+            session.add(job)
+            await session.commit()
+        created.append((job.id, owner.id))
+        return job.id, owner.id
+
+    yield _make
+    for job_id, owner_id in created:
+        async with factory.begin() as conn:
+            await conn.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": job_id})
+            await conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": owner_id})
 
 
 async def _status(test_engine: AsyncEngine, job_id: UUID) -> str:
@@ -102,6 +143,25 @@ async def test_a_job_cancelled_before_its_worker_begins_is_not_launched(
     assert await _status(test_engine, job) == "cancelled"
 
 
+async def test_a_launch_crash_fails_the_job_and_starts_the_next_one(
+    make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock, monkeypatch
+) -> None:
+    """A crash while launching the container fails the job with that error, frees
+    its slot, and starts the next queued job."""
+    monkeypatch.setattr("openscientist.version._commit", None)
+    manager = _manager(tmp_path, max_concurrent=2)
+    crasher = await make_job(JobStatus.QUEUED)
+    next_up = await make_job(JobStatus.QUEUED)
+    runner.launch.side_effect = RuntimeError("docker launch failed")
+    with patch.object(manager, "_run_job"):
+        manager._run_job_in_container(str(crasher))
+    status, error = await _ending(test_engine, crasher)
+    assert status == "failed"
+    assert "docker launch failed" in (error or "")
+    assert str(crasher) not in manager._running_jobs
+    assert str(next_up) in manager._running_jobs
+
+
 async def test_cancelling_a_started_queued_job_keeps_its_slot_and_stops_it(
     make_job: MakeJob, tmp_path: Path, runner: MagicMock
 ) -> None:
@@ -139,6 +199,18 @@ async def test_the_oldest_queued_job_starts_first(
     assert str(newer) not in manager._running_jobs
 
 
+async def test_a_queued_job_waits_while_a_slot_is_taken(
+    make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """A full manager leaves queued jobs queued instead of overrunning its limit."""
+    manager = _manager(tmp_path, max_concurrent=1)
+    job = await make_job(JobStatus.QUEUED)
+    manager._running_jobs["busy-job"] = MagicMock()
+    assert manager._start_next_queued_job() is False
+    assert str(job) not in manager._running_jobs
+    assert await _status(test_engine, job) == "queued"
+
+
 async def test_a_job_waiting_for_feedback_can_be_cancelled(
     make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock
 ) -> None:
@@ -152,6 +224,23 @@ async def test_a_job_waiting_for_feedback_can_be_cancelled(
 
 
 @pytest.mark.parametrize("finished", [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED])
+async def test_cancelling_a_finished_job_fails_loudly(
+    make_job: MakeJob,
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    runner: MagicMock,
+    finished: JobStatus,
+) -> None:
+    """An ended job refuses a late cancel and keeps its recorded ending."""
+    manager = _manager(tmp_path)
+    job = await make_job(finished)
+    with pytest.raises(ValueError, match="already ended"):
+        manager.cancel_job(str(job))
+    assert await _status(test_engine, job) == finished.value
+    runner.stop.assert_not_called()
+
+
+@pytest.mark.parametrize("finished", [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED])
 async def test_start_job_refuses_a_finished_job(
     make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, finished: JobStatus
 ) -> None:
@@ -161,6 +250,24 @@ async def test_start_job_refuses_a_finished_job(
         manager.start_job(str(job))
     assert str(job) not in manager._running_jobs
     assert await _status(test_engine, job) == finished.value
+
+
+async def test_starting_a_job_that_stopped_waiting_fails_loudly(
+    make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """A job cancelled right before the queue write is not started, and the error says so."""
+    manager = _manager(tmp_path)
+    job = await make_job(JobStatus.PENDING)
+    manager._running_jobs["busy-job"] = MagicMock()
+    with patch(
+        "openscientist.job_manager._db_update_job_status",
+        new_callable=AsyncMock,
+        return_value=JobStatusUpdateResult(),
+    ):
+        with pytest.raises(ValueError, match="stopped waiting"):
+            manager.start_job(str(job))
+    assert str(job) not in manager._running_jobs
+    assert await _status(test_engine, job) == "pending"
 
 
 @pytest.mark.parametrize(
@@ -199,6 +306,27 @@ async def test_the_webs_late_failure_does_not_overwrite_a_completed_job(
     assert await _status(test_engine, job) == "completed"
 
 
+async def test_a_status_write_that_cannot_reach_the_database_is_not_applied(
+    make_job: MakeJob, tmp_path: Path
+) -> None:
+    """A database failure is reported as not applied, so the owner is not
+    told about a move that never happened."""
+    manager = _manager(tmp_path)
+    job = await make_job(JobStatus.RUNNING)
+    with (
+        patch("openscientist.job_manager._run_async", side_effect=RuntimeError("database down")),
+        patch.object(manager, "_send_status_notification") as notify,
+    ):
+        applied = manager._update_job_status(
+            str(job),
+            JobStatus.FAILED,
+            allowed_from=JobManager.STARTED_STATUSES,
+            error_message="boom",
+        )
+    assert applied is False
+    notify.assert_not_called()
+
+
 async def test_startup_recovery_keeps_waiting_jobs_and_ends_started_ones(
     make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock
 ) -> None:
@@ -218,3 +346,154 @@ async def test_startup_recovery_keeps_waiting_jobs_and_ends_started_ones(
     assert {str(pending), str(queued)} <= manager._running_jobs.keys()
     cleaned = {call.args[0] for call in runner.cleanup.call_args_list}
     assert {str(running), str(paused)} <= cleaned
+
+
+async def test_a_lost_jobs_cleanup_failure_does_not_stop_recovery(
+    make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock
+) -> None:
+    """A container whose cleanup crashes is still ended, and the other lost
+    jobs are still processed."""
+    broken = await make_job(JobStatus.RUNNING)
+    other = await make_job(JobStatus.GENERATING_REPORT)
+
+    def _cleanup(job_id: str) -> None:
+        if job_id == str(broken):
+            raise RuntimeError("docker daemon is down")
+
+    runner.cleanup.side_effect = _cleanup
+    manager = _manager(tmp_path, max_concurrent=5)
+    with patch.object(manager, "_run_job"):
+        manager.recover_after_restart()
+    assert await _status(test_engine, broken) == "cancelled"
+    assert await _status(test_engine, other) == "cancelled"
+
+
+async def test_the_web_startup_recovers_the_jobs_the_previous_process_lost(
+    make_job: MakeJob, test_engine: AsyncEngine, tmp_path: Path, runner: MagicMock
+) -> None:
+    """The web startup runs the restart recovery, so waiting jobs move forward
+    and the jobs whose containers were lost are ended."""
+    pending = await make_job(JobStatus.PENDING)
+    lost = await make_job(JobStatus.RUNNING)
+    previous = web_app._state.job_manager
+    try:
+        web_app._state.job_manager = None
+        with patch.object(JobManager, "_run_job"):
+            web_app._initialize_job_manager_runtime(tmp_path)
+        manager = web_app._state.job_manager
+        assert manager is not None
+        assert await _status(test_engine, pending) == "queued"
+        assert await _status(test_engine, lost) == "cancelled"
+        assert str(pending) in manager._running_jobs
+    finally:
+        web_app._state.job_manager = previous
+
+
+# ─── the web surfaces a refused resume ─────────────────────────────────
+
+
+async def test_submitting_feedback_resumes_a_paused_job(
+    owned_job: OwnJob, test_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """The feedback panel flips the job back to running and tells the user it continues."""
+    job_id, owner_id = await owned_job(JobStatus.AWAITING_FEEDBACK)
+    job_dir = tmp_path / str(job_id)
+    job_dir.mkdir()
+    with patch.object(job_detail, "ui") as mock_ui:
+        job_detail._submit_feedback_and_continue(
+            job_dir, str(job_id), str(owner_id), 1, "check the PDB route"
+        )
+    assert await _status(test_engine, job_id) == "running"
+    mock_ui.notify.assert_called_once_with("Continuing to next iteration", type="positive")
+    mock_ui.navigate.to.assert_called_once_with(f"/job/{job_id}")
+
+
+async def test_feedback_for_a_job_that_ended_while_paused_keeps_its_ending(
+    owned_job: OwnJob, test_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """A job that ended while the panel was open is not resumed, and the user is told."""
+    job_id, owner_id = await owned_job(JobStatus.CANCELLED)
+    job_dir = tmp_path / str(job_id)
+    job_dir.mkdir()
+    with patch.object(job_detail, "ui") as mock_ui:
+        job_detail._submit_feedback_and_continue(job_dir, str(job_id), str(owner_id), 1, "")
+    assert await _status(test_engine, job_id) == "cancelled"
+    mock_ui.notify.assert_called_once_with(
+        "This job is no longer waiting for feedback.", type="warning"
+    )
+    mock_ui.navigate.to.assert_called_once_with(f"/job/{job_id}")
+
+
+def _job_info(status: JobStatus) -> JobInfo:
+    return JobInfo(
+        job_id=str(uuid4()), research_question="Q?", status=status, created_at="2026-01-01"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "warns"),
+    [
+        (JobStatus.RUNNING, True),
+        (JobStatus.AWAITING_FEEDBACK, True),
+        (JobStatus.COMPLETED, False),
+    ],
+)
+def test_the_delete_dialog_warns_only_when_the_job_is_active(
+    status: JobStatus, warns: bool, tmp_path: Path
+) -> None:
+    """The dialog warns the user that an active job will be cancelled before deletion."""
+    manager = JobManager(jobs_dir=tmp_path)
+    with (
+        patch.object(manager, "get_job", return_value=_job_info(status)),
+        patch.object(ui_components, "ui") as mock_ui,
+    ):
+        mock_ui.refreshable.side_effect = lambda fn: fn
+        ui_components.render_delete_dialog(str(uuid4()), manager)
+    labels = [call.args[0] for call in mock_ui.label.call_args_list if call.args]
+    active_note = "This job is currently active and will be cancelled before deletion."
+    assert (active_note in labels) is warns
+
+
+@pytest.mark.parametrize(
+    ("status", "cancels_first"),
+    [
+        (JobStatus.RUNNING, True),
+        (JobStatus.COMPLETED, False),
+    ],
+)
+async def test_deleting_a_job_cancels_it_only_while_it_is_active(
+    status: JobStatus, cancels_first: bool, tmp_path: Path
+) -> None:
+    """Confirming the delete dialog cancels an active job before deleting it."""
+    job_id = str(uuid4())
+    owner = uuid4()
+    manager = MagicMock()
+    manager.ACTIVE_STATUSES = JobManager.ACTIVE_STATUSES
+    manager.get_job.return_value = _job_info(status)
+    captured: list[Callable[[], Awaitable[None]]] = []
+
+    def _capture_actions(*_args: object, **kwargs: object) -> MagicMock:
+        captured.append(cast("Callable[[], Awaitable[None]]", kwargs["on_confirm"]))
+        return MagicMock()
+
+    @contextlib.asynccontextmanager
+    async def _admin_session():
+        yield SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(owner_id=owner)))
+
+    with (
+        patch.object(ui_components, "render_dialog_actions", _capture_actions),
+        patch.object(ui_components, "get_current_user_id", return_value=str(owner)),
+        patch.object(ui_components, "get_admin_session", _admin_session),
+        patch.object(ui_components, "ui") as mock_ui,
+    ):
+        mock_ui.refreshable.side_effect = lambda fn: fn
+        ui_components.render_delete_dialog(job_id, manager)
+        await captured[0]()
+    if cancels_first:
+        manager.cancel_job.assert_called_once_with(job_id)
+    else:
+        manager.cancel_job.assert_not_called()
+    manager.delete_job.assert_called_once_with(job_id)
+    mock_ui.notify.assert_called_once_with(
+        f"Job {job_id[-8:]} deleted successfully", type="positive"
+    )
