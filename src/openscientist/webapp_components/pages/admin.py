@@ -428,18 +428,8 @@ async def _build_admin_user_rows(session: Any, users: list[User]) -> list[dict[s
 
 
 def _format_sortable_timestamp(value: datetime | None) -> str:
-    """Format a timestamp for a sortable table column.
-
-    Includes the time (not just the date) so two events on the same day
-    still sort correctly relative to each other — date-only text ties, and a
-    tie falls back to whatever order the browser's sort happens to leave it
-    in, not true chronological order.
-
-    Plain ``YYYY-MM-DD HH:MM`` text still sorts correctly as a string, unlike
-    a human-relative string ("2 hours ago") — see api_keys.py's columns for
-    the pattern this avoids: those are deliberately *not* marked sortable
-    because relative-time text sorts alphabetically, not chronologically.
-    """
+    """Minute precision avoids same-day ties; plain text sorts correctly
+    unlike a relative-time string ("2 hours ago") — see api_keys.py."""
     return value.strftime("%Y-%m-%d %H:%M") if value else "—"
 
 
