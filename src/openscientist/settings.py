@@ -195,28 +195,6 @@ class ProviderSettings(BaseSettings):
     azure_client_id: str | None = Field(default=None, alias="AZURE_CLIENT_ID")
     azure_client_secret: str | None = Field(default=None, alias="AZURE_CLIENT_SECRET")
 
-    _LEGACY_ENV_VAR_RENAMES = (
-        ("CLAUDE_PROVIDER", "OPENSCIENTIST_PROVIDER"),
-        ("ANTHROPIC_MODEL", "OPENSCIENTIST_MODEL"),
-    )
-
-    @model_validator(mode="after")
-    def reject_legacy_env_vars(self) -> "ProviderSettings":
-        """Raise a clear error when a removed env-var name is still set.
-
-        We do not silently accept legacy aliases. Users upgrading must
-        rename their environment variables explicitly so that the
-        running configuration matches what the code reads.
-        """
-        for legacy, canonical in self._LEGACY_ENV_VAR_RENAMES:
-            if os.environ.get(legacy):
-                raise ValueError(
-                    f"{legacy} has been renamed to {canonical}. "
-                    f"Rename the variable in your environment (and .env file) and unset "
-                    f"{legacy}. The legacy name is no longer accepted."
-                )
-        return self
-
     @model_validator(mode="after")
     def require_provider_selected(self) -> "ProviderSettings":
         """There is no default provider. An unset ``OPENSCIENTIST_PROVIDER`` is

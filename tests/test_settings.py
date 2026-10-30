@@ -214,59 +214,25 @@ class TestHarnessSelection:
 
 
 class TestProviderIdEnvVar:
-    """Tests for OPENSCIENTIST_PROVIDER and rejection of the removed CLAUDE_PROVIDER."""
+    """Tests for the OPENSCIENTIST_PROVIDER env var."""
 
     def test_canonical_env_var_resolves(self, monkeypatch, tmp_path):
         """OPENSCIENTIST_PROVIDER is the canonical env-var name."""
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("CLAUDE_PROVIDER", raising=False)
         monkeypatch.setenv("OPENSCIENTIST_PROVIDER", "anthropic")
         settings = ProviderSettings()
         assert settings.provider_id == "anthropic"
 
-    def test_legacy_env_var_raises_clear_error(self, monkeypatch, tmp_path):
-        """Setting the removed CLAUDE_PROVIDER raises with a rename hint."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("OPENSCIENTIST_PROVIDER", raising=False)
-        monkeypatch.setenv("CLAUDE_PROVIDER", "anthropic")
-        with pytest.raises(ValueError, match="CLAUDE_PROVIDER has been renamed"):
-            ProviderSettings()
-
-    def test_legacy_env_var_rejected_even_when_canonical_also_set(self, monkeypatch, tmp_path):
-        """Both env vars set together still raises so users notice the leftover."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("OPENSCIENTIST_PROVIDER", "anthropic")
-        monkeypatch.setenv("CLAUDE_PROVIDER", "anthropic")
-        with pytest.raises(ValueError, match="CLAUDE_PROVIDER has been renamed"):
-            ProviderSettings()
-
 
 class TestModelEnvVar:
-    """Tests for OPENSCIENTIST_MODEL and rejection of the removed ANTHROPIC_MODEL."""
+    """Tests for the OPENSCIENTIST_MODEL env var."""
 
     def test_canonical_env_var_resolves(self, monkeypatch, tmp_path):
         """OPENSCIENTIST_MODEL is the canonical env-var name."""
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
         monkeypatch.setenv("OPENSCIENTIST_MODEL", "claude-sonnet-4-6")
         settings = ProviderSettings()
         assert settings.model == "claude-sonnet-4-6"
-
-    def test_legacy_env_var_raises_clear_error(self, monkeypatch, tmp_path):
-        """Setting the removed ANTHROPIC_MODEL raises with a rename hint."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("OPENSCIENTIST_MODEL", raising=False)
-        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-        with pytest.raises(ValueError, match="ANTHROPIC_MODEL has been renamed"):
-            ProviderSettings()
-
-    def test_legacy_env_var_rejected_even_when_canonical_also_set(self, monkeypatch, tmp_path):
-        """Both env vars set together still raises so users notice the leftover."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("OPENSCIENTIST_MODEL", "claude-sonnet-4-6")
-        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-        with pytest.raises(ValueError, match="ANTHROPIC_MODEL has been renamed"):
-            ProviderSettings()
 
 
 class TestModelFormatValidation:
