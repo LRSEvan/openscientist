@@ -6,7 +6,6 @@ Docker socket. Accepts only execute_code parameters, never a container spec.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -19,9 +18,10 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from openscientist.container_manager import ContainerManager, get_container_manager
-from openscientist.exec_broker_client import EXEC_BROKER_PORT, EXEC_TOKEN_HEADER
-from openscientist.job_container.secrets import make_exec_placeholder
+from openscientist.exec_broker_client import EXEC_TOKEN_HEADER
+from openscientist.job_container.secrets import broker_accepts
 from openscientist.job_container.utils import HostPathSettings, to_container_path
+from openscientist.listener import bind_listener
 from openscientist.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -46,12 +46,8 @@ def _confined_container_path(host_path: str, cs: HostPathSettings, job_root: Pat
     return container_path
 
 
-def create_exec_broker_app(
-    *,
-    master_key: Callable[[], str],
-    manager: Callable[[], ContainerManager],
-) -> Starlette:
-    """Build the broker ASGI app. The callables are resolved per request."""
+def create_exec_broker_app(*, manager: Callable[[], ContainerManager]) -> Starlette:
+    """Build the broker ASGI app. The manager is resolved per request."""
 
     async def handler(request: Request) -> Response:
         presented = request.headers.get(EXEC_TOKEN_HEADER, "")
@@ -67,9 +63,7 @@ def create_exec_broker_app(
         if not isinstance(job_id, str) or not job_id:
             return JSONResponse({"error": "missing job_id"}, status_code=400)
 
-        # Recompute the token from the claimed job_id and constant-time compare.
-        expected = make_exec_placeholder(master_key(), job_id)
-        if not presented or not hmac.compare_digest(expected, presented):
+        if not presented or not broker_accepts(job_id, presented):
             return Response("unauthorized", status_code=401)
 
         language = body.get("language", "python")
@@ -150,15 +144,18 @@ _broker_task: asyncio.Task[None] | None = None
 
 
 async def start_exec_broker() -> None:
-    """Start the broker listener as a loop task. The single, always-on exec path."""
+    """Start the broker listener as a loop task. The single, always-on exec path.
+
+    Raises:
+        ListenerBindError: Its port cannot be bound.
+    """
     global _broker_server, _broker_task
     if _broker_task is not None:
         return
-    app = create_exec_broker_app(
-        master_key=lambda: get_settings().secret_key,
-        manager=get_container_manager,
-    )
-    config = uvicorn.Config(app, host="0.0.0.0", port=EXEC_BROKER_PORT, log_level="warning")
+    port = get_settings().container.exec_broker_port
+    sock = bind_listener(port, name="execution broker", setting="OPENSCIENTIST_EXEC_BROKER_PORT")
+    app = create_exec_broker_app(manager=get_container_manager)
+    config = uvicorn.Config(app, log_level="warning")
     _broker_server = _NoSignalServer(config)
-    _broker_task = asyncio.create_task(_broker_server.serve())
-    logger.info("Execution broker listening on port %d", EXEC_BROKER_PORT)
+    _broker_task = asyncio.create_task(_broker_server.serve(sockets=[sock]))
+    logger.info("Execution broker listening on port %d", port)

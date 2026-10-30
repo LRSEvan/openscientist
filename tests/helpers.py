@@ -5,8 +5,10 @@ These are separated from conftest.py so they can be imported without
 mypy resolution issues.
 """
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import text
@@ -106,3 +108,12 @@ def fake_admin_session(session_obj: Any) -> Any:
         yield session_obj
 
     return _ctx
+
+
+def assert_names_a_make_target(message: str) -> None:
+    """``message`` tells the reader to run ``make <target>``, and the
+    repository's Makefile defines that target."""
+    named = re.search(r"make ([\w-]+)", message)
+    assert named, message
+    makefile = (Path(__file__).resolve().parents[1] / "Makefile").read_text()
+    assert re.search(rf"^{re.escape(named.group(1))}:", makefile, re.MULTILINE), named.group(0)

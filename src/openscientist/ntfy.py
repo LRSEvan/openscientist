@@ -14,7 +14,7 @@ import httpx
 from sqlalchemy import select
 
 from openscientist.database.models import User
-from openscientist.database.session import AsyncSessionLocal
+from openscientist.database.session import thread_safe_admin_session
 from openscientist.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -25,14 +25,14 @@ NTFY_BASE_URL = "https://ntfy.sh"
 async def get_user_ntfy_settings(user_id: UUID) -> tuple[bool, str | None]:
     """Get a user's ntfy settings from the database.
 
-    Uses thread-safe session to avoid event loop conflicts when called from
-    worker threads.
+    Runs as the admin login in a thread-safe session, because it is called from
+    worker threads that act for no user.
 
     Returns:
         Tuple of (ntfy_enabled, ntfy_topic). If user not found, returns (False, None).
     """
     try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+        async with thread_safe_admin_session() as session:
             stmt = select(User.ntfy_enabled, User.ntfy_topic).where(User.id == user_id)
             result = await session.execute(stmt)
             row = result.first()
@@ -47,14 +47,14 @@ async def get_user_ntfy_settings(user_id: UUID) -> tuple[bool, str | None]:
 async def ensure_user_has_topic(user_id: UUID) -> str | None:
     """Ensure a user has an ntfy topic, creating one if needed.
 
-    Uses thread-safe session to avoid event loop conflicts when called from
-    worker threads.
+    Runs as the admin login in a thread-safe session, because it is called from
+    worker threads that act for no user.
 
     Returns:
         The user's ntfy topic, or None if unable to create/retrieve.
     """
     try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+        async with thread_safe_admin_session() as session:
             stmt = select(User).where(User.id == user_id)
             result = await session.execute(stmt)
             user = result.scalar_one_or_none()

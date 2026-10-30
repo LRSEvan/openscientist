@@ -1,7 +1,7 @@
 """Web-side LLM key-replacement proxy for the untrusted job container.
 
 Authenticates a per-job placeholder, swaps in the real provider credential, and
-streams the response. Listens on a fixed internal port, unpublished to the host.
+streams the response. Listens on an internal port, unpublished to the host.
 """
 
 from __future__ import annotations
@@ -19,14 +19,14 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
-from openscientist.job_container.secrets import verify_job_placeholder
+from openscientist.job_container.secrets import proxy_accepts
+from openscientist.listener import bind_listener
 from openscientist.providers import get_provider
 from openscientist.providers.base import AirgapEgress, LlmUpstream
 from openscientist.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-LLM_PROXY_PORT = 8081
 _WEB_HOST_ENV = "OPENSCIENTIST_WEB_HOST"
 _DEFAULT_WEB_HOST = "openscientist"
 
@@ -55,7 +55,7 @@ _DROP_RESPONSE_HEADERS = frozenset(
 def container_proxy_base_url() -> str:
     """Proxy base URL as reached from a sibling job container on the compose network."""
     host = os.environ.get(_WEB_HOST_ENV, _DEFAULT_WEB_HOST)
-    return f"http://{host}:{LLM_PROXY_PORT}"
+    return f"http://{host}:{get_settings().container.llm_proxy_port}"
 
 
 def _presented_credential(request: Request) -> str | None:
@@ -71,15 +71,15 @@ def _presented_credential(request: Request) -> str | None:
 
 def create_llm_proxy_app(
     *,
-    master_key: Callable[[], str],
     upstream: Callable[[], LlmUpstream],
     client: httpx.AsyncClient,
 ) -> Starlette:
-    """Build the proxy ASGI app. The callables are resolved per request."""
+    """Build the proxy ASGI app. The callables are resolved per request, and only
+    a live run's credential is accepted."""
 
     async def handler(request: Request) -> Response:
         credential = _presented_credential(request)
-        if credential is None or not verify_job_placeholder(master_key(), credential):
+        if credential is None or not proxy_accepts(credential):
             return Response("unauthorized", status_code=401)
         try:
             target = upstream()
@@ -140,7 +140,11 @@ def _active_upstream() -> LlmUpstream:
 
 
 async def start_llm_proxy() -> None:
-    """Start the proxy listener as a loop task when the provider is proxied."""
+    """Start the proxy listener as a loop task when the provider is proxied.
+
+    Raises:
+        ListenerBindError: Its port cannot be bound.
+    """
     global _proxy_server, _proxy_task
     if _proxy_task is not None:
         return
@@ -151,13 +155,11 @@ async def start_llm_proxy() -> None:
         )
         return
 
+    port = get_settings().container.llm_proxy_port
+    sock = bind_listener(port, name="LLM proxy", setting="OPENSCIENTIST_LLM_PROXY_PORT")
     client = httpx.AsyncClient(timeout=httpx.Timeout(None))
-    app = create_llm_proxy_app(
-        master_key=lambda: get_settings().secret_key,
-        upstream=_active_upstream,
-        client=client,
-    )
-    config = uvicorn.Config(app, host="0.0.0.0", port=LLM_PROXY_PORT, log_level="warning")
+    app = create_llm_proxy_app(upstream=_active_upstream, client=client)
+    config = uvicorn.Config(app, log_level="warning")
     _proxy_server = _NoSignalServer(config)
-    _proxy_task = asyncio.create_task(_proxy_server.serve())
-    logger.info("LLM key-replacement proxy listening on port %d", LLM_PROXY_PORT)
+    _proxy_task = asyncio.create_task(_proxy_server.serve(sockets=[sock]))
+    logger.info("LLM key-replacement proxy listening on port %d", port)

@@ -11,21 +11,6 @@
 #   openscientist.job_id=<uuid>   set by JobContainerRunner at runtime
 #   openscientist.type=agent
 
-# --- Stage: build the open-codex CLI from the fork --------------------------
-# The open-codex branch carries the fixes that let codex drive open-weight
-# models served by Ollama: flatten MCP namespace tools for providers without
-# namespace support, a function-form apply_patch (with a +-prefix patch-body
-# description so open models format added lines correctly), and a web_search
-# capability gate that stops the hosted tool from corrupting tool calls on
-# non-OpenAI providers. Pinned to a commit on open-codex for reproducibility.
-FROM rust:1.95-bookworm AS codex-build
-ARG CODEX_REPO=https://github.com/LucaCappelletti94/codex.git
-ARG CODEX_REF=8f8009fcab89baafa51c15c9542734b1c94de8b6
-RUN git clone "${CODEX_REPO}" /codex \
-    && git -C /codex checkout "${CODEX_REF}" \
-    && cargo build --release --manifest-path /codex/codex-rs/Cargo.toml -p codex-cli \
-    && cp /codex/codex-rs/target/release/codex /usr/local/bin/codex
-
 FROM openscientist-base:latest
 
 # Install system dependencies for native extensions (scipy, h5py, scanpy, etc.) and Rust.
@@ -62,30 +47,19 @@ COPY pyproject.toml README.md uv.lock ./
 COPY src/ ./src/
 
 # Install dependencies including claude-agent-sdk and openai-codex (both listed
-# in pyproject.toml). The official openai-codex bundles its codex binary only as
-# a musl wheel, which is dropped via the uv override in pyproject.toml. The
-# binary is provisioned separately below.
+# in pyproject.toml). openai-codex brings the codex binary it is pinned to.
 RUN uv export --locked --no-dev --no-emit-project --format requirements-txt \
         -o /tmp/requirements.txt \
     && uv pip install --system -r /tmp/requirements.txt \
     && uv pip install --system --no-deps -e . \
     && rm /tmp/requirements.txt
 
-# Install the open-codex CLI built in the codex-build stage above (namespace
-# tools, function apply_patch, web_search capability gate, and the apply_patch
-# +-prefix description fix). Built from the fork rather than the upstream
-# release because the open-weight fixes are not yet upstream. It goes on PATH at
-# /usr/local/bin/codex, where CodexAgent._resolve_codex_bin (shutil.which) finds
-# it.
-COPY --from=codex-build /usr/local/bin/codex /usr/local/bin/codex
-RUN chmod +x /usr/local/bin/codex
-
 # omp harness CLI (OPENSCIENTIST_HARNESS=omp): pinned static binary onto PATH.
 # The checksum is the release asset digest, not just the tag: a git tag is
 # mutable and can be repointed at different bytes without this file changing,
 # and this binary runs with the job's database credentials in its environment.
-ARG OMP_VERSION=v17.1.5
-ARG OMP_SHA256=35019bfa4d1acae0040ef1f3d91c29c6e7401acfcdbcfeba6ff506a6b103c987
+ARG OMP_VERSION=v18.12.6
+ARG OMP_SHA256=85d9daf3a05fc76e8cd425ae1904eb576af8d21cc85fcf4690742626e07ccfa4
 ARG OMP_RELEASE_BASE=https://github.com/can1357/oh-my-pi/releases/download
 RUN curl -fsSL "${OMP_RELEASE_BASE}/${OMP_VERSION}/omp-linux-x64" -o /tmp/omp \
     && echo "${OMP_SHA256}  /tmp/omp" | sha256sum -c - \

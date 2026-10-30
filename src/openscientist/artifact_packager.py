@@ -8,7 +8,7 @@ into downloadable archives in various formats (ZIP, Markdown, JSON).
 import logging
 import zipfile
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,18 @@ _EXCLUDE_FILES = {"config.json", EXCLUDED_FILES_MANIFEST}
 MAX_ARTIFACT_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
+def _shown_dir(dir_path: Path) -> bool:
+    """Whether a directory of a job may hold artifacts. Linked directories are
+    never followed, since they could lead outside the job directory."""
+    return dir_path.name not in _EXCLUDE_DIRS and not dir_path.is_symlink()
+
+
+def _shown_file(file_path: Path) -> bool:
+    """Whether a file of a job is an artifact. Job directories are agent-writable,
+    so a file link could smuggle credentials or files from elsewhere in."""
+    return file_path.name not in _EXCLUDE_FILES and not file_path.is_symlink()
+
+
 def _iter_artifact_files(
     job_dir: Path,
     excluded_paths: set[Path] | None = None,
@@ -38,29 +50,34 @@ def _iter_artifact_files(
     excluded_paths = excluded_paths or set()
     for root, dirnames, filenames in job_dir.walk(top_down=True, follow_symlinks=False):
         # Prune before descent so linked directories are never traversed.
-        safe_dirnames: list[str] = []
-        for dirname in dirnames:
-            dir_path = root / dirname
-            if dirname in _EXCLUDE_DIRS:
-                continue
-            if dir_path.is_symlink():
-                continue
-            if dir_path.resolve() in excluded_paths:
-                continue
-            safe_dirnames.append(dirname)
-        dirnames[:] = safe_dirnames
-
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if _shown_dir(root / dirname) and (root / dirname).resolve() not in excluded_paths
+        ]
         for filename in filenames:
             file_path = root / filename
-            # Job directories are agent-writable. Do not let file links smuggle
-            # runtime credentials or files outside the job directory into an export.
-            if file_path.is_symlink():
-                continue
-            if file_path.resolve() in excluded_paths:
-                continue
-            if filename in _EXCLUDE_FILES:
-                continue
-            yield file_path, file_path.relative_to(job_dir)
+            if _shown_file(file_path) and file_path.resolve() not in excluded_paths:
+                yield file_path, file_path.relative_to(job_dir)
+
+
+def artifact_file(job_dir: Path, relative: str) -> Path | None:
+    """The file at ``relative`` in ``job_dir`` when the artifacts ZIP would
+    include it, or None."""
+    parts = PurePosixPath(relative).parts
+    if not parts or any(part in ("", ".", "..", "/") or "\\" in part for part in parts):
+        return None
+    path = job_dir
+    for dirname in parts[:-1]:
+        path = path / dirname
+        if not _shown_dir(path) or not path.is_dir():
+            return None
+    path = path / parts[-1]
+    if not _shown_file(path) or not path.is_file():
+        return None
+    if path.stat().st_size > MAX_ARTIFACT_FILE_SIZE_BYTES:
+        return None
+    return path
 
 
 def _partition_by_size(

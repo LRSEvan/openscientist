@@ -12,8 +12,9 @@ import os
 import re
 from functools import lru_cache
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 logger = logging.getLogger(__name__)
 _SIMPLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+$")
@@ -100,9 +101,8 @@ class ProviderSettings(BaseSettings):
         default=10, alias="AZURE_OPENAI_STREAM_MAX_RETRIES"
     )
 
-    # Ollama (Codex agent backend, open-weight models served locally through
-    # Ollama's OpenAI-compatible Responses endpoint). Local and keyless, so
-    # codex is told the provider needs no OpenAI auth.
+    # Ollama (omp-driven, open-weight models served locally through Ollama's
+    # OpenAI-compatible endpoint). Local and keyless.
     ollama_base_url: str = Field(default="http://localhost:11434/v1", alias="OLLAMA_BASE_URL")
 
     # vLLM (omp-driven, open-weight models served by a self-hosted vLLM server
@@ -194,28 +194,6 @@ class ProviderSettings(BaseSettings):
     azure_tenant_id: str | None = Field(default=None, alias="AZURE_TENANT_ID")
     azure_client_id: str | None = Field(default=None, alias="AZURE_CLIENT_ID")
     azure_client_secret: str | None = Field(default=None, alias="AZURE_CLIENT_SECRET")
-
-    _LEGACY_ENV_VAR_RENAMES = (
-        ("CLAUDE_PROVIDER", "OPENSCIENTIST_PROVIDER"),
-        ("ANTHROPIC_MODEL", "OPENSCIENTIST_MODEL"),
-    )
-
-    @model_validator(mode="after")
-    def reject_legacy_env_vars(self) -> "ProviderSettings":
-        """Raise a clear error when a removed env-var name is still set.
-
-        We do not silently accept legacy aliases. Users upgrading must
-        rename their environment variables explicitly so that the
-        running configuration matches what the code reads.
-        """
-        for legacy, canonical in self._LEGACY_ENV_VAR_RENAMES:
-            if os.environ.get(legacy):
-                raise ValueError(
-                    f"{legacy} has been renamed to {canonical}. "
-                    f"Rename the variable in your environment (and .env file) and unset "
-                    f"{legacy}. The legacy name is no longer accepted."
-                )
-        return self
 
     @model_validator(mode="after")
     def require_provider_selected(self) -> "ProviderSettings":
@@ -320,22 +298,63 @@ class DatabaseSettings(BaseSettings):
 
     database_url: str = Field(alias="DATABASE_URL")
 
-    # Admin database URL for elevated operations (bypasses RLS via DB role).
-    # If not set, falls back to DATABASE_URL.
+    # Login for admin sessions, which bypass RLS. The web process requires it.
+    # Agent containers load these settings without it.
     admin_database_url: str | None = Field(default=None, alias="ADMIN_DATABASE_URL")
 
     # Debug settings
     sql_echo: bool = Field(default=False, alias="SQL_ECHO")
+
+    # Seconds each connect waits for an unreachable database. The job runner
+    # sets it for agent containers, and the web fails fast.
+    connect_retry_seconds: float = Field(
+        default=0, ge=0, alias="OPENSCIENTIST_DB_CONNECT_RETRY_SECONDS"
+    )
 
     @property
     def effective_database_url(self) -> str:
         """Get the database URL."""
         return self.database_url
 
-    @property
-    def effective_admin_database_url(self) -> str:
-        """Get the admin database URL for elevated operations (bypasses RLS)."""
-        return self.admin_database_url or self.database_url
+    def required_admin_database_url(self) -> str:
+        """The admin login URL, for a process that opens admin sessions."""
+        if not self.admin_database_url:
+            raise ValueError(
+                "ADMIN_DATABASE_URL is not set. Admin sessions need the openscientist_admin "
+                "login and do not fall back to DATABASE_URL."
+            )
+        return self.admin_database_url
+
+
+class MigrationSettings(BaseSettings):
+    """Logins of the migration step (Alembic and the PubMed loader). The web never
+    loads these, so it holds no owner password."""
+
+    model_config = SettingsConfigDict(
+        env_file=(".env", ".env.owner"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    owner_database_url: str | None = Field(default=None, alias="OWNER_DATABASE_URL")
+    # Wins over a password in OWNER_DATABASE_URL, so .env.owner is its only source.
+    postgres_owner_password: SecretStr | None = Field(default=None, alias="POSTGRES_OWNER_PASSWORD")
+    # Password the migrations give openscientist_admin.
+    postgres_admin_password: SecretStr | None = Field(default=None, alias="POSTGRES_ADMIN_PASSWORD")
+
+    def required_owner_database_url(self) -> str:
+        """The openscientist_owner URL, with POSTGRES_OWNER_PASSWORD filled in."""
+        if not self.owner_database_url:
+            raise ValueError(
+                "OWNER_DATABASE_URL is not set. Migrations and the PubMed loader log in "
+                "as openscientist_owner."
+            )
+        url = make_url(self.owner_database_url)
+        if self.postgres_owner_password is not None:
+            password = self.postgres_owner_password.get_secret_value()
+            if password:
+                url = url.set(password=password)
+        return url.render_as_string(hide_password=False)
 
 
 class AuthSettings(BaseSettings):
@@ -549,6 +568,16 @@ class ContainerSettings(BaseSettings):
         alias="OPENSCIENTIST_HOST_PROJECT_DIR",
         description="Host path for project directory. Required when using agent containers.",
     )
+    llm_proxy_port: int = Field(
+        default=8081,
+        alias="OPENSCIENTIST_LLM_PROXY_PORT",
+        description="Port of the web's LLM key-replacement proxy, which agent containers call.",
+    )
+    exec_broker_port: int = Field(
+        default=8082,
+        alias="OPENSCIENTIST_EXEC_BROKER_PORT",
+        description="Port of the web's execution broker, which agent containers call.",
+    )
 
 
 class PhenixSettings(BaseSettings):
@@ -698,6 +727,10 @@ class Settings(BaseSettings):
     # Server settings
     port: int = Field(default=8080, alias="PORT")
     max_concurrent_jobs: int = Field(default=1, alias="OPENSCIENTIST_MAX_CONCURRENT_JOBS")
+    # Hours of slot use the queue weighs each owner's queued jobs by
+    scheduler_window_hours: float = Field(
+        default=24, gt=0, alias="OPENSCIENTIST_SCHEDULER_WINDOW_HOURS"
+    )
     base_url: str = Field(
         default="http://localhost:8080",
         alias="OPENSCIENTIST_BASE_URL",

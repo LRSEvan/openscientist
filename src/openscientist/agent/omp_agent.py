@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 
 _MCP_SERVER_NAME = "openscientist-tools"
 
-#: Written by the tools server on tools/list.
-MCP_HANDSHAKE_MARKER = "mcp_handshake"
+#: What omp prints when ``OMP_MCP_REQUIRE_READY`` makes it refuse the prompt
+#: because an MCP server did not connect within ``OMP_MCP_TIMEOUT_MS``.
+_MCP_NOT_READY = "MCP servers not ready"
 
 # Wall-clock bound on one turn; a stuck turn is cut and the loop advances.
 _TURN_TIMEOUT_SECONDS = int(os.environ.get("OPENSCIENTIST_OMP_TURN_TIMEOUT", "900"))
@@ -103,7 +104,7 @@ class OmpAgent(AbstractAgent[Provider]):
     # defaults: omp reads auth from the subprocess env and its model from
     # config.model_override, and folds chat guidance into the system prompt.
 
-    # Host omp store files copied to rebuild the vault in the job workspace
+    # Host omp store files copied to rebuild the vault in the run's home
     # (WAL/SHM included so an un-checkpointed db stays readable).
     _OMP_STORE_FILES: ClassVar[tuple[str, ...]] = (
         "agent.db",
@@ -112,12 +113,14 @@ class OmpAgent(AbstractAgent[Provider]):
         "config.yml",
     )
 
+    RUN_HOME: ClassVar[str | None] = ".omp-home"
+
     @classmethod
-    def provision_host_prelaunch(cls, settings: Settings, job_dir: Path) -> None:
-        """Copy the host omp credential vault into the job workspace, agent-writable
-        (mounting fails on permissions for the non-root agent), and point
-        ``PI_CODING_AGENT_DIR`` at the copy. No-op unless ``omp_auth_host_path``
-        is set (the API-key path needs no vault)."""
+    def provision_run_home(cls, settings: Settings, home: Path) -> None:
+        """Copy the host omp credential vault into the run's home, agent-writable
+        (mounting fails on permissions for the non-root agent), which the agent
+        uses as ``PI_CODING_AGENT_DIR``. No-op unless ``omp_auth_host_path`` is
+        set (the API-key path needs no vault)."""
         src = settings.provider.omp_auth_host_path
         if not src:
             return
@@ -125,22 +128,19 @@ class OmpAgent(AbstractAgent[Provider]):
         if not src_path.is_dir():
             logger.warning("omp_auth_host_path %s is not a directory, skipping", src_path)
             return
-        dest = job_dir / ".omp-home"
-        dest.mkdir(parents=True, exist_ok=True)
-        dest.chmod(0o777)
         copied = 0
         for name in cls._OMP_STORE_FILES:
             f = src_path / name
             if f.exists():
-                target = dest / name
+                target = home / name
                 shutil.copy2(f, target)
                 # Agent opens the SQLite vault read-write, so it must be writable.
                 target.chmod(0o666)
                 copied += 1
-        logger.info("Provisioned omp auth (%d files) into %s", copied, dest)
+        logger.info("Provisioned omp auth (%d files) into %s", copied, home)
 
     def _omp_home(self) -> Path:
-        return self._job_dir() / ".omp-home"
+        return self._job_dir() / str(self.RUN_HOME)
 
     def _job_dir(self) -> Path:
         # Absolute: omp resolves a relative --cwd against its own launch cwd.
@@ -252,7 +252,7 @@ class OmpAgent(AbstractAgent[Provider]):
             return
         home = self._omp_home()
         if not home.exists():
-            # Only when we create it: the vault provisioner already made it
+            # Only when we create it: a container run's home is already
             # agent-writable, and chmod on a root-owned dir fails for the agent.
             home.mkdir(parents=True, exist_ok=True)
             home.chmod(0o777)
@@ -271,6 +271,10 @@ class OmpAgent(AbstractAgent[Provider]):
         from the Claude Code ones the container env publishes, and letting the
         ambient environment win is how a provider ends up talking to the vendor
         directly with the real credential.
+
+        ``OMP_MCP_REQUIRE_READY`` is forced on after routing. Without it omp sends
+        the prompt anyway when the tools server misses its startup wait, and the
+        turn runs on built-ins alone.
         """
         provider_settings = get_settings().provider
         env = dict(os.environ)
@@ -289,6 +293,7 @@ class OmpAgent(AbstractAgent[Provider]):
 
         # Provider routing, applied last so it beats any ambient value.
         env.update(self._provider.harness_env(proxy=env.get(LLM_PROXY_URL_ENV)))
+        env["OMP_MCP_REQUIRE_READY"] = "1"
         return env
 
     #: omp built-in tools the discovery loop may use. ``--tools`` is an enable
@@ -377,17 +382,9 @@ class OmpAgent(AbstractAgent[Provider]):
         ]
         return "".join(parts)
 
-    def _mcp_handshake_marker(self) -> Path:
-        return self._omp_dir() / MCP_HANDSHAKE_MARKER
-
-    def _mcp_handshake_seen(self) -> bool:
-        return self._mcp_handshake_marker().exists()
-
-    def _clear_mcp_handshake(self) -> None:
-        self._mcp_handshake_marker().unlink(missing_ok=True)
-
-    def _missing_mcp_tools(self, result: IterationResult) -> bool:
-        return result.outcome is TurnOutcome.COMPLETED and not self._mcp_handshake_seen()
+    @staticmethod
+    def _missing_mcp_tools(result: IterationResult) -> bool:
+        return result.outcome is TurnOutcome.FAILED and _MCP_NOT_READY in result.error
 
     @staticmethod
     def _count_tool_calls(messages: list[dict[str, Any]]) -> int:
@@ -462,7 +459,6 @@ class OmpAgent(AbstractAgent[Provider]):
         system_prompt_path = self._write_system_prompt()
         self._write_mcp_config()
         config_path = self._write_omp_config()
-        self._clear_mcp_handshake()
         prompt_path = self._write_turn_prompt(prompt)
         args = self._build_args(system_prompt_path, prompt_path, config_path)
 
@@ -479,6 +475,7 @@ class OmpAgent(AbstractAgent[Provider]):
             self._pump(proc.stdout, stdout_buf), self._pump(proc.stderr, stderr_buf)
         )
         timed_out = False
+        cancelled: asyncio.CancelledError | None = None
         try:
             # One deadline over both awaits. Bounding only the pipe reads would
             # leave proc.wait() unbounded, so a process that closes its pipes
@@ -493,17 +490,22 @@ class OmpAgent(AbstractAgent[Provider]):
             timed_out = True
             logger.warning("omp turn exceeded %ds, cutting the turn", _TURN_TIMEOUT_SECONDS)
             await self._kill_tree(proc)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as e:
             # Stopping a job cancels this turn, and abandoning it here would leak
             # the tree exactly as the timeout used to. Signalled synchronously
             # because awaiting a graceful stop inside a cancelled task is not
-            # dependable, so there is no reliable window for SIGTERM.
+            # dependable, so there is no reliable window for SIGTERM. The cancel
+            # goes on once the partial stream's usage is counted below.
             self._signal_group(proc, signal.SIGKILL)
-            raise
+            cancelled = e
         finally:
             pump.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await pump
+        if cancelled is not None:
+            # Reaped so its pipes close while the event loop still runs.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
 
         stdout_bytes, stderr_bytes = bytes(stdout_buf), bytes(stderr_buf)
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")
@@ -552,6 +554,8 @@ class OmpAgent(AbstractAgent[Provider]):
         # tokens whether the turn completed, failed, or was cut short, and the
         # partial stream is what makes a timed-out turn's usage recoverable.
         self._token_usage += usage
+        if cancelled is not None:
+            raise cancelled
 
         # omp announces the session id in its first event but only writes the
         # session file once the turn has something to save. An id with no file
@@ -607,11 +611,11 @@ class OmpAgent(AbstractAgent[Provider]):
             # process tree and keep the output that already arrived.
             result = await self._run_omp(prompt)
 
-            # omp sometimes requests the model before asking for the tool list,
-            # silently leaving the agent on built-ins. Fatal, not FAILED: a failed
-            # report turn still completes the job when a report file exists.
+            # With OMP_MCP_REQUIRE_READY omp refuses the prompt when the tools
+            # server is not ready. Fatal, not FAILED: a failed report turn still
+            # completes the job when a report file exists.
             if self._missing_mcp_tools(result):
-                logger.warning("tools server was never asked for its tools, retrying the turn")
+                logger.warning("tools server was not ready, retrying the turn")
                 result = await self._run_omp(prompt)
                 if self._missing_mcp_tools(result):
                     raise McpToolsUnavailableError(

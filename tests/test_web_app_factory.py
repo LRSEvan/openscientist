@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,8 +59,11 @@ def test_main_reload_uses_factory_import_target(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr(web_app, "_settings_error", None)
     monkeypatch.setattr(
         "openscientist.settings.get_settings",
-        lambda: SimpleNamespace(dev=SimpleNamespace(dev_mode=True)),
+        lambda: SimpleNamespace(
+            dev=SimpleNamespace(dev_mode=True), database=SimpleNamespace(database_url="unused")
+        ),
     )
+    monkeypatch.setattr(web_app, "_refuse_unsafe_database_login", lambda _url: None)
 
     uvicorn_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
@@ -82,8 +86,11 @@ def test_main_non_reload_runs_with_created_app(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(web_app, "_settings_error", None)
     monkeypatch.setattr(
         "openscientist.settings.get_settings",
-        lambda: SimpleNamespace(dev=SimpleNamespace(dev_mode=False)),
+        lambda: SimpleNamespace(
+            dev=SimpleNamespace(dev_mode=False), database=SimpleNamespace(database_url="unused")
+        ),
     )
+    monkeypatch.setattr(web_app, "_refuse_unsafe_database_login", lambda _url: None)
 
     host_app = FastAPI()
     monkeypatch.setattr(web_app, "create_app", lambda jobs_dir=None: host_app)
@@ -103,7 +110,7 @@ def test_main_non_reload_runs_with_created_app(monkeypatch, tmp_path: Path) -> N
     assert kwargs["reload"] is False
 
 
-def test_register_nicegui_static_files_tolerates_duplicates(monkeypatch, tmp_path: Path) -> None:
+def test_register_nicegui_static_files_tolerates_duplicates(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
     def fake_add_static_files(route: str, directory: str) -> None:
@@ -113,10 +120,11 @@ def test_register_nicegui_static_files_tolerates_duplicates(monkeypatch, tmp_pat
 
     monkeypatch.setattr(web_app.app, "add_static_files", fake_add_static_files)
 
-    web_app._register_nicegui_static_files(tmp_path / "jobs")
+    web_app._register_nicegui_static_files()
 
+    # Job files are never static, since only users who may see the job get them.
     routes = [route for route, _ in calls]
-    assert routes == ["/jobs", "/assets"]
+    assert routes == ["/assets"]
 
 
 def test_register_robots_txt_serves_disallow_all() -> None:
@@ -209,3 +217,58 @@ def test_configure_host_app_registers_badge_and_thinking_status_head_html_once(
 
     assert len(badge_calls) == 1
     assert len(thinking_calls) == 1
+
+
+def _settings_with_admin_url(admin_url: str | None) -> SimpleNamespace:
+    from openscientist.settings import DatabaseSettings
+
+    database = DatabaseSettings(
+        DATABASE_URL="postgresql+asyncpg://user:pass@host:5432/db",
+        ADMIN_DATABASE_URL=admin_url,
+    )
+    return SimpleNamespace(database=database)
+
+
+def test_web_refuses_to_start_without_the_admin_url(monkeypatch, tmp_path: Path) -> None:
+    """The web opens admin sessions, so a missing admin URL is a configuration
+    error and main() serves the error page instead of the app."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADMIN_DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        "openscientist.settings.get_settings", lambda: _settings_with_admin_url(None)
+    )
+    error = web_app._validate_settings()
+    assert error is not None
+    assert "ADMIN_DATABASE_URL" in error
+
+
+def test_web_starts_with_the_admin_url(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "openscientist.settings.get_settings",
+        lambda: _settings_with_admin_url("postgresql+asyncpg://admin:pass@host:5432/db"),
+    )
+    assert web_app._validate_settings() is None
+
+
+def test_initialize_job_manager_runtime_installs_the_configured_manager(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The runtime initializer installs a global manager built from the
+    settings, and a second call leaves the existing manager in place."""
+    monkeypatch.setattr(
+        web_app,
+        "get_settings",
+        lambda: SimpleNamespace(max_concurrent_jobs=3, scheduler_window_hours=6),
+    )
+    monkeypatch.setattr(web_app.JobManager, "recover_after_restart", lambda self: None)
+    monkeypatch.setattr(web_app, "_state", web_app._AppState())
+
+    web_app._initialize_job_manager_runtime(tmp_path / "jobs")
+    manager = web_app.get_job_manager()
+    assert manager.max_concurrent == 3
+    assert manager.scheduler_window == timedelta(hours=6)
+    assert manager.jobs_dir == tmp_path / "jobs"
+
+    web_app._initialize_job_manager_runtime(tmp_path / "other")
+    assert web_app.get_job_manager() is manager

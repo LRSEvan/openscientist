@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import socket
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import httpx
 import pytest
 from starlette.testclient import TestClient
+from starlette.types import ASGIApp
+from uvicorn.config import Config
 
 from openscientist import exec_broker
 from openscientist.exec_broker import create_exec_broker_app
@@ -18,9 +24,9 @@ from openscientist.exec_broker_client import (
     BrokerError,
     execute_code_via_broker,
 )
-from openscientist.job_container.secrets import make_exec_placeholder
+from openscientist.job_container.secrets import issue_run_credentials, revoke_run_credentials
+from openscientist.settings import get_settings
 
-_MASTER = "master-key"
 _HOST_PROJECT = "/host/proj"
 
 _EXPECTED_KWARGS = {
@@ -45,9 +51,23 @@ def broker_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(exec_broker, "get_settings", lambda: settings)
 
 
+@pytest.fixture
+def token_for() -> Iterator[Callable[[str], str]]:
+    """Issue a live run's broker token for a job, ended after the test."""
+    roles: list[str] = []
+
+    def issue(job_id: str) -> str:
+        role = f"agent_{uuid4().hex}"
+        roles.append(role)
+        return issue_run_credentials(job_id, role).exec_token
+
+    yield issue
+    for role in roles:
+        revoke_run_credentials(role)
+
+
 def _client(manager: MagicMock) -> TestClient:
-    app = create_exec_broker_app(master_key=lambda: _MASTER, manager=lambda: manager)
-    return TestClient(app)
+    return TestClient(create_exec_broker_app(manager=lambda: manager))
 
 
 def _manager(result: dict[str, Any]) -> MagicMock:
@@ -74,10 +94,10 @@ def _body(job_id: str = "job-1", **overrides: Any) -> dict[str, Any]:
 
 @pytest.mark.usefixtures("broker_settings")
 class TestExecBrokerServer:
-    def test_valid_request_runs_executor_and_returns_result(self) -> None:
+    def test_valid_request_runs_executor_and_returns_result(self, token_for) -> None:
         result = {"success": True, "output": "1", "plots": [], "execution_time": 0.1}
         manager = _manager(result)
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         resp = _client(manager).post("/execute", json=_body(), headers={EXEC_TOKEN_HEADER: token})
         assert resp.status_code == 200
         assert resp.json() == result
@@ -86,10 +106,10 @@ class TestExecBrokerServer:
         # host path resolved back to the web container's own mount root
         assert kwargs["output_dir"] == Path("/app/jobs/job-1/provenance")
 
-    def test_rejects_token_for_a_different_job(self) -> None:
+    def test_rejects_token_for_a_different_job(self, token_for) -> None:
         manager = _manager({})
-        # A valid token, but for job-2, presented with a body claiming job-1.
-        token = make_exec_placeholder(_MASTER, "job-2")
+        # A live token, but for job-2, presented with a body claiming job-1.
+        token = token_for("job-2")
         resp = _client(manager).post(
             "/execute", json=_body(job_id="job-1"), headers={EXEC_TOKEN_HEADER: token}
         )
@@ -102,9 +122,18 @@ class TestExecBrokerServer:
         assert resp.status_code == 401
         manager.execute_code.assert_not_called()
 
-    def test_ignores_non_execute_code_fields(self) -> None:
+    def test_refuses_a_run_that_has_ended(self) -> None:
+        manager = _manager({})
+        role = f"agent_{uuid4().hex}"
+        token = issue_run_credentials("job-1", role).exec_token
+        revoke_run_credentials(role)
+        resp = _client(manager).post("/execute", json=_body(), headers={EXEC_TOKEN_HEADER: token})
+        assert resp.status_code == 401
+        manager.execute_code.assert_not_called()
+
+    def test_ignores_non_execute_code_fields(self, token_for) -> None:
         manager = _manager({"success": True, "output": "", "plots": [], "execution_time": 0.0})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(
             network_mode="host",
             volumes={"/etc": {"bind": "/etc"}},
@@ -118,34 +147,34 @@ class TestExecBrokerServer:
         # Only execute_code-shaped params reach the spawner, never a container spec.
         assert set(kwargs) == _EXPECTED_KWARGS
 
-    def test_rejects_output_dir_outside_job_directory(self) -> None:
+    def test_rejects_output_dir_outside_job_directory(self, token_for) -> None:
         manager = _manager({})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(output_dir=f"{_HOST_PROJECT}/jobs/other-job/provenance")
         resp = _client(manager).post("/execute", json=body, headers={EXEC_TOKEN_HEADER: token})
         assert resp.status_code == 403
         manager.execute_code.assert_not_called()
 
-    def test_rejects_data_file_outside_job_directory(self) -> None:
+    def test_rejects_data_file_outside_job_directory(self, token_for) -> None:
         manager = _manager({})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(data_files=[{"path": f"{_HOST_PROJECT}/jobs/victim/data/secret.csv"}])
         resp = _client(manager).post("/execute", json=body, headers={EXEC_TOKEN_HEADER: token})
         assert resp.status_code == 403
         manager.execute_code.assert_not_called()
 
-    def test_rejects_unsupported_language(self) -> None:
+    def test_rejects_unsupported_language(self, token_for) -> None:
         manager = _manager({})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         resp = _client(manager).post(
             "/execute", json=_body(language="ruby"), headers={EXEC_TOKEN_HEADER: token}
         )
         assert resp.status_code == 400
         manager.execute_code.assert_not_called()
 
-    def test_translates_and_confines_data_paths(self) -> None:
+    def test_translates_and_confines_data_paths(self, token_for) -> None:
         manager = _manager({"success": True, "output": "", "plots": [], "execution_time": 0.0})
-        token = make_exec_placeholder(_MASTER, "job-1")
+        token = token_for("job-1")
         body = _body(
             data_path=f"{_HOST_PROJECT}/jobs/job-1/data/primary.csv",
             data_files=[
@@ -158,6 +187,52 @@ class TestExecBrokerServer:
         assert kwargs["data_path"] == "/app/jobs/job-1/data/primary.csv"
         assert kwargs["data_files"][0]["path"] == "/app/jobs/job-1/data/primary.csv"
         assert kwargs["data_files"][0]["name"] == "primary.csv"
+
+
+class TestStartExecBroker:
+    """The always-on broker listener wires the real broker app into its task."""
+
+    async def test_start_wires_broker_app_and_starts_once(self, token_for, monkeypatch) -> None:
+        configs: list[Config] = []
+        served: list[socket.socket] = []
+
+        class _FakeServer:
+            def __init__(self, config: Config) -> None:
+                configs.append(config)
+
+            async def serve(self, sockets: list[socket.socket]) -> None:
+                served.extend(sockets)
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        monkeypatch.setenv("OPENSCIENTIST_EXEC_BROKER_PORT", str(port))
+        get_settings.cache_clear()
+        monkeypatch.setattr(exec_broker, "_NoSignalServer", _FakeServer)
+        monkeypatch.setattr(exec_broker, "_broker_server", None)
+        monkeypatch.setattr(exec_broker, "_broker_task", None)
+
+        try:
+            await exec_broker.start_exec_broker()
+            await exec_broker.start_exec_broker()
+            await asyncio.sleep(0)
+
+            # One listener on the configured broker port, holding the broker app.
+            assert len(configs) == 1
+            assert exec_broker._broker_task is not None
+            assert [sock.getsockname()[1] for sock in served] == [port]
+        finally:
+            for sock in served:
+                sock.close()
+            get_settings.cache_clear()
+
+        # The wired-up app is the real broker: a live token of another job is refused.
+        token = token_for("job-2")
+        app = cast("ASGIApp", configs[0].app)
+        resp = TestClient(app).post(
+            "/execute", json=_body(job_id="job-1"), headers={EXEC_TOKEN_HEADER: token}
+        )
+        assert resp.status_code == 401
 
 
 class TestExecBrokerClient:

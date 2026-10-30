@@ -60,3 +60,19 @@ class PDFGenerationError(OpenScientistError):
 
 class McpToolsUnavailableError(OpenScientistError):
     """Raised when a turn ran without the openscientist-tools MCP tools."""
+
+
+# ── Containers ────────────────────────────────────────────────────────
+
+#: The Makefile target that builds every image the web runs.
+BUILD_IMAGES_COMMAND = "make build"
+
+
+class MissingImageError(OpenScientistError):
+    """Raised when a container image the web runs is not on the Docker host."""
+
+    def __init__(self, image: str) -> None:
+        super().__init__(
+            f"Container image {image} not found. Build the images with '{BUILD_IMAGES_COMMAND}'."
+        )
+        self.image = image

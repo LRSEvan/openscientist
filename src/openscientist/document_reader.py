@@ -15,46 +15,6 @@ from docx import Document
 
 logger = logging.getLogger(__name__)
 
-# File extensions that require special extraction
-BINARY_DOCUMENT_EXTENSIONS = {
-    ".pdf",
-    ".docx",
-    ".doc",
-    ".xlsx",
-    ".xls",
-    ".pptx",
-    ".ppt",
-}
-
-# Extensions that can be read as text directly
-TEXT_EXTENSIONS = {
-    ".csv",
-    ".tsv",
-    ".txt",
-    ".json",
-    ".jsonl",
-    ".md",
-    ".markdown",
-    ".xml",
-    ".html",
-    ".htm",
-    ".yaml",
-    ".yml",
-    ".py",
-    ".r",
-    ".sh",
-}
-
-
-def is_binary_document(file_path: Path) -> bool:
-    """Check if a file is a binary document that needs special extraction."""
-    return file_path.suffix.lower() in BINARY_DOCUMENT_EXTENSIONS
-
-
-def is_text_file(file_path: Path) -> bool:
-    """Check if a file can be read as plain text."""
-    return file_path.suffix.lower() in TEXT_EXTENSIONS
-
 
 def extract_text_from_pdf(
     file_path: Path, max_pages: int | None = None

@@ -1,157 +1,77 @@
 """
 Database session management for OpenScientist.
 
-Provides async session factories and dependency injection for FastAPI/NiceGUI.
+Provides async sessions and dependency injection for FastAPI/NiceGUI. Every
+session binds the pooled engine of the loop it is opened on, so it works in
+any thread with a running loop.
 
 Session Types:
-    - get_session(): Standard session with RLS enforced via SET ROLE openscientist_app
+    - get_session(): Standard session with RLS enforced as openscientist_app
     - get_admin_session(): Admin session that bypasses RLS via elevated role
-    - AsyncSessionLocal(): Low-level session factory (also enforces RLS when used
-      without thread_safe, or via SET ROLE in thread-safe mode)
+    - async_session_local(): Low-level session, with no role or user of its own
 
-For the dual-engine pattern, get_session() connects as the main database user
-then immediately does SET ROLE openscientist_app to drop privileges. The openscientist_app
-role is a non-superuser NOLOGIN role that is subject to RLS policies.
+get_session() connects as the main database user, and every transaction it runs
+switches to openscientist_app, a non-superuser NOLOGIN role subject to RLS.
 """
 
 import logging
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from uuid import UUID
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
-
-from openscientist.settings import get_settings
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from .engine import get_admin_engine, get_engine
+from .rls import set_current_user, use_app_role
 
 logger = logging.getLogger(__name__)
 
-# Lazy session factories (initialized on first use)
-_session_factory: async_sessionmaker[AsyncSession] | None = None
-_admin_session_factory: async_sessionmaker[AsyncSession] | None = None
+
+def _session(engine: AsyncEngine) -> AsyncSession:
+    return AsyncSession(engine, expire_on_commit=False, autoflush=False)
 
 
-def _get_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Get or create the async session factory for standard operations."""
-    global _session_factory
-    if _session_factory is None:
-        _session_factory = async_sessionmaker(
-            get_engine(),
-            class_=AsyncSession,
-            expire_on_commit=False,
-            autocommit=False,
-            autoflush=False,
-        )
-    return _session_factory
+def thread_safe_admin_session() -> AsyncSession:
+    """An admin session for system work in the web process that acts for no user.
 
-
-def _get_admin_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Get or create the async session factory for admin operations.
-
-    This factory uses the admin engine which connects with an elevated
-    PostgreSQL role that bypasses RLS policies.
+    Connects with ``ADMIN_DATABASE_URL`` (``openscientist_admin``, BYPASSRLS).
     """
-    global _admin_session_factory
-    if _admin_session_factory is None:
-        _admin_session_factory = async_sessionmaker(
-            get_admin_engine(),
-            class_=AsyncSession,
-            expire_on_commit=False,
-            autocommit=False,
-            autoflush=False,
-        )
-    return _admin_session_factory
+    return _session(get_admin_engine())
 
 
-def _create_fresh_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Create a fresh session factory for the current event loop.
-
-    This creates a new engine with NullPool (no connection pooling)
-    for use in worker threads or contexts with different event loops.
-    The engine and factory are NOT cached because asyncpg connections
-    are bound to the event loop they were created in, and asyncio.run()
-    creates a new event loop each time.
-    """
-    settings = get_settings()
-    database_url = settings.database.effective_database_url
-
-    # Create a fresh engine with NullPool - no caching since each
-    # asyncio.run() creates a new event loop and connections are loop-bound
-    thread_engine = create_async_engine(
-        database_url,
-        poolclass=NullPool,  # No pooling - each connection is fresh
-        echo=settings.database.sql_echo,
-    )
-    return async_sessionmaker(
-        thread_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-        autocommit=False,
-        autoflush=False,
-    )
+@asynccontextmanager
+async def thread_safe_user_session(user_id: UUID) -> AsyncIterator[AsyncSession]:
+    """A session whose every transaction runs as ``user_id`` under RLS."""
+    async with _session(get_engine()) as session:
+        await use_app_role(session)
+        await set_current_user(session, user_id)
+        yield session
 
 
-def async_session_local(thread_safe: bool = False) -> AsyncSession:
+#: Opens the caller's session inside the coroutine that uses it.
+SessionOpener = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
+
+def async_session_local() -> AsyncSession:
     """Create a new async session.
-
-    Args:
-        thread_safe: If True, creates a fresh session factory with NullPool,
-                     safe for use in worker threads or separate event loops.
-                     Each call creates a new engine to avoid event loop conflicts.
-                     Default False uses the shared engine (main event loop only).
 
     Returns:
         A new AsyncSession instance.
 
     Note:
-        The returned session does NOT automatically SET ROLE openscientist_app.
-        Callers must use the session as a context manager and call
-        set_current_user() to set RLS context, or use get_session() instead.
+        The returned session runs as the login role. Callers that act for a user
+        call use_app_role() and set_current_user(), or use get_session() instead.
     """
-    if thread_safe:
-        return _create_fresh_session_factory()()
-    return _get_session_factory()()
-
-
-# Backward-compatible alias for older imports.
-AsyncSessionLocal = async_session_local
-
-
-async def _set_app_role(session: AsyncSession) -> None:
-    """Drop privileges to openscientist_app role for RLS enforcement.
-
-    The main database user (openscientist) is typically a superuser that bypasses
-    all RLS policies. By switching to openscientist_app (a non-superuser NOLOGIN role),
-    the session becomes subject to RLS policies.
-
-    This must be called on every new session before user-facing queries.
-    If the openscientist_app role does not exist, this will raise — that's intentional.
-    A silent fallback to superuser would bypass all RLS.
-    """
-    await session.execute(text("SET ROLE openscientist_app"))
-
-
-async def _clear_rls_user_context(session: AsyncSession) -> None:
-    """Clear app.current_user_id to prevent context leakage across pooled connections."""
-    with suppress(Exception):
-        await session.execute(text("SELECT set_config('app.current_user_id', NULL, false)"))
-
-
-async def _reset_role(session: AsyncSession) -> None:
-    """Restore the original database role after session use."""
-    with suppress(Exception):
-        await session.execute(text("RESET ROLE"))
+    return _session(get_engine())
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency to provide a database session with RLS enforced.
 
-    Connects as the main database user, then drops privileges to openscientist_app
-    via SET ROLE. The openscientist_app role is subject to RLS policies, ensuring
-    that queries only return rows the current user is authorized to see.
+    Connects as the main database user, and runs every transaction as
+    openscientist_app, which is subject to RLS policies, so queries only return
+    rows the current user is authorized to see.
 
     Callers must still call set_current_user(session, user_id) to set the
     RLS context for the specific user.
@@ -169,19 +89,14 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     Yields:
         AsyncSession: A SQLAlchemy async session with RLS enforced.
     """
-    factory = _get_session_factory()
-    async with factory() as session:
+    async with _session(get_engine()) as session:
         try:
-            # Drop to openscientist_app role so RLS policies are enforced
-            await _set_app_role(session)
-            await _clear_rls_user_context(session)
+            await use_app_role(session)
             yield session
         except Exception:
             await session.rollback()
             raise
         finally:
-            await _clear_rls_user_context(session)
-            await _reset_role(session)
             await session.close()
 
 
@@ -198,8 +113,7 @@ async def get_admin_session() -> AsyncGenerator[AsyncSession, None]:
     Sessions from this factory bypass RLS policies by connecting with
     the openscientist_admin PostgreSQL role which has BYPASSRLS privilege.
 
-    The role is created by docker/postgres/init.sql in production or by
-    the test setup in tests/conftest.py.
+    The role is created by docker/postgres/bootstrap.sql, which conftest also runs.
 
     Use this only for:
     - Background schedulers (no user context available)
@@ -218,15 +132,11 @@ async def get_admin_session() -> AsyncGenerator[AsyncSession, None]:
     Yields:
         AsyncSession: A SQLAlchemy async session with admin privileges.
     """
-    # Use the admin session factory which connects with elevated privileges
-    factory = _get_admin_session_factory()
-    async with factory() as session:
+    async with _session(get_admin_engine()) as session:
         try:
-            await _clear_rls_user_context(session)
             yield session
         except Exception:
             await session.rollback()
             raise
         finally:
-            await _clear_rls_user_context(session)
             await session.close()

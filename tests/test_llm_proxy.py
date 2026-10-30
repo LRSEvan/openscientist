@@ -1,9 +1,11 @@
 """Tests for the LLM key-replacement proxy (Claude backend)."""
 
-import hashlib
-import hmac
+import asyncio
+import socket
+from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import cast
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -12,13 +14,14 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
+from starlette.types import ASGIApp
+from uvicorn.config import Config
 
 from openscientist.job_container.runner import JobContainerRunner
 from openscientist.job_container.secrets import (
     derive_job_secret,
-    derive_llm_proxy_token,
-    make_job_placeholder,
-    verify_job_placeholder,
+    issue_run_credentials,
+    revoke_run_credentials,
 )
 from openscientist.llm_proxy import container_proxy_base_url, create_llm_proxy_app
 from openscientist.providers import get_provider
@@ -71,34 +74,19 @@ def active_provider(monkeypatch):
     get_settings.cache_clear()
 
 
-class TestProxyToken:
-    """Per-job proxy token and placeholder derivation."""
+@pytest.fixture
+def placeholder_for() -> Iterator[Callable[[str], str]]:
+    """Issue a live run's LLM placeholder for a job, ended after the test."""
+    roles: list[str] = []
 
-    def test_token_matches_reference_and_is_distinct(self):
-        reference = hmac.new(b"master", b"llm_proxy:job-1", hashlib.sha256).hexdigest()
-        assert derive_llm_proxy_token("master", "job-1") == reference
-        assert len(reference) == 64
-        # Distinct label from the settings secret, so one does not reveal the other.
-        assert derive_llm_proxy_token("master", "job-1") != derive_job_secret("master", "job-1")
-        assert derive_llm_proxy_token("master", "job-1") != "master"
+    def issue(job_id: str) -> str:
+        role = f"agent_{uuid4().hex}"
+        roles.append(role)
+        return issue_run_credentials(job_id, role).llm_placeholder
 
-    def test_placeholder_round_trip(self):
-        placeholder = make_job_placeholder("master", "job-1")
-        assert placeholder == "job-1." + derive_llm_proxy_token("master", "job-1")
-        assert verify_job_placeholder("master", placeholder)
-
-    def test_placeholder_rejects_tampering_and_wrong_master(self):
-        placeholder = make_job_placeholder("master", "job-1")
-        flipped = placeholder[:-1] + ("0" if placeholder[-1] != "0" else "1")
-        assert not verify_job_placeholder("master", flipped)
-        assert not verify_job_placeholder("other-master", placeholder)
-        assert not verify_job_placeholder("master", "no-separator")
-        assert not verify_job_placeholder("master", ".onlytoken")
-        assert not verify_job_placeholder("master", "jobonly.")
-
-    def test_placeholder_tolerates_job_id_with_separator(self):
-        placeholder = make_job_placeholder("master", "job.with.dots")
-        assert verify_job_placeholder("master", placeholder)
+    yield issue
+    for role in roles:
+        revoke_run_credentials(role)
 
 
 class TestClaudeUpstream:
@@ -424,25 +412,6 @@ class TestCodexConfigRedirect:
         toml = provider.codex_config_overrides()
         assert 'base_url = "https://myres.openai.azure.com/openai/v1"' in toml
 
-    def test_ollama_config_points_at_proxy(self, active_provider):
-        provider = active_provider(
-            OPENSCIENTIST_PROVIDER="ollama",
-            OLLAMA_BASE_URL="http://ollama:11434/v1",
-            OPENSCIENTIST_LLM_PROXY_URL="http://openscientist:8081",
-        )
-        toml = provider.codex_config_overrides()
-        assert 'base_url = "http://openscientist:8081"' in toml
-        assert "requires_openai_auth = true" in toml
-        assert 'env_key = "OPENAI_API_KEY"' in toml
-
-    def test_ollama_config_keyless_without_proxy(self, active_provider):
-        provider = active_provider(
-            OPENSCIENTIST_PROVIDER="ollama", OLLAMA_BASE_URL="http://ollama:11434/v1"
-        )
-        toml = provider.codex_config_overrides()
-        assert 'base_url = "http://ollama:11434/v1"' in toml
-        assert "requires_openai_auth = false" in toml
-
 
 class TestProxyBaseUrl:
     def test_default_and_override(self, monkeypatch):
@@ -489,12 +458,10 @@ def _recording_upstream(recorded: list[dict]) -> httpx.AsyncClient:
 class TestProxyForwarding:
     """The proxy authenticates, substitutes the real key, and forwards."""
 
-    def test_substitutes_key_and_preserves_request(self):
-        master = "master-key"
-        placeholder = make_job_placeholder(master, "job-1")
+    def test_substitutes_key_and_preserves_request(self, placeholder_for):
+        placeholder = placeholder_for("job-1")
         recorded: list[dict] = []
         app = create_llm_proxy_app(
-            master_key=lambda: master,
             upstream=lambda: LlmUpstream("https://upstream.test", {"x-api-key": "REAL-KEY"}),
             client=_recording_upstream(recorded),
         )
@@ -518,12 +485,10 @@ class TestProxyForwarding:
         assert forwarded["headers"]["anthropic-version"] == "2023-06-01"
         assert forwarded["body"] == b'{"m":1}'
 
-    def test_accepts_bearer_and_sets_authorization(self):
-        master = "master-key"
-        placeholder = make_job_placeholder(master, "job-x")
+    def test_accepts_bearer_and_sets_authorization(self, placeholder_for):
+        placeholder = placeholder_for("job-x")
         recorded: list[dict] = []
         app = create_llm_proxy_app(
-            master_key=lambda: master,
             upstream=lambda: LlmUpstream(
                 "https://cborg.test", {"authorization": "Bearer REAL-TOK"}
             ),
@@ -538,12 +503,10 @@ class TestProxyForwarding:
         assert resp.status_code == 200
         assert recorded[0]["headers"]["authorization"] == "Bearer REAL-TOK"
 
-    def test_forwards_responses_wire_with_query(self):
-        master = "master-key"
-        placeholder = make_job_placeholder(master, "job-c")
+    def test_forwards_responses_wire_with_query(self, placeholder_for):
+        placeholder = placeholder_for("job-c")
         recorded: list[dict] = []
         app = create_llm_proxy_app(
-            master_key=lambda: master,
             upstream=lambda: LlmUpstream(
                 "https://api.openai.com/v1", {"authorization": "Bearer REAL"}
             ),
@@ -564,7 +527,6 @@ class TestProxyForwarding:
     def test_rejects_invalid_token_without_forwarding(self):
         recorded: list[dict] = []
         app = create_llm_proxy_app(
-            master_key=lambda: "master-key",
             upstream=lambda: LlmUpstream("https://upstream.test", {"x-api-key": "REAL-KEY"}),
             client=_recording_upstream(recorded),
         )
@@ -577,21 +539,118 @@ class TestProxyForwarding:
         assert missing.status_code == 401
         assert recorded == []
 
-    def test_unsupported_provider_returns_502(self):
-        master = "master-key"
-        placeholder = make_job_placeholder(master, "job-1")
+    def test_refuses_a_run_that_has_ended_without_forwarding(self):
+        role = f"agent_{uuid4().hex}"
+        placeholder = issue_run_credentials("job-1", role).llm_placeholder
+        revoke_run_credentials(role)
+        recorded: list[dict] = []
+        app = create_llm_proxy_app(
+            upstream=lambda: LlmUpstream("https://upstream.test", {"x-api-key": "REAL-KEY"}),
+            client=_recording_upstream(recorded),
+        )
+        with TestClient(app) as client:
+            resp = client.post("/v1/messages", headers={"x-api-key": placeholder}, content=b"{}")
+        assert resp.status_code == 401
+        assert recorded == []
+
+    def test_unsupported_provider_returns_502(self, placeholder_for):
+        placeholder = placeholder_for("job-1")
 
         def _raise() -> LlmUpstream:
             raise ValueError("not supported")
 
         app = create_llm_proxy_app(
-            master_key=lambda: master,
             upstream=_raise,
             client=_recording_upstream([]),
         )
         with TestClient(app) as client:
             resp = client.post("/v1/messages", headers={"x-api-key": placeholder}, content=b"{}")
         assert resp.status_code == 502
+
+
+class TestStartLlmProxy:
+    """start_llm_proxy wires the real proxy app into its listener task."""
+
+    async def test_start_wires_proxy_app_and_starts_once(
+        self, active_provider, placeholder_for, monkeypatch
+    ) -> None:
+        from openscientist import llm_proxy
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        provider = active_provider(
+            OPENSCIENTIST_PROVIDER="anthropic",
+            ANTHROPIC_API_KEY="real-key",
+            OPENSCIENTIST_LLM_PROXY_PORT=str(port),
+        )
+        assert provider.airgap_egress().mode is AirgapEgress.PROXY
+
+        configs: list[Config] = []
+        served: list[socket.socket] = []
+
+        class _FakeServer:
+            def __init__(self, config: Config) -> None:
+                configs.append(config)
+
+            async def serve(self, sockets: list[socket.socket]) -> None:
+                served.extend(sockets)
+
+        recorded: list[dict] = []
+
+        async def endpoint(request: Request) -> StreamingResponse:
+            body = await request.body()
+            recorded.append(
+                {"path": request.url.path, "headers": dict(request.headers), "body": body}
+            )
+
+            async def stream():
+                yield b"upstream-body"
+
+            return StreamingResponse(stream())
+
+        upstream_app = Starlette(routes=[Route("/{path:path}", endpoint, methods=["GET", "POST"])])
+        real_async_client = httpx.AsyncClient
+
+        def make_client(*, timeout: httpx.Timeout | None = None) -> httpx.AsyncClient:
+            # Answer the started app's upstream in-memory, offline.
+            return real_async_client(transport=httpx.ASGITransport(app=upstream_app))
+
+        monkeypatch.setattr(llm_proxy, "_NoSignalServer", _FakeServer)
+        monkeypatch.setattr(llm_proxy, "_proxy_server", None)
+        monkeypatch.setattr(llm_proxy, "_proxy_task", None)
+        monkeypatch.setattr(httpx, "AsyncClient", make_client)
+
+        await llm_proxy.start_llm_proxy()
+        await llm_proxy.start_llm_proxy()
+        await asyncio.sleep(0)
+
+        # One listener on the configured proxy port, holding the proxy app.
+        assert len(configs) == 1
+        assert llm_proxy._proxy_task is not None
+        assert [sock.getsockname()[1] for sock in served] == [port]
+        for sock in served:
+            sock.close()
+        app = cast("ASGIApp", configs[0].app)
+
+        placeholder = placeholder_for("job-1")
+        with TestClient(app) as client:
+            missing = client.post("/v1/messages", content=b"{}")
+            ok = client.post(
+                "/v1/messages",
+                headers={"x-api-key": placeholder, "anthropic-version": "2023-06-01"},
+                content=b'{"m":1}',
+            )
+        # The wired-up app is the real proxy: a credentialless request is refused,
+        # and a live run's credential is substituted with the real key.
+        assert missing.status_code == 401
+        assert ok.status_code == 200
+        assert ok.content == b"upstream-body"
+        forwarded = recorded[0]
+        assert forwarded["path"] == "/v1/messages"
+        assert forwarded["headers"]["x-api-key"] == "real-key"
+        assert forwarded["headers"]["anthropic-version"] == "2023-06-01"
+        assert forwarded["body"] == b'{"m":1}'
 
 
 class TestRunnerInjection:
@@ -615,6 +674,8 @@ class TestRunnerInjection:
             job_id="job-1",
             job_mount="/agent/jobs/job-1",
             provider_env=provider_env,
+            database_url="postgresql://agent",
+            exec_token="job-1.exec",
         )
         assert env["ANTHROPIC_BASE_URL"] == "http://openscientist:8081"
         assert env["ANTHROPIC_API_KEY"] == "job-1.tok"

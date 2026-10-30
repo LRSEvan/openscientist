@@ -37,7 +37,7 @@ async def _time_query(conn: asyncpg.Connection, sql: str) -> list[float]:
 
 
 async def main() -> None:
-    dsn = to_asyncpg_dsn(get_settings().database.effective_admin_database_url)
+    dsn = to_asyncpg_dsn(get_settings().database.required_admin_database_url())
     conn = await asyncpg.connect(dsn)
     try:
         pubmed_rows = await conn.fetchval("SELECT count(*) FROM pubmed_articles")

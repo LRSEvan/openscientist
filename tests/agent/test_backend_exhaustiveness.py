@@ -20,10 +20,7 @@ from openscientist.agent.base import AbstractAgent, AgentBackend, IterationResul
 # Importing the concrete agents registers them as AbstractAgent subclasses.
 from openscientist.agent.claude_code_agent import ClaudeCodeAgent  # noqa: F401
 from openscientist.agent.codex_agent import CodexAgent
-from openscientist.agent.factory import (
-    agent_class_for_provider_id,
-    backend_for_provider_id,
-)
+from openscientist.agent.factory import agent_class_for_provider_id
 from openscientist.agent.omp_agent import OmpAgent  # noqa: F401
 from openscientist.prompts.common import BackendFragments
 from openscientist.providers import provider_class, provider_ids
@@ -94,8 +91,6 @@ def test_every_provider_resolves_to_a_concrete_agent() -> None:
     for provider_id in provider_ids():
         agent_cls = agent_class_for_provider_id(provider_id)
         assert agent_cls in concrete, provider_id
-        # The id-keyed backend resolver agrees with the resolved agent class.
-        assert backend_for_provider_id(provider_id) is agent_cls.backend, provider_id
 
 
 def test_every_provider_class_is_registered() -> None:

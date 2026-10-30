@@ -5,22 +5,24 @@ The page uses @ui.refreshable decorators to enable in-place updates
 without full page reloads.
 """
 
+import asyncio
 import json
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 from nicegui import ui
 
 from openscientist.agent.factory import agent_class_for_provider_id
-from openscientist.async_tasks import run_sync
 from openscientist.auth import get_current_user_id, is_current_user_admin, require_auth
 from openscientist.database.rls import set_current_user
-from openscientist.database.session import get_session_ctx
+from openscientist.database.session import get_session_ctx, thread_safe_user_session
 from openscientist.job.types import JobInfo, JobStatus
 from openscientist.job_chat import get_chat_history, send_chat_message
 from openscientist.job_manager import _db_get_job, _db_get_share_permission
@@ -71,10 +73,13 @@ def _derive_progress_from_ks(
     return iterations_completed, findings_count
 
 
-def _load_knowledge_state(job_id: str, user_id: str) -> tuple[dict[str, Any] | None, str | None]:
+async def _load_knowledge_state(
+    job_id: str, user_id: str
+) -> tuple[dict[str, Any] | None, str | None]:
     """Load knowledge state from database, returning (data, error_message)."""
     try:
-        ks = KnowledgeState.load_from_database_sync(job_id, UUID(user_id))
+        async with thread_safe_user_session(UUID(user_id)) as session:
+            ks = await KnowledgeState.load_from_database(job_id, session)
         return ks.to_dict(), None
     except Exception as e:
         logger.warning("Failed to load knowledge state from database for %s: %s", job_id, e)
@@ -274,6 +279,12 @@ def _collect_iteration_plots(
     return plots
 
 
+def _job_file_url(job_dir: Path, path: Path) -> str:
+    """The URL that serves ``path``, a file of the job in ``job_dir``, to users
+    who may see the job."""
+    return f"/web/jobs/{job_dir.name}/files/{quote(path.relative_to(job_dir).as_posix())}"
+
+
 def _render_iteration_plots(iter_provenance_dir: Path, iter_num: int) -> None:
     iteration_plots = _collect_iteration_plots(iter_provenance_dir, iter_num)
     if not iteration_plots:
@@ -293,8 +304,7 @@ def _render_iteration_plots(iter_provenance_dir: Path, iter_num: int) -> None:
                 ui.label(plot_title).classes("text-sm font-bold")
                 if description:
                     ui.label(description).classes("text-xs text-blue-700 italic")
-                plot_url = f"/{plot_file}"
-                ui.image(plot_url).classes("w-full")
+                ui.image(_job_file_url(iter_provenance_dir.parent, plot_file)).classes("w-full")
                 ui.button(
                     "Download",
                     on_click=lambda p=plot_file: ui.download(p.read_bytes(), filename=p.name),
@@ -579,18 +589,30 @@ def _next_iteration_for_feedback(ks_data: dict[str, Any] | None) -> int:
     return int(ks_data.get("iteration", 1))
 
 
-def _submit_feedback_and_continue(
+async def _submit_feedback_and_continue(
     job_dir: Path, job_id: str, user_id: str, completed_iter: int, feedback_text: str
 ) -> None:
-    ks = KnowledgeState.load_from_database_sync(job_id, UUID(user_id))
-    if feedback_text.strip():
-        ks.add_feedback(feedback_text.strip(), completed_iter)
-        ks.save_to_database_sync(job_id, UUID(user_id))
+    as_user = partial(thread_safe_user_session, UUID(user_id))
+    async with as_user() as session:
+        ks = await KnowledgeState.load_from_database(job_id, session)
+        if feedback_text.strip():
+            ks.add_feedback(feedback_text.strip(), completed_iter)
+            await ks.save_to_database(job_id, session)
 
     try:
-        run_sync(update_job_status(job_dir, "running"))
+        resumed = await update_job_status(
+            job_dir,
+            "running",
+            allowed_from=("awaiting_feedback",),
+            open_session=as_user,
+            retry_for=0,
+        )
     except Exception:
         ui.notify("Failed to continue job. Please try again.", type="negative")
+        return
+    if not resumed:
+        ui.notify("This job is no longer waiting for feedback.", type="warning")
+        ui.navigate.to(f"/job/{job_id}")
         return
     ui.notify("Continuing to next iteration", type="positive")
     ui.navigate.to(f"/job/{job_id}")
@@ -672,8 +694,8 @@ def _render_feedback_panel(
                 placeholder="e.g., Focus on metabolic pathways, or investigate the correlation with gene X...",
             ).classes("w-full")
 
-            def submit_feedback(fi: Any = feedback_input, ci: int = completed_iter) -> None:
-                _submit_feedback_and_continue(job_dir, job_id, user_id, ci, fi.value)
+            async def submit_feedback(fi: Any = feedback_input, ci: int = completed_iter) -> None:
+                await _submit_feedback_and_continue(job_dir, job_id, user_id, ci, fi.value)
 
             with ui.row().classes("w-full gap-2 mt-2"):
                 ui.button(
@@ -694,7 +716,7 @@ def _render_feedback_panel(
         _render_feedback_countdown(awaiting_since, active_timers)
 
 
-def _refresh_feedback_panel(
+async def _refresh_feedback_panel(
     feedback_container: ui.column,
     job_manager: Any,
     job_id: str,
@@ -705,7 +727,7 @@ def _refresh_feedback_panel(
     ks_data: dict[str, Any] | None = None,
 ) -> None:
     feedback_container.clear()
-    latest_job = job_manager.get_job(job_id)
+    latest_job = await job_manager.get_job(job_id)
     if latest_job is None:
         return
     _render_feedback_panel(
@@ -744,9 +766,9 @@ def _render_job_not_found() -> None:
     ui.button("Back to Jobs", on_click=lambda: ui.navigate.to("/jobs"))
 
 
-def _load_db_job_for_user(job_id: str, user_id: str) -> Any:
+async def _load_db_job_for_user(job_id: str, user_id: str) -> Any:
     try:
-        return run_sync(_db_get_job(job_id, user_id=UUID(user_id)))
+        return await _db_get_job(job_id, user_id=UUID(user_id))
     except ValueError:
         return None
     except Exception:
@@ -759,11 +781,11 @@ def _load_db_job_for_user(job_id: str, user_id: str) -> Any:
         return None
 
 
-def _resolve_job_permissions(job_id: str, user_id: str, db_job: Any) -> tuple[bool, bool]:
+async def _resolve_job_permissions(job_id: str, user_id: str, db_job: Any) -> tuple[bool, bool]:
     is_owner = db_job.owner_id == UUID(user_id)
     if is_owner:
         return True, True
-    share_permission = run_sync(_db_get_share_permission(job_id, UUID(user_id)))
+    share_permission = await _db_get_share_permission(job_id, UUID(user_id))
     return False, share_permission == "edit"
 
 
@@ -796,20 +818,20 @@ def _create_page_dialogs(job_id: str, job_manager: Any, user_id: str) -> tuple[A
     return share_dialog, delete_dialog, notifications_dialog
 
 
-def _build_job_detail_context(job_id: str) -> _JobDetailContext | None:
+async def _build_job_detail_context(job_id: str) -> _JobDetailContext | None:
     from openscientist import web_app
 
     job_manager = web_app.get_job_manager()
     user_id = get_current_user_id()
     assert user_id is not None
-    db_job = _load_db_job_for_user(job_id, user_id)
+    db_job = await _load_db_job_for_user(job_id, user_id)
     if db_job is None:
         return None
 
-    is_owner, can_edit = _resolve_job_permissions(job_id, user_id, db_job)
+    is_owner, can_edit = await _resolve_job_permissions(job_id, user_id, db_job)
 
     job_dir = job_manager.jobs_dir / job_id
-    ks_data, ks_load_error = _load_knowledge_state(job_id, user_id)
+    ks_data, ks_load_error = await _load_knowledge_state(job_id, user_id)
 
     # Derive progress from already-loaded KS data instead of loading it again via get_job()
     iterations_completed, findings_count = _derive_progress_from_ks(
@@ -1053,18 +1075,18 @@ def _handle_status_transition(
     render_job_stats.refresh()
 
 
-def _check_and_refresh(
+async def _check_and_refresh(
     context: _JobDetailContext,
     render_job_stats: Any,
     render_timeline: Any,
     stats_timer_holder: dict[str, Any],
 ) -> None:
-    db_job = run_sync(_db_get_job(context.job_id))
+    db_job = await _db_get_job(context.job_id)
     if db_job is None:
         _handle_missing_job_during_poll(stats_timer_holder)
         return
 
-    latest_ks, _ = _load_knowledge_state(context.job_id, context.user_id)
+    latest_ks, _ = await _load_knowledge_state(context.job_id, context.user_id)
 
     iters, findings = _derive_progress_from_ks(latest_ks, db_job.status, db_job.current_iteration)
     latest_job = JobInfo.from_db_model(db_job, iters, findings)
@@ -1086,7 +1108,7 @@ def _check_and_refresh(
     _handle_status_transition(context, latest_job, stats_timer_holder, render_job_stats)
 
 
-def _render_timeline_tab(context: _JobDetailContext) -> None:
+async def _render_timeline_tab(context: _JobDetailContext) -> None:
     @ui.refreshable
     def render_job_stats() -> None:
         _render_job_stats_content(context)
@@ -1101,7 +1123,7 @@ def _render_timeline_tab(context: _JobDetailContext) -> None:
     render_timeline()
 
     feedback_container = ui.column().classes("w-full")
-    _refresh_feedback_panel(
+    await _refresh_feedback_panel(
         feedback_container=feedback_container,
         job_manager=context.job_manager,
         job_id=context.job_id,
@@ -1115,8 +1137,8 @@ def _render_timeline_tab(context: _JobDetailContext) -> None:
     stats_timer_holder: dict[str, Any] = {"timer": None}
 
     @guard_client
-    def check_and_refresh() -> None:
-        _check_and_refresh(context, render_job_stats, render_timeline, stats_timer_holder)
+    async def check_and_refresh() -> None:
+        await _check_and_refresh(context, render_job_stats, render_timeline, stats_timer_holder)
 
     if context.job_info.status in _polling_statuses():
         stats_timer_holder["timer"] = ui.timer(2.0, check_and_refresh)
@@ -1127,7 +1149,7 @@ def _download_artifacts_zip(job_id: str) -> None:
     ui.download(f"/web/jobs/{job_id}/artifacts.zip")
 
 
-def _download_pdf_report(report_path: Path, pdf_path: Path, job_id: str) -> None:
+async def _download_pdf_report(report_path: Path, pdf_path: Path, job_id: str) -> None:
     # Serve existing PDF if available (avoids overwriting WeasyPrint PDF with fpdf2)
     if pdf_path.exists():
         ui.download(pdf_path.read_bytes(), filename=f"{job_id}_report.pdf")
@@ -1141,7 +1163,8 @@ def _download_pdf_report(report_path: Path, pdf_path: Path, job_id: str) -> None
         stripped_path = report_path.parent / "_final_report_stripped.md"
         stripped_path.write_text(stripped, encoding="utf-8")
         try:
-            markdown_to_pdf(stripped_path, pdf_path)
+            # Rendering a long report takes seconds of CPU.
+            await asyncio.to_thread(markdown_to_pdf, stripped_path, pdf_path)
         finally:
             stripped_path.unlink(missing_ok=True)
         ui.download(pdf_path.read_bytes(), filename=f"{job_id}_report.pdf")
@@ -1159,7 +1182,7 @@ def _can_regenerate_report(context: _JobDetailContext) -> bool:
     return is_current_user_admin() and context.job_info.status == JobStatus.COMPLETED
 
 
-def _regenerate_report(context: _JobDetailContext) -> None:
+async def _regenerate_report(context: _JobDetailContext) -> None:
     """Admin action: re-run only the report-generation phase for this job.
 
     Launches the agent container in report-only mode (the discovery iterations
@@ -1175,7 +1198,7 @@ def _regenerate_report(context: _JobDetailContext) -> None:
         ui.notify("You are not authorized to regenerate reports.", type="negative")
         return
     try:
-        context.job_manager.regenerate_report(context.job_id)
+        await context.job_manager.regenerate_report(context.job_id)
     except ValueError as exc:
         ui.notify(str(exc), type="negative")
         return
@@ -1199,9 +1222,9 @@ def _confirm_regenerate_report(context: _JobDetailContext) -> None:
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=dialog.close).props("flat color=grey")
 
-            def _confirm() -> None:
+            async def _confirm() -> None:
                 dialog.close()
-                _regenerate_report(context)
+                await _regenerate_report(context)
 
             ui.button("Regenerate", on_click=_confirm).props("color=primary")
     dialog.open()
@@ -1237,48 +1260,9 @@ def _render_report_actions(context: _JobDetailContext, report_path: Path, pdf_pa
 
 def _render_report_html_iframe(job_dir: Path) -> None:
     """Render HTML report in an iframe to avoid CSS leakage."""
-    from nicegui import app
-
-    html_path = job_dir / "final_report.html"
-    if not html_path.exists():
+    if not (job_dir / "final_report.html").exists():
         return
-
-    # Re-render with base64 images for browser display
-    try:
-        from openscientist.report.renderer import render_report_html
-
-        md_path = job_dir / "final_report.md"
-        html_content = render_report_html(md_path, job_dir, embed_images=True)
-    except Exception:
-        logger.warning("Failed to re-render HTML with base64 images, using on-disk version")
-        html_content = html_path.read_text(encoding="utf-8")
-
-    # Open external links in a new tab; leave #fragment links (TOC) alone
-    html_content = html_content.replace(
-        "</body>",
-        """<script>
-document.addEventListener('click', function(e) {
-  var a = e.target.closest('a');
-  if (!a) return;
-  var href = a.getAttribute('href') || '';
-  if (href.startsWith('#')) return;
-  e.preventDefault();
-  window.open(href, '_blank', 'noopener,noreferrer');
-});
-</script></body>""",
-        1,
-    )
-
-    # Serve as a static route and embed in iframe
-    route_path = f"/report-html/{job_dir.name}"
-
-    @app.get(route_path)
-    async def _serve_report_html():  # type: ignore[no-untyped-def]
-        from starlette.responses import HTMLResponse
-
-        return HTMLResponse(html_content)
-
-    ui.element("iframe").props(f'src="{route_path}" frameborder="0"').style(
+    ui.element("iframe").props(f'src="/web/jobs/{job_dir.name}/report.html" frameborder="0"').style(
         "width: 100%; height: 80vh; border: 1px solid #ddd; border-radius: 8px;"
     )
 
@@ -1709,7 +1693,7 @@ def _render_chat_tab(context: _JobDetailContext) -> None:
     _ChatTabController(context).render()
 
 
-def _render_job_tabs(context: _JobDetailContext) -> None:
+async def _render_job_tabs(context: _JobDetailContext) -> None:
     with ui.tabs().classes("w-full") as tabs:
         timeline_tab = ui.tab("Research Log")
         report_tab = ui.tab("Report")
@@ -1717,7 +1701,7 @@ def _render_job_tabs(context: _JobDetailContext) -> None:
 
     with ui.tab_panels(tabs, value=timeline_tab).classes("w-full"):
         with ui.tab_panel(timeline_tab):
-            _render_timeline_tab(context)
+            await _render_timeline_tab(context)
         with ui.tab_panel(report_tab):
             _render_report_tab(context)
         with ui.tab_panel(chat_tab):
@@ -1726,9 +1710,9 @@ def _render_job_tabs(context: _JobDetailContext) -> None:
 
 @ui.page("/job/{job_id}")
 @require_auth
-def job_detail_page(job_id: str) -> None:
+async def job_detail_page(job_id: str) -> None:
     """Job detail page with progressive disclosure UI."""
-    context = _build_job_detail_context(job_id)
+    context = await _build_job_detail_context(job_id)
     if context is None:
         _render_job_not_found()
         return
@@ -1736,4 +1720,4 @@ def job_detail_page(job_id: str) -> None:
     ui.page_title(f"{_job_page_title(context.job_info)} - OpenScientist")
     render_navigator()
     _render_job_status_notices(context)
-    _render_job_tabs(context)
+    await _render_job_tabs(context)

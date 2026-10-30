@@ -9,16 +9,18 @@ services:
   postgres:
     image: postgres:18
     restart: ${OPENSCIENTIST_RESTART_POLICY:-unless-stopped}
+    # The superuser password comes from .env.db, which the web never loads.
+    env_file:
+      - path: .env.db
+        required: true
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-openscientist}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openscientist_dev_password}
       POSTGRES_DB: ${POSTGRES_DB:-openscientist}
+    # Published on loopback only, so other machines cannot reach the database.
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
-      # Init script creates openscientist_admin role for RLS bypass
-      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openscientist} -d ${POSTGRES_DB:-openscientist}"]
       interval: 10s
@@ -26,20 +28,65 @@ services:
       retries: 5
       start_period: 10s
 
+  # As the superuser, creates or updates the database logins and hands the schema
+  # to openscientist_owner. Runs on every `up`, before the migrations.
+  db-bootstrap:
+    image: postgres:18
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env.db
+        required: true
+      - path: .env.owner
+        required: true
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openscientist}
+      POSTGRES_DB: ${POSTGRES_DB:-openscientist}
+      POSTGRES_WEB_PASSWORD: ${POSTGRES_WEB_PASSWORD:?set POSTGRES_WEB_PASSWORD in .env}
+      POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}
+    volumes:
+      - ./docker/postgres/bootstrap.sql:/bootstrap.sql:ro
+    entrypoint:
+      - sh
+      - -c
+      - PGPASSWORD="$$POSTGRES_PASSWORD" exec psql -X -q -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -f /bootstrap.sql
+
+  # Alembic as openscientist_owner. Loads only the owner password, never the
+  # superuser's. The PubMed loader runs here too:
+  #   docker compose run --rm migrate python -m openscientist.pubmed_mirror
+  migrate:
+    platform: ${OPENSCIENTIST_PLATFORM:-}
+    build: .
+    restart: "no"
+    depends_on:
+      db-bootstrap:
+        condition: service_completed_successfully
+    env_file:
+      - path: .env.owner
+        required: true
+    environment:
+      OWNER_DATABASE_URL: postgresql+asyncpg://openscientist_owner@postgres:5432/${POSTGRES_DB:-openscientist}
+      POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}
+    volumes:
+      - ./src:/app/src
+    command: ["alembic", "upgrade", "head"]
+
   openscientist:
     stdin_open: true # docker run -i
     tty: true        # docker run -t
     platform: ${OPENSCIENTIST_PLATFORM:-}
     build: .
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "${PORT:-8080}:8080"
     # In dev mode, restart=no; in production, restart=unless-stopped
     restart: ${OPENSCIENTIST_RESTART_POLICY:-unless-stopped}
-    # Map host.docker.internal to the host gateway so the in-page chat's codex
-    # agent can reach a host-local model endpoint (e.g. Ollama at
+    # Map host.docker.internal to the host gateway so the web's LLM proxy and
+    # context-window probe can reach a host-local model endpoint (e.g. Ollama at
     # http://host.docker.internal:11434/v1). Mirrors what job_container/runner.py
     # adds for agent containers. Harmless for providers that do not use it.
     extra_hosts:
@@ -50,8 +97,8 @@ services:
         required: false
     environment:
       # Database URLs use the 'postgres' service hostname — must override any .env value
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-openscientist}:${POSTGRES_PASSWORD:-openscientist_dev_password}@postgres:5432/${POSTGRES_DB:-openscientist}
-      ADMIN_DATABASE_URL: postgresql+asyncpg://openscientist_admin:${POSTGRES_PASSWORD:-openscientist_dev_password}@postgres:5432/${POSTGRES_DB:-openscientist}
+      DATABASE_URL: postgresql+asyncpg://openscientist_web:${POSTGRES_WEB_PASSWORD:?set POSTGRES_WEB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-openscientist}
+      ADMIN_DATABASE_URL: postgresql+asyncpg://openscientist_admin:${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-openscientist}
       PORT: ${PORT:-8080}
 
       # Phenix: PHENIX_HOST_PATH points to a Linux x86_64 Phenix directory on the
@@ -74,7 +121,6 @@ services:
       OMP_AUTH_HOST_PATH: ${OMP_AUTH_DIR:+/app/omp-auth}
 
       # Container isolation defaults
-      OPENSCIENTIST_USE_CONTAINER_ISOLATION: ${OPENSCIENTIST_USE_CONTAINER_ISOLATION:-true}
       OPENSCIENTIST_EXECUTOR_IMAGE: ${OPENSCIENTIST_EXECUTOR_IMAGE:-openscientist-executor:latest}
       OPENSCIENTIST_AGENT_IMAGE: ${OPENSCIENTIST_AGENT_IMAGE:-openscientist-agent:latest}
       OPENSCIENTIST_EXECUTOR_MEMORY: ${OPENSCIENTIST_EXECUTOR_MEMORY:-2g}

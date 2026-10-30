@@ -1,13 +1,14 @@
 """Standalone Phenix structural biology tools (`run_phenix_tool`,
 `compare_structures`, `parse_alphafold_confidence`).
 
-All three register only when `check_phenix_available()` is true, mirroring
-the in-process gate. The function bodies are defined unconditionally so
-tests can import and call them regardless of the env state.
+All three register only when `_phenix_installed()` is true. The function
+bodies are defined unconditionally so tests can import and call them
+regardless of the env state.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -65,14 +66,14 @@ def _format_phenix_output(
     return "".join(output_parts)
 
 
-def _log_phenix_execution(
+async def _log_phenix_execution(
     tool_name: str,
     input_files: list[str],
     description: str,
     success: bool,
 ) -> None:
     """Record Phenix tool execution in knowledge state."""
-    ks = KnowledgeState.load_from_database_sync(STATE.job_id)
+    ks = await KnowledgeState.load_from_database(STATE.job_id)
     ks.log_analysis(
         action="run_phenix_tool",
         tool_name=tool_name,
@@ -80,10 +81,10 @@ def _log_phenix_execution(
         description=description,
         success=success,
     )
-    ks.save_to_database_sync(STATE.job_id)
+    await ks.save_to_database(STATE.job_id)
 
 
-def _run_phenix_tool_impl(
+async def _run_phenix_tool_impl(
     tool_name: str,
     input_files: list[str],
     arguments: dict[str, object] | None = None,
@@ -100,7 +101,8 @@ def _run_phenix_tool_impl(
 
     cmd = _build_phenix_command(tool_name, resolved_files, arguments)
     try:
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             cmd,
             env=phenix_env,
             capture_output=True,
@@ -115,7 +117,7 @@ def _run_phenix_tool_impl(
     except (OSError, subprocess.SubprocessError) as e:
         return f"❌ Error running {tool_name}: {e}"
 
-    _log_phenix_execution(
+    await _log_phenix_execution(
         tool_name=tool_name,
         input_files=input_files,
         description=description,
@@ -173,7 +175,7 @@ def _load_pae_entry_count(pae_path: Path) -> int | None:
     return 1
 
 
-def run_phenix_tool(
+async def run_phenix_tool(
     tool_name: str,
     input_files: list[str],
     arguments: dict[str, Any] | None = None,
@@ -195,7 +197,7 @@ def run_phenix_tool(
     Returns:
         Tool output (stdout/stderr, parsed results if available)
     """
-    return _run_phenix_tool_impl(
+    return await _run_phenix_tool_impl(
         tool_name=tool_name,
         input_files=input_files,
         arguments=arguments,
@@ -203,7 +205,9 @@ def run_phenix_tool(
     )
 
 
-def compare_structures(experimental_pdb: str, predicted_pdb: str, description: str = "") -> str:
+async def compare_structures(
+    experimental_pdb: str, predicted_pdb: str, description: str = ""
+) -> str:
     """Compare experimental and predicted protein structures using Phenix.
 
     Args:
@@ -215,7 +219,7 @@ def compare_structures(experimental_pdb: str, predicted_pdb: str, description: s
         Alignment results with RMSD values and statistics
     """
     desc = description or "Comparing experimental and predicted structures"
-    result = _run_phenix_tool_impl(
+    result = await _run_phenix_tool_impl(
         tool_name="phenix.superpose_pdbs",
         input_files=[experimental_pdb, predicted_pdb],
         description=desc,
@@ -288,12 +292,7 @@ def parse_alphafold_confidence(alphafold_pdb: str, pae_json: str | None = None) 
 
 
 def _phenix_installed() -> bool:
-    """Direct PHENIX_PATH env-var probe.
-
-    Avoids `openscientist.phenix_setup.check_phenix_available`, which
-    routes through `get_settings()` and crashes at module import when
-    `DATABASE_URL` is not set yet.
-    """
+    """Probe PHENIX_PATH directly, since `get_settings()` fails at import without `DATABASE_URL`."""
     phenix_path = os.environ.get("PHENIX_PATH")
     if not phenix_path:
         return False

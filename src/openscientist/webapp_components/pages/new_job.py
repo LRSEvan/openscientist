@@ -51,7 +51,7 @@ def _notify_creation_error(error: Exception) -> None:
     ui.notify("Error creating job. Please try again or contact support.", type="negative")
 
 
-def _submit_job(
+async def _submit_job(
     *,
     job_manager: Any,
     user_can_start_jobs: bool,
@@ -82,7 +82,7 @@ def _submit_job(
     mode = "coinvestigate" if coinvestigate_mode.value else "autonomous"
 
     try:
-        job_manager.create_job(
+        await job_manager.create_job(
             job_id=job_id,
             research_question=question,
             data_files=data_files,
@@ -116,7 +116,7 @@ async def _handle_upload(e: Any, session_id: str) -> None:
 
 @ui.page("/new")
 @require_auth
-def new_job_page() -> None:
+async def new_job_page() -> None:
     """Job submission form."""
     from openscientist import web_app
 

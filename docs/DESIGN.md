@@ -233,7 +233,6 @@ OpenScientist runs as a Docker container:
 
 ```bash
 make build            # Build the Docker image
-make build-no-cache   # Build without cache (for dependency updates)
 make start            # Start the container
 make restart          # Restart without rebuilding
 ```

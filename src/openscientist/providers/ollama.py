@@ -1,11 +1,9 @@
-"""Ollama provider (drives the Codex agent against a local model).
+"""Ollama provider (drives omp against a local model).
 
-Routes the Codex agent at a locally hosted Ollama server through its
-OpenAI-compatible Responses endpoint (default
-``http://localhost:11434/v1``), which serves open-weight models such as
-``gpt-oss:20b`` with tool calling. Ollama is local and keyless, so codex
-is told the provider needs no OpenAI auth (``requires_openai_auth =
-false``) and no API key is sent.
+Routes omp at a locally hosted Ollama server through its OpenAI-compatible
+endpoint (default ``http://localhost:11434/v1``), which serves open-weight
+models such as ``gpt-oss:20b`` with tool calling. Ollama is local and keyless,
+so no API key is sent.
 
 Because the server runs on the host, the base URL must be reachable from
 wherever the agent runs. In-process on the dev box ``localhost`` works
@@ -23,11 +21,10 @@ import requests
 from openscientist.models import ModelProfile, probed_model_profile
 from openscientist.providers.base import (
     LLM_PROXY_URL_ENV,
-    CodexCompatible,
     CostInfo,
     LlmUpstream,
     OmpModelCatalog,
-    self_hosted_codex_provider_table,
+    OpenAiWireCompatible,
     self_hosted_omp_model_catalog,
 )
 from openscientist.settings import ProviderSettings, get_settings
@@ -75,8 +72,8 @@ def _probe_ollama_context_tokens(base_url: str, model_id: str) -> int | None:
     return None
 
 
-class OllamaProvider(CodexCompatible):
-    """Local Ollama server as a Codex backend (open-weight models)."""
+class OllamaProvider(OpenAiWireCompatible):
+    """Local Ollama server driven by omp (open-weight models)."""
 
     @property
     def id(self) -> str:
@@ -120,20 +117,10 @@ class OllamaProvider(CodexCompatible):
         return LlmUpstream(get_settings().provider.ollama_base_url, {})
 
     def proxy_env_overrides(self, *, proxy_base_url: str, placeholder: str) -> dict[str, str]:
-        # Codex sends the placeholder so the proxy authenticates the container.
+        # omp sends the placeholder so the proxy authenticates the container.
         return {"OPENAI_API_KEY": placeholder, LLM_PROXY_URL_ENV: proxy_base_url}
 
-    def codex_config_overrides(self) -> list[str]:
-        proxy = os.environ.get(LLM_PROXY_URL_ENV)
-        return self_hosted_codex_provider_table(
-            provider_id=self.codex_model_provider_id(),
-            name=self.display_name,
-            base_url=proxy or get_settings().provider.ollama_base_url,
-            # Ollama has no credential of its own, so only the proxy keys it.
-            keyed=bool(proxy),
-        )
-
-    def codex_model_name(self) -> str | None:
+    def effective_model_name(self) -> str | None:
         # Ollama holds several models and picks one per request, so a default
         # here keeps it zero-config. It lives with the provider rather than as a
         # second env var that OPENSCIENTIST_MODEL would silently override.
@@ -157,14 +144,6 @@ class OllamaProvider(CodexCompatible):
         if not model:
             return None
         return _probe_ollama_context_tokens(get_settings().provider.ollama_base_url, model)
-
-    def codex_model_provider_id(self) -> str:
-        # Not "ollama": codex reserves that id for its built-in provider.
-        return "ollama-local"
-
-    def codex_sdk_env(self) -> dict[str, str]:
-        # Keyless: nothing to forward into the codex child environment.
-        return {}
 
     def omp_model_catalog(self, *, context_window: int) -> OmpModelCatalog | None:
         model_id = self.effective_model_name()

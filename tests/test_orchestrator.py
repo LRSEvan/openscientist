@@ -1,7 +1,7 @@
 """Tests for orchestrator helper functions.
 
 Only tests pure/helper functions that don't spawn subprocesses or require
-the full agent loop. The run_discovery integration is too heavyweight for
+the full agent loop. The run_discovery_async integration is too heavyweight for
 unit testing.
 """
 
@@ -20,7 +20,6 @@ from openscientist.agent.base import TurnOutcome
 from openscientist.orchestrator import (
     get_version_metadata,
     increment_ks_iteration,
-    update_job_status,
 )
 from openscientist.settings import clear_settings_cache
 
@@ -144,7 +143,7 @@ class TestVersionMetadataHarness:
 
     def test_codex_probes_the_binary_the_agent_runs(self, pinned_harness, monkeypatch):
         pinned_harness("openai", "codex")
-        monkeypatch.setenv("OPENSCIENTIST_CODEX_BIN", "/opt/pinned/codex")
+        monkeypatch.setattr("codex_cli_bin.bundled_codex_path", lambda: Path("/opt/pinned/codex"))
         calls: list[list[str]] = []
 
         def fake_run(argv, **kwargs):
@@ -209,127 +208,6 @@ class TestVersionMetadataHarness:
         info = get_version_metadata()
         assert info["agent_harness"] == "omp"
         assert "agent_harness_version" not in info
-
-
-# ─── update_job_status ────────────────────────────────────────────────
-
-
-class TestUpdateJobStatus:
-    """Tests for DB-backed job status updates."""
-
-    @pytest.mark.asyncio
-    async def test_update_status(self, tmp_path):
-        job_id = str(uuid4())
-        job_dir = tmp_path / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        job = MagicMock()
-        job.status = "pending"
-        job.owner_id = None
-        job.short_title = None
-        job.research_question = "Test job"
-
-        job_result = MagicMock()
-        job_result.scalar_one_or_none.return_value = job
-
-        with patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls:
-            mock_session = AsyncMock()
-            mock_session.execute = AsyncMock(return_value=job_result)
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_session
-            mock_cm.__aexit__.return_value = False
-            mock_session_cls.return_value = mock_cm
-
-            await update_job_status(job_dir, "running")
-
-        assert job.status == "running"
-        mock_session.flush.assert_awaited_once()
-        mock_session.commit.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_awaiting_feedback_sends_notification(self, tmp_path):
-        job_id = str(uuid4())
-        job_dir = tmp_path / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        owner_id = uuid4()
-        job = MagicMock()
-        job.status = "running"
-        job.owner_id = owner_id
-        job.short_title = "Short title"
-        job.research_question = "Long title"
-        job.current_iteration = 4
-
-        job_result = MagicMock()
-        job_result.scalar_one_or_none.return_value = job
-
-        user_row = MagicMock()
-        user_row.ntfy_enabled = True
-        user_row.ntfy_topic = "topic-123"
-        user_result = MagicMock()
-        user_result.first.return_value = user_row
-
-        with (
-            patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls,
-            patch(
-                "openscientist.orchestrator.iteration.notify_job_status_change",
-                new_callable=AsyncMock,
-            ) as mock_notify,
-        ):
-            mock_session = AsyncMock()
-            mock_session.execute = AsyncMock(side_effect=[job_result, user_result])
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_session
-            mock_cm.__aexit__.return_value = False
-            mock_session_cls.return_value = mock_cm
-
-            await update_job_status(job_dir, "awaiting_feedback")
-
-        mock_notify.assert_awaited_once()
-        kwargs = mock_notify.await_args.kwargs
-        assert kwargs["job_id"] == job_id
-        assert kwargs["job_title"] == "Short title"
-        assert kwargs["new_status"] == "awaiting_feedback"
-        assert kwargs["iteration"] == 4
-
-    @pytest.mark.asyncio
-    async def test_running_does_not_send_feedback_notification(self, tmp_path):
-        job_id = str(uuid4())
-        job_dir = tmp_path / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        job = MagicMock()
-        job.status = "awaiting_feedback"
-        job.owner_id = uuid4()
-        job.short_title = "Short"
-        job.research_question = "Title"
-
-        job_result = MagicMock()
-        job_result.scalar_one_or_none.return_value = job
-
-        user_row = MagicMock()
-        user_row.ntfy_enabled = True
-        user_row.ntfy_topic = "topic-123"
-        user_result = MagicMock()
-        user_result.first.return_value = user_row
-
-        with (
-            patch("openscientist.orchestrator.iteration.AsyncSessionLocal") as mock_session_cls,
-            patch(
-                "openscientist.orchestrator.iteration.notify_job_status_change",
-                new_callable=AsyncMock,
-            ) as mock_notify,
-        ):
-            mock_session = AsyncMock()
-            mock_session.execute = AsyncMock(side_effect=[job_result, user_result])
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_session
-            mock_cm.__aexit__.return_value = False
-            mock_session_cls.return_value = mock_cm
-
-            await update_job_status(job_dir, "running")
-
-        mock_notify.assert_not_awaited()
 
 
 # ─── discovery cancellation / failure flow ────────────────────────────
@@ -412,15 +290,12 @@ class TestDiscoveryCancellationAndFailure:
             ]
         )
 
-        mock_provider = MagicMock()
-
         with (
             patch(
                 "openscientist.orchestrator.discovery._load_runtime_context",
                 new_callable=AsyncMock,
                 return_value=runtime,
             ),
-            patch("openscientist.orchestrator.discovery.get_provider", return_value=mock_provider),
             patch(
                 "openscientist.orchestrator.discovery._build_agent_executor",
                 return_value=mock_executor,
@@ -438,7 +313,7 @@ class TestDiscoveryCancellationAndFailure:
             patch("openscientist.orchestrator.discovery._append_iteration_artifacts"),
             patch("openscientist.orchestrator.discovery._sync_version_metadata"),
             patch(
-                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch("openscientist.orchestrator.discovery.increment_ks_iteration"),
@@ -500,15 +375,12 @@ class TestDiscoveryCancellationAndFailure:
             ]
         )
 
-        mock_provider = MagicMock()
-
         with (
             patch(
                 "openscientist.orchestrator.discovery._load_runtime_context",
                 new_callable=AsyncMock,
                 return_value=runtime,
             ),
-            patch("openscientist.orchestrator.discovery.get_provider", return_value=mock_provider),
             patch(
                 "openscientist.orchestrator.discovery._build_agent_executor",
                 return_value=mock_executor,
@@ -526,7 +398,7 @@ class TestDiscoveryCancellationAndFailure:
             patch("openscientist.orchestrator.discovery._append_iteration_artifacts"),
             patch("openscientist.orchestrator.discovery._sync_version_metadata"),
             patch(
-                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch("openscientist.orchestrator.discovery.increment_ks_iteration"),
@@ -542,6 +414,333 @@ class TestDiscoveryCancellationAndFailure:
         assert result["status"] == "failed"
         mock_report_phase.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_coinvestigate_wait_stops_when_the_job_stopped_running(self, tmp_path):
+        """The container must not pause for feedback once the job is no longer running."""
+        from openscientist.orchestrator.discovery import (
+            _DiscoveryCancelledError,
+            _wait_for_coinvestigate_feedback,
+        )
+
+        job_dir = tmp_path / str(uuid4())
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery.update_job_status",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery.wait_for_feedback_or_timeout",
+                new_callable=AsyncMock,
+            ) as mock_wait,
+        ):
+            with pytest.raises(_DiscoveryCancelledError, match="no longer running"):
+                await _wait_for_coinvestigate_feedback(
+                    job_dir=job_dir,
+                    investigation_mode="coinvestigate",
+                    current_iteration=1,
+                    max_iterations=4,
+                )
+
+        mock_wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_coinvestigate_wait_stops_when_the_job_ended_while_waiting(
+        self, test_engine, tmp_path
+    ):
+        """A job that ended while the feedback panel was open is not resumed."""
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from openscientist.database.models import Job
+        from openscientist.orchestrator.discovery import (
+            _DiscoveryCancelledError,
+            _wait_for_coinvestigate_feedback,
+        )
+
+        async with AsyncSession(test_engine, expire_on_commit=False) as session:
+            job = Job(research_question="Q?", status="cancelled")
+            session.add(job)
+            await session.commit()
+        try:
+            job_dir = tmp_path / str(job.id)
+            job_dir.mkdir()
+            with (
+                patch(
+                    "openscientist.orchestrator.discovery.update_job_status",
+                    new_callable=AsyncMock,
+                    side_effect=[True, False],
+                ),
+                patch(
+                    "openscientist.orchestrator.discovery.wait_for_feedback_or_timeout",
+                    new_callable=AsyncMock,
+                    return_value={"outcome": "timeout", "feedback_text": None},
+                ),
+            ):
+                with pytest.raises(_DiscoveryCancelledError, match="is cancelled"):
+                    await _wait_for_coinvestigate_feedback(
+                        job_dir=job_dir,
+                        investigation_mode="coinvestigate",
+                        current_iteration=1,
+                        max_iterations=4,
+                    )
+        finally:
+            async with test_engine.begin() as conn:
+                await conn.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": job.id})
+
+    @pytest.mark.asyncio
+    async def test_executor_prep_stops_when_the_job_stopped_running(self, tmp_path):
+        """The agent workspace is not prepared once the job is no longer running."""
+        from openscientist.orchestrator.discovery import (
+            _build_and_prepare_executor,
+            _DiscoveryCancelledError,
+        )
+
+        job_dir = tmp_path / str(uuid4())
+        job_dir.mkdir()
+        runtime = {
+            "job_id": job_dir.name,
+            "use_hypotheses": False,
+            "data_files": [str(job_dir / "data.csv")],
+        }
+        executor = MagicMock()
+        executor.prepare_job_workspace = AsyncMock()
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=executor,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery.update_job_status",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            with pytest.raises(_DiscoveryCancelledError, match="no longer running"):
+                await _build_and_prepare_executor(job_dir, runtime)
+
+        executor.prepare_job_workspace.assert_not_awaited()
+
+
+# ─── guarded status writes ───────────────────────────────────────────
+
+
+class TestGuardedStatusWrites:
+    """A status write its guard refuses is reported as not applied."""
+
+    @pytest.mark.asyncio
+    async def test_update_of_an_invalid_job_id_is_not_applied(self, tmp_path):
+        from openscientist.orchestrator.iteration import update_job_status
+
+        job_dir = tmp_path / "not-a-uuid"
+        job_dir.mkdir()
+
+        assert await update_job_status(job_dir, "running", allowed_from=("running",)) is False
+
+    @pytest.mark.asyncio
+    async def test_a_database_error_reaches_the_caller(self, tmp_path):
+        from openscientist.orchestrator.iteration import update_job_status
+
+        job_dir = tmp_path / str(uuid4())
+        job_dir.mkdir()
+
+        def _broken_session():
+            raise RuntimeError("connection refused")
+
+        with pytest.raises(RuntimeError, match="connection refused"):
+            await update_job_status(
+                job_dir, "running", allowed_from=("running",), open_session=_broken_session
+            )
+
+
+class TestDiscoveryCompletion:
+    """A finished run reports the progress persisted in the knowledge state."""
+
+    @staticmethod
+    def _runtime(job_id: str, max_iterations: int) -> dict:
+        return {
+            "job_id": job_id,
+            "research_question": "Question?",
+            "max_iterations": max_iterations,
+            "use_hypotheses": False,
+            "investigation_mode": "autonomous",
+            "data_files": [],
+        }
+
+    @staticmethod
+    def _executor(outcomes: list) -> MagicMock:
+        from openscientist.agent.base import TokenUsage
+
+        executor = MagicMock()
+        executor.total_tokens = TokenUsage()
+        executor.shutdown = AsyncMock()
+        executor.prepare_job_workspace = AsyncMock()
+        executor.warm_model_profile = AsyncMock()
+        executor.run_iteration = AsyncMock(side_effect=outcomes)
+        return executor
+
+    @pytest.mark.asyncio
+    async def test_run_discovery_completes_and_reports_the_persisted_progress(self, tmp_path):
+        from openscientist.agent.base import IterationResult, TurnOutcome
+        from openscientist.knowledge_state import KnowledgeState
+        from openscientist.orchestrator.discovery import run_discovery_async
+
+        job_id = str(uuid4())
+        (tmp_path / job_id).mkdir(parents=True, exist_ok=True)
+
+        ks = KnowledgeState(job_id, "Question?", 3)
+        ks.add_finding("A finding", "evidence")
+        ks.data["iteration"] = 3
+
+        outcomes = [
+            IterationResult(
+                outcome=TurnOutcome.COMPLETED, output="iteration done", tool_calls=0, transcript=[]
+            )
+            for _ in range(3)
+        ]
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._load_runtime_context",
+                new_callable=AsyncMock,
+                return_value=self._runtime(job_id, 3),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=self._executor(outcomes),
+            ) as mock_executor,
+            patch(
+                "openscientist.orchestrator.discovery._run_report_generation_phase",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._persist_final_status",
+                new_callable=AsyncMock,
+                return_value="completed",
+            ),
+            patch("openscientist.orchestrator.discovery.update_job_status", new_callable=AsyncMock),
+            patch("openscientist.orchestrator.discovery._append_iteration_artifacts"),
+            patch("openscientist.orchestrator.discovery._sync_version_metadata"),
+            patch(
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
+                return_value=ks,
+            ),
+            patch("openscientist.orchestrator.discovery.increment_ks_iteration") as mock_increment,
+            patch(
+                "openscientist.orchestrator.discovery._get_job_status",
+                new_callable=AsyncMock,
+                return_value="running",
+                create=True,
+            ),
+        ):
+            result = await run_discovery_async(tmp_path / job_id)
+
+        # Every iteration ran, the persisted iteration counter advanced, and the
+        # result the caller sees carries the knowledge state's own progress.
+        assert mock_executor.return_value.run_iteration.await_count == 3
+        assert mock_increment.await_count == 2
+        assert result == {
+            "job_id": job_id,
+            "status": "completed",
+            "iterations": ks.data["iteration"],
+            "findings": len(ks.data["findings"]),
+        }
+
+    @pytest.mark.asyncio
+    async def test_regenerate_report_completes_and_reports_the_persisted_progress(self, tmp_path):
+        from openscientist.knowledge_state import KnowledgeState
+        from openscientist.orchestrator.discovery import regenerate_report_async
+
+        job_id = str(uuid4())
+        (tmp_path / job_id).mkdir(parents=True, exist_ok=True)
+
+        ks = KnowledgeState(job_id, "Question?", 2)
+        ks.add_finding("A finding", "evidence")
+        ks.data["iteration"] = 2
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._load_runtime_context",
+                new_callable=AsyncMock,
+                return_value=self._runtime(job_id, 2),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=self._executor([]),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._run_report_generation_phase",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._persist_final_status",
+                new_callable=AsyncMock,
+                return_value="completed",
+            ),
+            patch("openscientist.orchestrator.discovery.update_job_status", new_callable=AsyncMock),
+            patch("openscientist.orchestrator.discovery._sync_version_metadata"),
+            patch(
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
+                return_value=ks,
+            ),
+        ):
+            result = await regenerate_report_async(tmp_path / job_id)
+
+        assert result == {
+            "job_id": job_id,
+            "status": "completed",
+            "iterations": ks.data["iteration"],
+            "findings": len(ks.data["findings"]),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_failed_regeneration_still_reports_the_persisted_progress(self, tmp_path):
+        from openscientist.knowledge_state import KnowledgeState
+        from openscientist.orchestrator.discovery import regenerate_report_async
+
+        job_id = str(uuid4())
+        (tmp_path / job_id).mkdir(parents=True, exist_ok=True)
+
+        ks = KnowledgeState(job_id, "Question?", 2)
+        ks.add_finding("A finding", "evidence")
+        ks.data["iteration"] = 2
+
+        with (
+            patch(
+                "openscientist.orchestrator.discovery._load_runtime_context",
+                new_callable=AsyncMock,
+                return_value=self._runtime(job_id, 2),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._build_agent_executor",
+                return_value=self._executor([]),
+            ),
+            patch(
+                "openscientist.orchestrator.discovery._run_report_generation_phase",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("report exploded"),
+            ),
+            patch("openscientist.orchestrator.discovery.update_job_status", new_callable=AsyncMock),
+            patch("openscientist.orchestrator.discovery._sync_version_metadata"),
+            patch(
+                "openscientist.orchestrator.discovery.KnowledgeState.load_from_database",
+                return_value=ks,
+            ),
+        ):
+            result = await regenerate_report_async(tmp_path / job_id)
+
+        # The caller still learns the persisted progress behind the failure.
+        assert result == {
+            "job_id": job_id,
+            "status": "failed",
+            "iterations": ks.data["iteration"],
+            "findings": len(ks.data["findings"]),
+            "error": "report exploded",
+        }
+
 
 # ─── increment_ks_iteration ──────────────────────────────────────────
 
@@ -549,7 +748,8 @@ class TestDiscoveryCancellationAndFailure:
 class TestIncrementKsIteration:
     """Tests for atomic iteration increment."""
 
-    def test_increments_iteration(self):
+    @pytest.mark.asyncio
+    async def test_increments_iteration(self):
         from openscientist.knowledge_state import KnowledgeState
 
         ks = KnowledgeState("job1", "Q?", 10)
@@ -557,19 +757,20 @@ class TestIncrementKsIteration:
 
         with (
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database",
             ) as mock_save,
         ):
-            increment_ks_iteration("job1")
+            await increment_ks_iteration("job1")
 
         assert ks.data["iteration"] == 4
-        mock_save.assert_called_once_with("job1")
+        mock_save.assert_awaited_once_with("job1")
 
-    def test_preserves_other_fields(self):
+    @pytest.mark.asyncio
+    async def test_preserves_other_fields(self):
         from openscientist.knowledge_state import KnowledgeState
 
         ks = KnowledgeState("job1", "Q?", 10)
@@ -579,14 +780,14 @@ class TestIncrementKsIteration:
 
         with (
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.load_from_database",
                 return_value=ks,
             ),
             patch(
-                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database_sync",
+                "openscientist.orchestrator.iteration.KnowledgeState.save_to_database",
             ),
         ):
-            increment_ks_iteration("job1")
+            await increment_ks_iteration("job1")
 
         assert ks.data["iteration"] == 2
         assert len(ks.data["findings"]) == 1
@@ -615,7 +816,7 @@ class TestWriteSkillsToClaudeDir:
 
         agent = ClaudeCodeAgent(AgentConfig(job_dir=tmp_path), StubClaudeProvider())
         with (
-            patch("openscientist.database.session.AsyncSessionLocal") as mock_session_cls,
+            patch("openscientist.database.session.async_session_local") as mock_session_cls,
             patch(
                 "openscientist.prompts.get_enabled_skills", new_callable=AsyncMock
             ) as mock_get_skills,
@@ -987,23 +1188,6 @@ class TestAppendLog:
         assert "Iteration 2" in content
 
 
-# ─── packaged chat template ───────────────────────────────────────────
-
-
-class TestChatTemplate:
-    """The packaged CHAT_CLAUDE.md must match the repo copy so the in-image
-    template stays in sync with the source of truth. (Writing the chat context
-    is the agent's job, exercised in tests/test_job_chat.py.)"""
-
-    def test_packaged_template_matches_repo_copy(self):
-        from openscientist.prompts.common import read_chat_template
-
-        repo_copy = (Path(__file__).resolve().parents[1] / "CHAT_CLAUDE.md").read_text(
-            encoding="utf-8"
-        )
-        assert read_chat_template() == repo_copy
-
-
 # ─── build_initial_prompt ──────────────────────────────────────────────
 
 
@@ -1280,7 +1464,7 @@ class TestReportGenerationPhase:
                 outcome=TurnOutcome.COMPLETED, output="", tool_calls=0, transcript=[]
             )
 
-        with patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks):
+        with patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks):
             await discovery._set_consensus_answer(
                 SimpleNamespace(
                     run_iteration=fake_run,
@@ -1314,7 +1498,7 @@ class TestReportGenerationPhase:
                 outcome=TurnOutcome.COMPLETED, output="", tool_calls=0, transcript=[]
             )
 
-        with patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks):
+        with patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks):
             await discovery._set_consensus_answer(
                 SimpleNamespace(
                     run_iteration=fake_run,
@@ -1345,7 +1529,7 @@ class TestReportGenerationPhase:
                 outcome=TurnOutcome.COMPLETED, output="", tool_calls=0, transcript=[]
             )
 
-        with patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks):
+        with patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks):
             await discovery._set_consensus_answer(
                 SimpleNamespace(
                     run_iteration=fake_run,
@@ -1373,7 +1557,7 @@ class TestReportGenerationPhase:
             )
 
         with (
-            patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks),
+            patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks),
             patch.object(discovery, "build_report_prompt", return_value="R"),
             patch.object(discovery, "_save_report_transcript"),
             patch.object(discovery, "_ensure_report_written", return_value=True),
@@ -1408,7 +1592,7 @@ class TestReportGenerationPhase:
             )
 
         with (
-            patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks),
+            patch.object(discovery.KnowledgeState, "load_from_database", return_value=ks),
             patch.object(discovery, "build_report_prompt", return_value="R"),
             patch.object(discovery, "build_report_retry_prompt", return_value="RETRY"),
             patch.object(discovery, "_save_report_transcript"),
@@ -1427,88 +1611,6 @@ class TestReportGenerationPhase:
         assert outcome.success is False
         # Report attempted _MAX times, so the consensus turn is never reached.
         assert len(calls) == discovery._MAX_REPORT_ATTEMPTS
-
-
-class TestRegenerateReportAsync:
-    """The admin report-only re-run reuses persisted findings and must NOT
-    re-run the discovery iterations."""
-
-    @staticmethod
-    def _runtime() -> dict[str, Any]:
-        return {
-            "job_id": "j",
-            "research_question": "Q?",
-            "description": "ctx",
-            "use_hypotheses": False,
-            "data_files": [],
-            "max_iterations": 3,
-            "investigation_mode": "autonomous",
-        }
-
-    @pytest.mark.asyncio
-    async def test_skips_discovery_loop_and_runs_report(self, tmp_path: Path):
-        from openscientist.knowledge_state import KnowledgeState
-        from openscientist.orchestrator import discovery
-
-        ks = KnowledgeState("j", "Q?", 3)
-        executor = SimpleNamespace()
-        report_phase = AsyncMock(return_value=discovery._ReportOutcome(success=True, error=""))
-
-        with (
-            patch.object(
-                discovery, "_load_runtime_context", new=AsyncMock(return_value=self._runtime())
-            ),
-            patch.object(
-                discovery, "_build_and_prepare_executor", new=AsyncMock(return_value=executor)
-            ),
-            patch.object(discovery, "_run_primary_discovery_loop", new=AsyncMock()) as loop,
-            patch.object(discovery, "_run_report_generation_phase", new=report_phase),
-            patch.object(
-                discovery, "_persist_final_status", new=AsyncMock(return_value="completed")
-            ),
-            patch.object(discovery, "_finalize_executor", new=AsyncMock()) as finalize,
-            patch.object(discovery.KnowledgeState, "load_from_database_sync", return_value=ks),
-        ):
-            result = await discovery.regenerate_report_async(tmp_path)
-
-        # The discovery iterations are never re-run, only the report phase runs.
-        loop.assert_not_awaited()
-        report_phase.assert_awaited_once()
-        # The executor is always finalized (cost record + shutdown).
-        finalize.assert_awaited_once()
-        assert result["status"] == "completed"
-
-    @pytest.mark.asyncio
-    async def test_failure_marks_job_failed_and_finalizes(self, tmp_path: Path):
-        from openscientist.orchestrator import discovery
-
-        executor = SimpleNamespace()
-
-        with (
-            patch.object(
-                discovery, "_load_runtime_context", new=AsyncMock(return_value=self._runtime())
-            ),
-            patch.object(
-                discovery, "_build_and_prepare_executor", new=AsyncMock(return_value=executor)
-            ),
-            patch.object(
-                discovery,
-                "_run_report_generation_phase",
-                new=AsyncMock(side_effect=RuntimeError("boom")),
-            ),
-            patch.object(discovery, "update_job_status", new=AsyncMock()) as update_status,
-            patch.object(discovery, "_finalize_executor", new=AsyncMock()) as finalize,
-            patch.object(
-                discovery.KnowledgeState,
-                "load_from_database_sync",
-                side_effect=Exception("no ks"),
-            ),
-        ):
-            result = await discovery.regenerate_report_async(tmp_path)
-
-        assert result["status"] == "failed"
-        update_status.assert_awaited()  # job marked failed
-        finalize.assert_awaited_once()  # executor still cleaned up
 
 
 class TestEnsureReportWritten:

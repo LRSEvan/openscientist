@@ -118,40 +118,34 @@ class TestGetProvider:
 
 
 class TestAgentBackendForProvider:
-    """`backend_for_provider_id` maps a provider id to its agent backend
-    without instantiating the provider (which would validate auth)."""
+    """`agent_class_for_provider_id` maps a provider id to its agent backend
+    without instantiating the provider, which would validate auth (no auth env
+    is set here)."""
 
     def test_codex_compatible_provider_maps_to_codex(self):
         from openscientist.agent.base import AgentBackend
-        from openscientist.agent.factory import backend_for_provider_id
+        from openscientist.agent.factory import agent_class_for_provider_id
 
-        assert backend_for_provider_id("openai") is AgentBackend.CODEX
-        assert backend_for_provider_id("azure-openai") is AgentBackend.CODEX
-        assert backend_for_provider_id("ollama") is AgentBackend.CODEX
-        # vLLM is OpenAI-wire but not a Codex backend, so omp is its only harness.
-        assert backend_for_provider_id("vllm") is AgentBackend.OMP
-        # llama.cpp is likewise OpenAI-wire but not a Codex backend.
-        assert backend_for_provider_id("llamacpp") is AgentBackend.OMP
+        assert agent_class_for_provider_id("openai").backend is AgentBackend.CODEX
+        assert agent_class_for_provider_id("azure-openai").backend is AgentBackend.CODEX
+        # Ollama, vLLM and llama.cpp are OpenAI-wire but not Codex backends, so
+        # omp is their only harness.
+        assert agent_class_for_provider_id("ollama").backend is AgentBackend.OMP
+        assert agent_class_for_provider_id("vllm").backend is AgentBackend.OMP
+        assert agent_class_for_provider_id("llamacpp").backend is AgentBackend.OMP
 
     def test_claude_compatible_providers_map_to_claude_code(self):
         from openscientist.agent.base import AgentBackend
-        from openscientist.agent.factory import backend_for_provider_id
+        from openscientist.agent.factory import agent_class_for_provider_id
 
         for pid in ("anthropic", "cborg", "vertex", "bedrock", "foundry"):
-            assert backend_for_provider_id(pid) is AgentBackend.CLAUDE_CODE
+            assert agent_class_for_provider_id(pid).backend is AgentBackend.CLAUDE_CODE
 
     def test_unknown_provider_defaults_to_claude_code(self):
         from openscientist.agent.base import AgentBackend
-        from openscientist.agent.factory import backend_for_provider_id
+        from openscientist.agent.factory import agent_class_for_provider_id
 
-        assert backend_for_provider_id("does-not-exist") is AgentBackend.CLAUDE_CODE
-
-    def test_does_not_instantiate_provider(self):
-        # No auth env is set, yet this must not raise (instantiation would).
-        from openscientist.agent.base import AgentBackend
-        from openscientist.agent.factory import backend_for_provider_id
-
-        assert backend_for_provider_id("openai") is AgentBackend.CODEX
+        assert agent_class_for_provider_id("does-not-exist").backend is AgentBackend.CLAUDE_CODE
 
 
 class TestProviderInit:

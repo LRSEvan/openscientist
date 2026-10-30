@@ -9,23 +9,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
-from openscientist.database.models import User
 from openscientist.database.models.job import Job as JobModel
-from openscientist.database.session import AsyncSessionLocal
-from openscientist.job.types import JobStatus
+from openscientist.database.retry import CONTAINER_DB_RETRY_SECONDS, retry_async
+from openscientist.database.session import SessionOpener, async_session_local
 from openscientist.knowledge_state import KnowledgeState
-from openscientist.ntfy import notify_job_status_change
 from openscientist.prompts.common import namespace_tool_mentions
 
 logger = logging.getLogger(__name__)
 
 FEEDBACK_TIMEOUT_SECONDS = 15 * 60  # 15 minutes
+
+#: Statuses after which a job holds no slot, so the scheduler stops counting it.
+_ENDED_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 # Budgeting the report prompt against the model's context window. We reserve
 # tokens for the system prompt, tool definitions, the model's own output, and
@@ -378,24 +380,27 @@ def build_consensus_retry_prompt(research_question: str, *, tool_prefix: str) ->
 Calling that tool is the only action for this step."""
 
 
-def increment_ks_iteration(job_id: str) -> None:
+async def increment_ks_iteration(job_id: str) -> None:
     """Increment the persisted knowledge-state iteration counter."""
-    ks = KnowledgeState.load_from_database_sync(job_id)
+    ks = await KnowledgeState.load_from_database(job_id)
     ks.data["iteration"] += 1
-    ks.save_to_database_sync(job_id)
+    await ks.save_to_database(job_id)
 
 
 async def _get_job_status(job_id: str) -> str | None:
-    """Fetch current job status from the database."""
-    try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
+    """Fetch current job status from the database, retrying a lost connection
+    for :data:`CONTAINER_DB_RETRY_SECONDS`."""
+
+    async def read() -> str | None:
+        async with async_session_local() as session:
             result = await session.execute(
                 select(JobModel.status).where(JobModel.id == UUID(job_id))
             )
             return result.scalar_one_or_none()
-    except Exception as e:
-        logger.warning("Failed to fetch status for job %s: %s", job_id, e)
-        return None
+
+    return await retry_async(
+        read, within=CONTAINER_DB_RETRY_SECONDS, what=f"reading the status of job {job_id}"
+    )
 
 
 def _parse_job_uuid(job_id: str) -> UUID | None:
@@ -411,108 +416,64 @@ async def _persist_job_status(
     job_uuid: UUID,
     status: str,
     error_message: str | None,
-) -> tuple[str | None, UUID | None, str | None, int, bool, str | None] | None:
-    old_status: str | None = None
-    owner_id: UUID | None = None
-    job_title: str | None = None
-    current_iteration = 1
-    ntfy_enabled = False
-    ntfy_topic: str | None = None
-
-    try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
-            job_result = await session.execute(select(JobModel).where(JobModel.id == job_uuid))
-            job = job_result.scalar_one_or_none()
-            if job is None:
-                logger.warning("Cannot update status for missing job %s", job_id)
-                return None
-
-            old_status = job.status
-            if old_status != status:
-                job.status = status
-                await session.flush()
-            if error_message:
-                job.error_message = error_message
-
-            owner_id = job.owner_id
-            job_title = job.short_title or job.research_question
-            try:
-                current_iteration = int(job.current_iteration)
-                if current_iteration < 1:
-                    current_iteration = 1
-            except (TypeError, ValueError):
-                current_iteration = 1
-
-            if owner_id is not None:
-                user_result = await session.execute(
-                    select(User.ntfy_enabled, User.ntfy_topic).where(User.id == owner_id)
-                )
-                user_row = user_result.first()
-                if user_row:
-                    ntfy_enabled = bool(user_row.ntfy_enabled)
-                    ntfy_topic = user_row.ntfy_topic
-
-            await session.commit()
-    except Exception as e:
-        logger.warning("Failed to update status for job %s: %s", job_id, e)
-        return None
-
-    return old_status, owner_id, job_title, current_iteration, ntfy_enabled, ntfy_topic
-
-
-def _should_notify_awaiting_feedback(
-    *,
-    status: str,
-    old_status: str | None,
-    owner_id: UUID | None,
-    ntfy_enabled: bool,
-    job_title: str | None,
+    allowed_from: Collection[str],
+    open_session: SessionOpener,
+    retry_for: float,
 ) -> bool:
-    if status != JobStatus.AWAITING_FEEDBACK or old_status == JobStatus.AWAITING_FEEDBACK:
-        return False
-    return bool(owner_id and ntfy_enabled and job_title)
+    values: dict[str, object] = {"status": status}
+    if error_message:
+        values["error_message"] = error_message
+    if status in _ENDED_STATUSES:
+        values["ended_at"] = func.now()
+    stmt = (
+        update(JobModel)
+        .where(JobModel.id == job_uuid, JobModel.status.in_(list(allowed_from)))
+        .values(**values)
+        .returning(JobModel.id)
+    )
+
+    async def write() -> bool:
+        async with open_session() as session:
+            if (await session.execute(stmt)).scalar_one_or_none() is None:
+                logger.info(
+                    "Job %s is not in %s, so it stays as it is", job_id, sorted(allowed_from)
+                )
+                return False
+            await session.commit()
+            return True
+
+    return await retry_async(write, within=retry_for, what=f"moving job {job_id} to {status}")
 
 
 async def update_job_status(
     job_dir: Path,
     status: str,
     error_message: str | None = None,
-) -> None:
-    """Update job status in the database and notify on feedback wait transitions."""
+    *,
+    allowed_from: Collection[str],
+    open_session: SessionOpener | None = None,
+    retry_for: float = CONTAINER_DB_RETRY_SECONDS,
+) -> bool:
+    """Move the job to ``status`` if it is in one of ``allowed_from``, in
+    ``open_session``, else the process's own login. Returns whether it applied.
+
+    A lost connection is retried for ``retry_for`` seconds and then raised, as
+    is any other database error."""
     job_id = job_dir.name
 
     job_uuid = _parse_job_uuid(job_id)
     if job_uuid is None:
-        return
+        return False
 
-    db_result = await _persist_job_status(job_id, job_uuid, status, error_message)
-    if db_result is None:
-        return
-
-    old_status, owner_id, job_title, current_iteration, ntfy_enabled, ntfy_topic = db_result
-    if not _should_notify_awaiting_feedback(
-        status=status,
-        old_status=old_status,
-        owner_id=owner_id,
-        ntfy_enabled=ntfy_enabled,
-        job_title=job_title,
-    ):
-        return
-
-    if owner_id is None or not job_title:
-        return
-
-    try:
-        await notify_job_status_change(
-            user_id=owner_id,
-            job_id=job_id,
-            job_title=job_title,
-            new_status="awaiting_feedback",
-            iteration=current_iteration,
-            ntfy_topic=ntfy_topic,
-        )
-    except Exception as e:
-        logger.warning("Failed to send awaiting_feedback notification for %s: %s", job_id, e)
+    return await _persist_job_status(
+        job_id,
+        job_uuid,
+        status,
+        error_message,
+        allowed_from,
+        open_session or async_session_local,
+        retry_for,
+    )
 
 
 async def wait_for_feedback_or_timeout(

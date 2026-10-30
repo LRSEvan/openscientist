@@ -167,17 +167,6 @@ class TestJobInfoUseHypotheses:
         info = JobInfo.from_db_model(fake_job)
         assert info.use_hypotheses is False
 
-    def test_to_dict_and_from_dict_roundtrip_preserves_use_hypotheses(self) -> None:
-        info = JobInfo(
-            job_id="j1",
-            research_question="Q?",
-            status=JobStatus.RUNNING,
-            created_at="2026-01-01T00:00:00",
-            use_hypotheses=True,
-        )
-        restored = JobInfo.from_dict(info.to_dict())
-        assert restored.use_hypotheses is True
-
 
 # ---------------------------------------------------------------------------
 # 5. agent/claude_code_agent.py — ClaudeCodeAgent wiring
@@ -262,7 +251,7 @@ class TestGetAgentHypotheses:
 
 
 def _make_mock_session_for_job(job: Any) -> Any:
-    """Build a mock AsyncSessionLocal context manager that returns a single job."""
+    """Build a mock async_session_local context manager that returns a single job."""
     job_result = MagicMock()
     job_result.scalar_one_or_none.return_value = job
 
@@ -300,7 +289,7 @@ class TestLoadRuntimeContextHypotheses:
         job_dir.mkdir()
 
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -315,7 +304,7 @@ class TestLoadRuntimeContextHypotheses:
         job_dir.mkdir()
 
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -331,7 +320,7 @@ class TestLoadRuntimeContextHypotheses:
         job_dir.mkdir()
 
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -376,7 +365,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Research with hypotheses",
@@ -393,7 +382,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Research without hypotheses",
@@ -411,7 +400,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Default hypotheses test",
@@ -427,7 +416,7 @@ class TestDbCreateJobHypotheses:
         mock_cm, captured = self._make_session_mock()
         job_id = str(uuid4())
 
-        with patch("openscientist.job_manager.AsyncSessionLocal", return_value=mock_cm):
+        with patch("openscientist.job_manager.thread_safe_admin_session", return_value=mock_cm):
             await _db_create_job(
                 job_id,
                 "Research with model metadata",
@@ -524,11 +513,11 @@ class TestStatsBadgesHypotheses:
         assert self._badge_value(badges, "Provider") == "Azure OpenAI Service"
         assert self._get_badge(badges, "Model") is None
 
-    def test_ollama_job_shows_codex_and_ollama_provider(self) -> None:
+    def test_ollama_job_shows_omp_and_ollama_provider(self) -> None:
         from openscientist.webapp_components.pages.job_detail import _stats_badges
 
         badges = _stats_badges(self._make_job(llm_provider="ollama"), lit_count=0)
-        assert self._badge_value(badges, "Agent") == "Codex"
+        assert self._badge_value(badges, "Agent") == "Oh My Pi"
         assert self._badge_value(badges, "Provider") == "Ollama (local)"
 
     def test_ollama_job_with_model_shows_provider_and_model(self) -> None:
@@ -538,7 +527,7 @@ class TestStatsBadgesHypotheses:
             self._make_job(llm_provider="ollama", llm_model="gpt-oss:20b"), lit_count=0
         )
         # Provider (where it is hosted) and model (which one ran) appear together.
-        assert self._badge_value(badges, "Agent") == "Codex"
+        assert self._badge_value(badges, "Agent") == "Oh My Pi"
         assert self._badge_value(badges, "Provider") == "Ollama (local)"
         assert self._badge_value(badges, "Model") == "gpt-oss:20b"
 
@@ -865,7 +854,7 @@ class TestNewJobPageStructure:
 class TestEndToEndHypothesesFlow:
     """Test the full create → persist → read flow for use_hypotheses."""
 
-    def test_create_db_job_record_passes_use_hypotheses_to_db_create_job(
+    async def test_create_db_job_record_passes_use_hypotheses_to_db_create_job(
         self, tmp_path: Path
     ) -> None:
         """_create_db_job_record(use_hypotheses=True) calls _db_create_job with use_hypotheses=True."""
@@ -880,7 +869,7 @@ class TestEndToEndHypothesesFlow:
         with patch(
             "openscientist.job_manager._db_create_job", new_callable=AsyncMock
         ) as mock_db_create:
-            jm._create_db_job_record(
+            await jm._create_db_job_record(
                 job_id=job_id,
                 research_question="Test",
                 max_iterations=3,
@@ -912,7 +901,7 @@ class TestEndToEndHypothesesFlow:
             investigation_mode="autonomous",
         )
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(fake_job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -936,7 +925,7 @@ class TestEndToEndHypothesesFlow:
             investigation_mode="autonomous",
         )
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(fake_job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -1108,7 +1097,7 @@ class TestWriteSkillsToClaudeDirJobClaudeMd:
 
         agent = ClaudeCodeAgent(AgentConfig(job_dir=tmp_path), StubClaudeProvider())
         with patch(
-            "openscientist.database.session.AsyncSessionLocal",
+            "openscientist.database.session.async_session_local",
             side_effect=Exception("no db"),
         ):
             await agent.prepare_job_workspace(**kwargs)

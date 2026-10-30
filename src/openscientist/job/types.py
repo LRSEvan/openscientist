@@ -29,7 +29,12 @@ class JobStatus(StrEnum):
 
 @dataclass
 class JobStatusUpdateResult:
-    """Result of updating job status, includes data needed for notifications."""
+    """Result of updating job status, includes data needed for notifications.
+
+    ``applied`` is False when the job was not in a status the write may leave.
+    """
+
+    applied: bool = False
 
     ntfy_enabled: bool = False
     ntfy_topic: str | None = None
@@ -65,12 +70,6 @@ class JobInfo:
         d = asdict(self)
         d["status"] = self.status.value
         return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> JobInfo:
-        data = data.copy()
-        data["status"] = JobStatus(data["status"])
-        return cls(**data)
 
     @classmethod
     def from_db_model(

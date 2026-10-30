@@ -11,30 +11,35 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openscientist.database.models import Job, JobChatMessage
-from openscientist.database.session import AsyncSessionLocal
 from openscientist.knowledge_state import KnowledgeState
 
 logger = logging.getLogger(__name__)
 
-# The web side and the chat-turn container exchange one turn through these files
-# in the mounted job_dir, so the container needs no database access of its own.
-_CHAT_REQUEST_FILE = ".chat_request.json"
-_CHAT_RESPONSE_FILE = ".chat_response.json"
+# The web side and the chat-turn container exchange one turn through a request
+# and a response file in the mounted job_dir, so the container needs no database
+# access of its own. Each turn names its files after a fresh id, which the
+# container receives in this variable, because turns on one job can overlap.
+CHAT_TURN_ENV = "OPENSCIENTIST_CHAT_TURN"
 
 
-async def _load_research_question_from_db(job_id: str) -> str | None:
+def _chat_turn_files(job_dir: Path, chat_turn: str) -> tuple[Path, Path]:
+    """The request and response files of one chat turn."""
+    return (
+        job_dir / f".chat_request_{chat_turn}.json",
+        job_dir / f".chat_response_{chat_turn}.json",
+    )
+
+
+async def _load_research_question_from_db(job_id: str, session: AsyncSession) -> str | None:
     try:
-        async with AsyncSessionLocal(thread_safe=True) as session:
-            result = await session.execute(
-                select(Job.research_question).where(Job.id == UUID(job_id))
-            )
-            value = result.scalar_one_or_none()
+        result = await session.execute(select(Job.research_question).where(Job.id == UUID(job_id)))
+        value = result.scalar_one_or_none()
         if isinstance(value, str) and value.strip():
             return value
     except ValueError:
@@ -130,16 +135,16 @@ def _append_iteration_summaries(parts: list[str], summaries: list[Any]) -> None:
     parts.append("")
 
 
-def _load_knowledge_state(job_id: str) -> dict[str, Any] | None:
+async def _load_knowledge_state(job_id: str, session: AsyncSession) -> dict[str, Any] | None:
     try:
-        payload = KnowledgeState.load_from_database_sync(job_id).to_dict()
+        payload = (await KnowledgeState.load_from_database(job_id, session)).to_dict()
     except Exception as e:
         logger.warning("Failed to load knowledge state for job %s: %s", job_id, e)
         return None
     return payload if isinstance(payload, dict) else None
 
 
-async def load_job_context(job_id: str) -> str:
+async def load_job_context(job_id: str, session: AsyncSession) -> str:
     """
     Load comprehensive job context for LLM chat.
 
@@ -148,16 +153,18 @@ async def load_job_context(job_id: str) -> str:
 
     Args:
         job_id: Job ID
+        session: The chatting user's session, so the context holds only what
+            that user may see
 
     Returns:
         Formatted context string for LLM
     """
     context_parts: list[str] = []
-    research_question = await _load_research_question_from_db(job_id)
+    research_question = await _load_research_question_from_db(job_id, session)
     if research_question:
         _append_research_question(context_parts, research_question)
 
-    ks = _load_knowledge_state(job_id)
+    ks = await _load_knowledge_state(job_id, session)
     if not ks:
         return "\n".join(context_parts)
 
@@ -288,7 +295,7 @@ Be concise, accurate, and cite specific papers or findings when relevant. Focus 
     # few-shotting a report dump, and the live user message comes last.
     prompt_parts: list[str] = []
 
-    job_context = await load_job_context(str(job_id))
+    job_context = await load_job_context(str(job_id), session)
     if job_context.strip():
         prompt_parts.append(
             "## Background reference for this job\n"
@@ -334,21 +341,21 @@ async def _send_message_via_container(
     """Run one chat turn in a hardened, ephemeral container.
 
     The web side builds the request and (in send_chat_message) persists the chat
-    rows, since it holds the RLS context. The container only reads a request file
-    and writes a reply file in the mounted job_dir, so it touches no database and
-    holds no master key, provider credential, or Docker socket."""
+    rows, since it holds the RLS context. The container reads a request file and
+    writes a reply file in the mounted job_dir, and its own database login,
+    pinned to this job, records the turn's cost. It holds no master key,
+    provider credential, or Docker socket."""
     from openscientist.job_container.runner import JobContainerRunner
 
     request = await _build_chat_request(session, job_id, message)
-    request_path = job_dir / _CHAT_REQUEST_FILE
-    response_path = job_dir / _CHAT_RESPONSE_FILE
-    response_path.unlink(missing_ok=True)
+    chat_turn = uuid4().hex
+    request_path, response_path = _chat_turn_files(job_dir, chat_turn)
     request_path.write_text(json.dumps(request))
 
     logger.info("Running chat turn for job %s in a hardened container", job_id)
     try:
         # run_chat_turn blocks on the container, so run it off the event loop.
-        await asyncio.to_thread(JobContainerRunner().run_chat_turn, str(job_id), job_dir)
+        await asyncio.to_thread(JobContainerRunner().run_chat_turn, str(job_id), job_dir, chat_turn)
         if not response_path.exists():
             raise RuntimeError("Chat container produced no response")
         response = json.loads(response_path.read_text())
@@ -361,18 +368,21 @@ async def _send_message_via_container(
         response_path.unlink(missing_ok=True)
 
 
-async def run_chat_turn_async(job_dir: Path) -> dict[str, str]:
+async def run_chat_turn_async(job_dir: Path, chat_turn: str, job_id: str) -> dict[str, str]:
     """Container entry point for one chat turn.
 
-    Reads the request the web side wrote into job_dir, runs one agent turn with
-    the full toolset (the container holds no secrets to protect), and writes the
-    reply to the response file. Returns a status dict for the entrypoint."""
+    Reads the turn's request the web side wrote into job_dir, runs one agent turn
+    with the full toolset (the container holds no secrets to protect), writes the
+    turn's cost through the container's own database login, and writes the reply
+    to the turn's response file. Returns a status dict for the entrypoint."""
     from openscientist.agent.base import AgentConfig
     from openscientist.agent.factory import build_agent
+    from openscientist.orchestrator.discovery import _CostLedger, _finalize_executor
     from openscientist.providers import get_provider
 
     job_dir = Path(job_dir)
-    request = json.loads((job_dir / _CHAT_REQUEST_FILE).read_text())
+    request_path, response_path = _chat_turn_files(job_dir, chat_turn)
+    request = json.loads(request_path.read_text())
     config = AgentConfig(
         job_dir=job_dir,
         system_prompt=request["system_prompt"],
@@ -382,6 +392,8 @@ async def run_chat_turn_async(job_dir: Path) -> dict[str, str]:
     executor.apply_runtime_environment()
     executor.write_chat_context()
 
+    ledger = _CostLedger.for_executor(executor, job_id)
+    ledger.begin("chat", None)
     response: dict[str, str] = {}
     try:
         result = await executor.run_iteration(request["prompt"], reset_session=True)
@@ -393,7 +405,7 @@ async def run_chat_turn_async(job_dir: Path) -> dict[str, str]:
         logger.error("Chat turn failed: %s", e, exc_info=True)
         response = {"error": str(e)}
     finally:
-        await executor.shutdown()
+        await _finalize_executor(executor, ledger)
 
-    (job_dir / _CHAT_RESPONSE_FILE).write_text(json.dumps(response))
+    response_path.write_text(json.dumps(response))
     return {"status": "completed" if "output" in response else "failed"}

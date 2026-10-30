@@ -19,10 +19,7 @@ from openscientist.database.models.hypothesis import Hypothesis
 from openscientist.database.models.iteration_summary import IterationSummary
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.models.literature import Literature
-from openscientist.database.rls import set_current_user
-from openscientist.database.session import AsyncSessionLocal
-
-KS_FILENAME = "knowledge_state.json"
+from openscientist.database.session import SessionOpener, async_session_local
 
 # Bound the literature abstracts dumped into the report-generation prompt.
 # Dumping every abstract has overflowed the model's context window, dropping the
@@ -301,10 +298,6 @@ class KnowledgeState:
             summary: Plain-language summary of what was accomplished
             strapline: Short, punchy title for this iteration (5-10 words)
         """
-        # Ensure iteration_summaries exists (backwards compatibility)
-        if "iteration_summaries" not in self.data:
-            self.data["iteration_summaries"] = []
-
         # Check if this iteration already has a summary
         for existing in self.data["iteration_summaries"]:
             if existing["iteration"] == iteration:
@@ -342,30 +335,6 @@ class KnowledgeState:
         self.data["agent_status"] = None
         self.data["agent_status_updated_at"] = None
 
-    def get_agent_status(self) -> str | None:
-        """Get the current agent status message."""
-        return self.data.get("agent_status")
-
-    def get_iteration_summary(self, iteration: int) -> str | None:
-        """
-        Get the summary for a specific iteration.
-
-        Args:
-            iteration: Iteration number
-
-        Returns:
-            Summary string or None if not found
-        """
-        summaries = self.data.get("iteration_summaries", [])
-        for entry in summaries:
-            if entry["iteration"] == iteration:
-                return str(entry["summary"])
-        return None
-
-    def increment_iteration(self) -> None:
-        """Increment the iteration counter."""
-        self.data["iteration"] += 1
-
     def add_feedback(self, text: str, after_iteration: int) -> None:
         """
         Add scientist feedback to history.
@@ -377,10 +346,6 @@ class KnowledgeState:
             text: Feedback text from scientist
             after_iteration: The iteration that just completed
         """
-        # Ensure field exists (backwards compatibility)
-        if "feedback_history" not in self.data:
-            self.data["feedback_history"] = []
-
         self.data["feedback_history"].append(
             {
                 "after_iteration": after_iteration,
@@ -462,191 +427,6 @@ class KnowledgeState:
             summary_parts.append("")
 
         return "\n".join(summary_parts)
-
-    def get_report_summary(self) -> str:
-        """
-        Get a comprehensive summary of all accumulated knowledge for report generation.
-
-        Unlike get_summary() which is concise for iteration prompts, this includes
-        ALL findings, hypotheses, literature, and iteration timelines so the report
-        agent can write a thorough final report.
-
-        Returns:
-            Formatted comprehensive summary of KS state
-        """
-        all_hypotheses = self.data["hypotheses"]
-        supported, rejected, pending = self._split_hypotheses_by_status(all_hypotheses)
-
-        parts = self._report_intro_section()
-        self._append_data_summary_section(parts)
-        self._append_progress_overview_section(parts, all_hypotheses, supported, rejected, pending)
-        self._append_investigation_timeline_section(parts)
-        self._append_findings_section(parts)
-        self._append_supported_hypotheses_section(parts, supported)
-        self._append_rejected_hypotheses_section(parts, rejected)
-        self._append_pending_hypotheses_section(parts, pending)
-        self._append_literature_section(parts)
-        self._append_consensus_answer_section(parts)
-        return "\n".join(parts)
-
-    @staticmethod
-    def _split_hypotheses_by_status(
-        all_hypotheses: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        """Split hypotheses into supported, rejected, and pending groups."""
-        supported = [hyp for hyp in all_hypotheses if hyp["status"] == "supported"]
-        rejected = [hyp for hyp in all_hypotheses if hyp["status"] == "rejected"]
-        pending = [hyp for hyp in all_hypotheses if hyp["status"] == "pending"]
-        return supported, rejected, pending
-
-    def _report_intro_section(self) -> list[str]:
-        """Build the report summary header section."""
-        return [
-            f"# Comprehensive Knowledge Summary (After {self.data['iteration']} iterations)",
-            "",
-            "## Research Question",
-            self.data["config"]["research_question"],
-            "",
-        ]
-
-    def _append_data_summary_section(self, parts: list[str]) -> None:
-        """Append data summary section when available."""
-        data_summary = self.data.get("data_summary", {})
-        if not data_summary:
-            return
-        parts.append("## Data Summary")
-        parts.append(f"- Files: {data_summary.get('files', [])}")
-        parts.append(f"- Samples: {data_summary.get('n_samples', 'Unknown')}")
-        parts.append(f"- Features: {data_summary.get('n_features', 'Unknown')}")
-        parts.append("")
-
-    def _append_progress_overview_section(
-        self,
-        parts: list[str],
-        all_hypotheses: list[dict[str, Any]],
-        supported: list[dict[str, Any]],
-        rejected: list[dict[str, Any]],
-        pending: list[dict[str, Any]],
-    ) -> None:
-        """Append high-level counts covering hypotheses/findings/literature."""
-        parts.append("## Progress Overview")
-        parts.append(f"- Total hypotheses proposed: {len(all_hypotheses)}")
-        parts.append(f"- Supported: {len(supported)}")
-        parts.append(f"- Rejected: {len(rejected)}")
-        parts.append(f"- Pending: {len(pending)}")
-        parts.append(f"- Findings confirmed: {len(self.data['findings'])}")
-        parts.append(f"- Literature reviewed: {len(self.data['literature'])}")
-        parts.append("")
-
-    def _append_investigation_timeline_section(self, parts: list[str]) -> None:
-        """Append ordered iteration summaries."""
-        summaries = self.data.get("iteration_summaries", [])
-        if not summaries:
-            return
-        parts.append("## Investigation Timeline")
-        for entry in sorted(summaries, key=lambda item: item["iteration"]):
-            strapline = entry.get("strapline", "")
-            label = f" — {strapline}" if strapline else ""
-            parts.append(f"- **Iteration {entry['iteration']}{label}:** {entry['summary']}")
-        parts.append("")
-
-    def _append_findings_section(self, parts: list[str]) -> None:
-        """Append all findings with evidence and optional metadata."""
-        findings = self.data["findings"]
-        if not findings:
-            return
-        parts.append("## All Findings")
-        for finding in findings:
-            parts.append(f"### {finding['id']}: {finding['title']}")
-            parts.append(f"- **Evidence:** {finding['evidence']}")
-            if finding.get("biological_interpretation"):
-                parts.append(f"- **Interpretation:** {finding['biological_interpretation']}")
-            if finding.get("supporting_hypotheses"):
-                parts.append(
-                    f"- **Supporting hypotheses:** {', '.join(finding['supporting_hypotheses'])}"
-                )
-            if finding.get("literature_support"):
-                parts.append(
-                    f"- **Literature support:** {', '.join(finding['literature_support'])}"
-                )
-            if finding.get("plots"):
-                parts.append(f"- **Plots:** {', '.join(finding['plots'])}")
-            parts.append("")
-
-    @staticmethod
-    def _append_hypothesis_result_details(parts: list[str], result: dict[str, Any]) -> None:
-        """Append optional hypothesis result fields."""
-        if result.get("summary"):
-            parts.append(f"- **Result:** {result['summary']}")
-        if result.get("p_value"):
-            parts.append(f"- **P-value:** {result['p_value']}")
-        if result.get("effect_size"):
-            parts.append(f"- **Effect size:** {result['effect_size']}")
-        if result.get("conclusion"):
-            parts.append(f"- **Conclusion:** {result['conclusion']}")
-
-    def _append_supported_hypotheses_section(
-        self, parts: list[str], supported: list[dict[str, Any]]
-    ) -> None:
-        """Append all supported hypotheses and measured outcomes."""
-        if not supported:
-            return
-        parts.append("## Supported Hypotheses")
-        for hypothesis in supported:
-            parts.append(f"### {hypothesis['id']}: {hypothesis['statement']}")
-            self._append_hypothesis_result_details(parts, hypothesis.get("result") or {})
-            parts.append("")
-
-    def _append_rejected_hypotheses_section(
-        self, parts: list[str], rejected: list[dict[str, Any]]
-    ) -> None:
-        """Append rejected hypotheses with conclusions."""
-        if not rejected:
-            return
-        parts.append("## Rejected Hypotheses")
-        for hypothesis in rejected:
-            parts.append(f"### {hypothesis['id']}: {hypothesis['statement']}")
-            result = hypothesis.get("result") or {}
-            if result.get("conclusion"):
-                parts.append(f"- **Conclusion:** {result['conclusion']}")
-            elif result.get("summary"):
-                parts.append(f"- **Result:** {result['summary']}")
-            parts.append("")
-
-    @staticmethod
-    def _append_pending_hypotheses_section(parts: list[str], pending: list[dict[str, Any]]) -> None:
-        """Append still-pending hypotheses as remaining knowledge gaps."""
-        if not pending:
-            return
-        parts.append("## Knowledge Gaps (Pending Hypotheses)")
-        parts.extend(f"- {hypothesis['id']}: {hypothesis['statement']}" for hypothesis in pending)
-        parts.append("")
-
-    def _append_literature_section(self, parts: list[str]) -> None:
-        """Append reviewed literature titles and compact abstracts."""
-        literature_entries = self.data["literature"]
-        if not literature_entries:
-            return
-        parts.append("## Literature Reviewed")
-        for literature in literature_entries:
-            pmid_str = f" (PMID: {literature['pmid']})" if literature.get("pmid") else ""
-            parts.append(f"- **{literature['title']}**{pmid_str}")
-            abstract = literature.get("abstract", "")
-            if abstract:
-                truncated = abstract[:200] + "..." if len(abstract) > 200 else abstract
-                parts.append(f"  Abstract: {truncated}")
-            if literature.get("relevance_to"):
-                parts.append(f"  Relevant to: {', '.join(literature['relevance_to'])}")
-        parts.append("")
-
-    def _append_consensus_answer_section(self, parts: list[str]) -> None:
-        """Append consensus answer when one has been produced."""
-        consensus_answer = self.data.get("consensus_answer")
-        if not consensus_answer:
-            return
-        parts.append("## Previous Consensus Answer")
-        parts.append(consensus_answer)
-        parts.append("")
 
     def get_report_outline(self, *, abstract_budget_chars: int | None = None) -> str:
         """Get an outline of accumulated knowledge for the report prompt.
@@ -762,33 +542,14 @@ class KnowledgeState:
 
         return "\n".join(parts)
 
-    def set_version_info(self, version_info: dict[str, str]) -> None:
-        """
-        Set version/environment metadata in config.
-
-        Args:
-            version_info: Dict with keys like 'claude_code_version',
-                         'claude_agent_sdk_version', 'openscientist_commit',
-                         'docker_container_id'
-        """
-        self.data["config"]["version_info"] = version_info
-
     def to_dict(self) -> dict[str, Any]:
         """Return the raw data dictionary."""
         return self.data
 
     # Database persistence methods
 
-    async def _save_to_database_with_session(
-        self,
-        session: AsyncSession,
-        job_id: str,
-        user_id: UUID | None = None,
-    ) -> None:
+    async def _save_to_database_with_session(self, session: AsyncSession, job_id: str) -> None:
         """Persist knowledge-state rows using an existing session."""
-        if user_id:
-            await set_current_user(session, user_id)
-
         job_uuid = UUID(job_id)
         await self._update_job_record(session, job_uuid)
         await self._upsert_hypotheses(session, job_uuid)
@@ -811,9 +572,6 @@ class KnowledgeState:
             return
         job.current_iteration = int(self.data.get("iteration", 1))
         job.data_summary = _sanitize_for_json(self.data.get("data_summary") or {})
-        # States loaded from the DB carry no version_info; don't null a recorded value.
-        if version_info := self.data["config"].get("version_info"):
-            job.version_info = _sanitize_for_json(version_info)
         job.agent_status = self.data.get("agent_status")
         updated_at_raw = self.data.get("agent_status_updated_at")
         if isinstance(updated_at_raw, str):
@@ -1029,12 +787,7 @@ class KnowledgeState:
                 )
             )
 
-    async def save_to_database(
-        self,
-        job_id: str,
-        user_id: UUID | None = None,
-        session: AsyncSession | None = None,
-    ) -> None:
+    async def save_to_database(self, job_id: str, session: AsyncSession | None = None) -> None:
         """
         Save knowledge state to database tables.
 
@@ -1043,43 +796,50 @@ class KnowledgeState:
 
         Args:
             job_id: Job ID (UUID string)
-            user_id: User ID for RLS context (optional)
+            session: The caller's session, whose role decides which rows the
+                save may reach. Without one, the process's own login is used,
+                which in the agent container is the container's job login.
         """
         if session is None:
-            async with AsyncSessionLocal(thread_safe=True) as session:
-                await self._save_to_database_with_session(session, job_id, user_id)
-                await session.commit()
+            async with async_session_local() as own_session:
+                await self._save_to_database_with_session(own_session, job_id)
+                await own_session.commit()
             return
 
-        await self._save_to_database_with_session(session, job_id, user_id)
+        await self._save_to_database_with_session(session, job_id)
         await session.commit()
 
     @classmethod
-    async def load_from_database(cls, job_id: str, user_id: UUID | None = None) -> "KnowledgeState":
+    async def load_from_database(
+        cls, job_id: str, session: AsyncSession | None = None
+    ) -> "KnowledgeState":
         """
         Load knowledge state from database tables.
 
         Args:
             job_id: Job ID (UUID string)
-            user_id: User ID for RLS context (optional)
+            session: The caller's session, as for :meth:`save_to_database`.
 
         Returns:
             KnowledgeState instance populated from database
         """
-        async with AsyncSessionLocal(thread_safe=True) as session:
-            if user_id:
-                await set_current_user(session, user_id)
+        if session is None:
+            async with async_session_local() as own_session:
+                return await cls._load_with_session(own_session, job_id)
+        return await cls._load_with_session(session, job_id)
 
-            job_uuid = UUID(job_id)
-            job = await cls._load_job_or_raise(session, job_id, job_uuid)
-            ks = cls._new_from_job_record(job_id, job)
-            await cls._load_hypotheses(session, job_uuid, ks)
-            await cls._load_findings(session, job_uuid, ks)
-            await cls._load_literature(session, job_uuid, ks)
-            await cls._load_analysis_log(session, job_uuid, ks)
-            await cls._load_iteration_summaries(session, job_uuid, ks)
-            await cls._load_feedback_history(session, job_uuid, ks)
-            return ks
+    @classmethod
+    async def _load_with_session(cls, session: AsyncSession, job_id: str) -> "KnowledgeState":
+        job_uuid = UUID(job_id)
+        job = await cls._load_job_or_raise(session, job_id, job_uuid)
+        ks = cls._new_from_job_record(job_id, job)
+        await cls._load_hypotheses(session, job_uuid, ks)
+        await cls._load_findings(session, job_uuid, ks)
+        await cls._load_literature(session, job_uuid, ks)
+        await cls._load_analysis_log(session, job_uuid, ks)
+        await cls._load_iteration_summaries(session, job_uuid, ks)
+        await cls._load_feedback_history(session, job_uuid, ks)
+        return ks
 
     @classmethod
     async def _load_job_or_raise(
@@ -1258,15 +1018,15 @@ class KnowledgeState:
                 }
             )
 
-    def save_to_database_sync(self, job_id: str, user_id: UUID | None = None) -> None:
-        """Synchronous wrapper for save_to_database."""
+    def save_to_database_sync(self, job_id: str, open_session: SessionOpener | None = None) -> None:
+        """Run save_to_database in ``open_session``, opened inside the wrapper's own loop."""
         from openscientist.async_tasks import run_sync
 
-        run_sync(self.save_to_database(job_id, user_id))
+        async def save() -> None:
+            if open_session is None:
+                await self.save_to_database(job_id)
+                return
+            async with open_session() as session:
+                await self.save_to_database(job_id, session)
 
-    @classmethod
-    def load_from_database_sync(cls, job_id: str, user_id: UUID | None = None) -> "KnowledgeState":
-        """Synchronous wrapper for load_from_database."""
-        from openscientist.async_tasks import run_sync
-
-        return run_sync(cls.load_from_database(job_id, user_id))
+        run_sync(save())

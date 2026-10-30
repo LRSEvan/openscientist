@@ -26,7 +26,7 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
-        args: [--tb=auto, --ignore=tests/zz_e2e, --ignore=tests/webapp/pages]
+        args: [--tb=auto]
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

@@ -4,12 +4,14 @@ import asyncio
 import os
 import subprocess
 import tempfile
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Callable, Generator, Mapping
+from functools import partial
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -26,6 +28,18 @@ from openscientist.database.models import (
     SkillSource,
     User,
 )
+from tests.db_logins import (
+    ADMIN_PASSWORD,
+    BOOTSTRAP_ENV,
+    BOOTSTRAP_SQL,
+    CONTAINER_BOOTSTRAP_DIR,
+    OWNER_PASSWORD,
+    WEB_PASSWORD,
+    login_url,
+    reset_database_state,
+    run_bootstrap,
+)
+from tests.db_outage import Forwarder
 
 
 # Clear any cached settings after environment setup
@@ -98,12 +112,22 @@ def postgres_container() -> Generator[PostgresContainer, None, None]:
         username="openscientist",
         password="openscientist_dev_password",
         dbname="openscientist",
-    ) as postgres:
+    ).with_volume_mapping(str(BOOTSTRAP_SQL.parent), CONTAINER_BOOTSTRAP_DIR, "ro") as postgres:
         yield postgres
 
 
 @pytest.fixture(scope="session")
-def _apply_migrations_once(test_database_url: str) -> None:
+def bootstrap(
+    test_database_url: str, postgres_container: PostgresContainer | None
+) -> Callable[[Mapping[str, str]], tuple[int, str]]:
+    """Run ``docker/postgres/bootstrap.sql`` with the given passwords."""
+    return partial(run_bootstrap, test_database_url, postgres_container)
+
+
+@pytest.fixture(scope="session")
+def _apply_migrations_once(
+    test_database_url: str, bootstrap: Callable[[Mapping[str, str]], tuple[int, str]]
+) -> None:
     """Apply migrations once at session start (synchronous).
 
     This fixture applies Alembic migrations once per test session rather than
@@ -117,77 +141,42 @@ def _apply_migrations_once(test_database_url: str) -> None:
     async def _setup_schema() -> None:
         engine = create_async_engine(test_database_url, echo=False)
 
-        # Clean schema before applying migrations
+        # Clean schema before applying migrations. The schema is recreated the
+        # way initdb leaves it, owned by the database owner.
         async with engine.begin() as conn:
             await conn.execute(text("DROP TABLE IF EXISTS alembic_version CASCADE"))
             await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
-            await conn.execute(text("CREATE SCHEMA public"))
-            await conn.execute(text("GRANT ALL ON SCHEMA public TO PUBLIC"))
+            await conn.execute(text("CREATE SCHEMA public AUTHORIZATION pg_database_owner"))
+            await conn.execute(text("GRANT USAGE ON SCHEMA public TO PUBLIC"))
 
         await engine.dispose()
 
-    async def _setup_roles() -> None:
-        engine = create_async_engine(test_database_url, echo=False)
-
-        # Create roles to match production environment:
-        # - openscientist_app: Non-superuser role subject to RLS (used by get_session)
-        # - openscientist_admin: Role with BYPASSRLS (used by get_admin_session)
-        async with engine.begin() as conn:
-            # App role - subject to RLS
-            await conn.execute(
-                text(
-                    "DO $$ BEGIN CREATE ROLE openscientist_app NOLOGIN; "
-                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-                )
-            )
-            await conn.execute(
-                text("GRANT ALL ON ALL TABLES IN SCHEMA public TO openscientist_app")
-            )
-            await conn.execute(
-                text("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO openscientist_app")
-            )
-
-            # Admin role - bypasses RLS (matches docker/postgres/init.sql)
-            await conn.execute(
-                text(
-                    "DO $$ BEGIN CREATE ROLE openscientist_admin NOLOGIN BYPASSRLS; "
-                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-                )
-            )
-            await conn.execute(
-                text("GRANT ALL ON ALL TABLES IN SCHEMA public TO openscientist_admin")
-            )
-            await conn.execute(
-                text("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO openscientist_admin")
-            )
-
-        await engine.dispose()
-
-    # Run schema setup
     asyncio.run(_setup_schema())
 
-    # Apply Alembic migrations (creates tables AND adds RLS policies)
-    _apply_alembic_migrations(test_database_url)
+    exit_code, output = bootstrap(BOOTSTRAP_ENV)
+    if exit_code != 0:
+        raise RuntimeError(f"bootstrap.sql failed with exit code {exit_code}:\n{output}")
 
-    # Create app and admin roles
-    asyncio.run(_setup_roles())
+    _apply_alembic_migrations(login_url(test_database_url, "openscientist_owner", OWNER_PASSWORD))
 
 
-def _apply_alembic_migrations(database_url: str) -> None:
+def _apply_alembic_migrations(owner_database_url: str) -> None:
     """Apply all Alembic migrations to the test database.
 
     This ensures RLS policies and other migrations are properly applied.
     Uses subprocess for complete isolation from async event loop.
 
     Args:
-        database_url: Async database URL (postgresql+asyncpg://...)
+        owner_database_url: Async URL of the openscientist_owner login
 
     Raises:
         RuntimeError: If migrations fail to apply
     """
-    # Set environment variable for Alembic
+    # The variables win over a developer's .env.db, which the settings also read.
     env = os.environ.copy()
-    env["DATABASE_URL"] = database_url
+    env["OWNER_DATABASE_URL"] = owner_database_url
+    env["POSTGRES_OWNER_PASSWORD"] = OWNER_PASSWORD
+    env["POSTGRES_ADMIN_PASSWORD"] = ADMIN_PASSWORD
 
     # Get the path to the project root (where alembic.ini is)
     project_root = Path(__file__).parent.parent
@@ -215,7 +204,7 @@ def _apply_alembic_migrations(database_url: str) -> None:
             f"STDOUT: {result.stdout}\n"
             f"STDERR: {result.stderr}\n\n"
             f"Common causes:\n"
-            f"1. Database not accessible at {database_url}\n"
+            f"1. Database not accessible at {owner_database_url}\n"
             f"2. Migration file syntax errors\n"
             f"3. Database permissions issues\n"
             f"4. Migration dependencies not met"
@@ -231,9 +220,9 @@ def test_database_url(postgres_container: PostgresContainer | None) -> str:
     1. TEST_DATABASE_URL if explicitly set
     2. Testcontainer PostgreSQL (auto-started)
 
-    Also propagates the real URL to env/settings so that code paths using
-    AsyncSessionLocal(thread_safe=True) connect to the testcontainer DB
-    instead of the dummy placeholder URL set at import time.
+    Also propagates the real URL to env/settings so that the app's own sessions
+    connect to the testcontainer DB instead of the dummy placeholder URL set at
+    import time.
     """
     # Check for explicit test database URL
     test_url = os.getenv("TEST_DATABASE_URL")
@@ -250,22 +239,31 @@ def test_database_url(postgres_container: PostgresContainer | None) -> str:
         sync_url: str = postgres_container.get_connection_url()
         url = sync_url.replace("postgresql+psycopg2://", "postgresql+asyncpg://")
 
-    # Propagate the real URL so thread-safe session factories connect correctly
+    # Propagate the real URL to the app's sessions
     os.environ["DATABASE_URL"] = url
+    os.environ["ADMIN_DATABASE_URL"] = login_url(url, "openscientist_admin", ADMIN_PASSWORD)
     from openscientist.settings import clear_settings_cache
 
     clear_settings_cache()
-
-    # Reset engine/session factory globals so they pick up the new URL
-    import openscientist.database.engine as engine_mod
-    import openscientist.database.session as session_mod
-
-    engine_mod._engine = None
-    engine_mod._admin_engine = None
-    session_mod._session_factory = None
-    session_mod._admin_session_factory = None
-
     return url
+
+
+@pytest.fixture
+def web_login(test_database_url: str, _apply_migrations_once: None) -> Generator[None, None, None]:
+    """Point ``DATABASE_URL`` and ``ADMIN_DATABASE_URL`` at the web's real logins."""
+    saved = {name: os.environ.get(name) for name in ("DATABASE_URL", "ADMIN_DATABASE_URL")}
+    os.environ["DATABASE_URL"] = login_url(test_database_url, "openscientist_web", WEB_PASSWORD)
+    os.environ["ADMIN_DATABASE_URL"] = login_url(
+        test_database_url, "openscientist_admin", ADMIN_PASSWORD
+    )
+    reset_database_state()
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    reset_database_state()
 
 
 @pytest_asyncio.fixture
@@ -302,6 +300,24 @@ async def test_engine(
 
     yield engine
     await engine.dispose()
+
+
+@pytest.fixture
+def database(test_engine: AsyncEngine) -> Generator[Forwarder, None, None]:
+    """Point every app login at a forwarder to the test database, which starts
+    up. ``database.down()`` refuses connects until ``database.up()``."""
+    names = ("DATABASE_URL", "ADMIN_DATABASE_URL")
+    saved = {name: os.environ[name] for name in names}
+    target = make_url(saved["DATABASE_URL"])
+    forwarder = Forwarder((target.host or "127.0.0.1", target.port or 5432))
+    for name in names:
+        url = make_url(saved[name]).set(host="127.0.0.1", port=forwarder.port)
+        os.environ[name] = url.render_as_string(hide_password=False)
+    reset_database_state()
+    yield forwarder
+    forwarder.down()
+    os.environ.update(saved)
+    reset_database_state()
 
 
 @pytest_asyncio.fixture

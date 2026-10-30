@@ -226,7 +226,7 @@ def _show_delete_dialog(
 
 @ui.page("/jobs")
 @require_auth
-def jobs_page() -> None:
+async def jobs_page() -> None:
     """Jobs list page."""
     from openscientist import web_app
 

@@ -15,12 +15,15 @@ from unittest.mock import patch
 import pytest
 import requests
 
+from openscientist.providers import provider_class, provider_ids
+from openscientist.providers.base import ClaudeCompatible
 from openscientist.providers.pricing import (
     _FALLBACK_PRICING,
     _LITELLM_PRICING_URL,
     estimate_cost_usd,
     normalize_model_name,
 )
+from openscientist.settings import get_settings
 
 _ENTRY = {
     "input_cost_per_token": 5e-6,
@@ -134,6 +137,25 @@ def test_fallback_pricing_carries_its_own_cache_rates() -> None:
             cache_write_tokens=200_000,
         )
     assert cost == pytest.approx(7.25)
+
+
+@pytest.mark.parametrize(
+    "provider_id",
+    [p for p in provider_ids() if issubclass(provider_class(p), ClaudeCompatible)],
+)
+def test_every_provider_default_model_has_an_offline_price(
+    provider_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A default that falls out of the table is priced at $0 whenever litellm cannot
+    be reached, and a model missing from litellm is usually a retired one. Sonnet 4
+    stayed the Anthropic default for months after its retirement."""
+    monkeypatch.delenv("OPENSCIENTIST_MODEL", raising=False)
+    get_settings.cache_clear()
+    cls = provider_class(provider_id)
+    # Built without __init__, which validates credentials this test does not need.
+    default = cls.__new__(cls).claude_model_name()  # type: ignore[attr-defined]
+    assert normalize_model_name(default) in _FALLBACK_PRICING, default
+    get_settings.cache_clear()
 
 
 @pytest.mark.network
