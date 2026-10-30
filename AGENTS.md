@@ -211,4 +211,3 @@ uv run python tools/tile_screenshots.py \
 
 - `docs/DESIGN.md` - Architecture and design decisions
 - `docs/DEPLOYMENT.md` - Production deployment guide
-- `docs/DISCOVERY_AGENT_REFERENCE.md` - Discovery agent prompt reference
