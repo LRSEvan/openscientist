@@ -1,7 +1,7 @@
 """Add approved_at timestamp to users.
 
 Revision ID: add_approved_at
-Revises: add_version_info
+Revises: job_slot_times
 Create Date: 2026-10-15 12:00:00
 
 Lets the admin Users table sort by when a user was approved. Previously only
@@ -20,7 +20,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "add_approved_at"
-down_revision: str | None = "add_version_info"
+down_revision: str | None = "job_slot_times"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
