@@ -251,7 +251,7 @@ class TestGetAgentHypotheses:
 
 
 def _make_mock_session_for_job(job: Any) -> Any:
-    """Build a mock AsyncSessionLocal context manager that returns a single job."""
+    """Build a mock async_session_local context manager that returns a single job."""
     job_result = MagicMock()
     job_result.scalar_one_or_none.return_value = job
 
@@ -289,7 +289,7 @@ class TestLoadRuntimeContextHypotheses:
         job_dir.mkdir()
 
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -304,7 +304,7 @@ class TestLoadRuntimeContextHypotheses:
         job_dir.mkdir()
 
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -320,7 +320,7 @@ class TestLoadRuntimeContextHypotheses:
         job_dir.mkdir()
 
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -901,7 +901,7 @@ class TestEndToEndHypothesesFlow:
             investigation_mode="autonomous",
         )
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(fake_job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -925,7 +925,7 @@ class TestEndToEndHypothesesFlow:
             investigation_mode="autonomous",
         )
         with patch(
-            "openscientist.orchestrator.discovery.AsyncSessionLocal",
+            "openscientist.orchestrator.discovery.async_session_local",
             return_value=_make_mock_session_for_job(fake_job),
         ):
             runtime = await _load_runtime_context(job_dir)
@@ -1097,7 +1097,7 @@ class TestWriteSkillsToClaudeDirJobClaudeMd:
 
         agent = ClaudeCodeAgent(AgentConfig(job_dir=tmp_path), StubClaudeProvider())
         with patch(
-            "openscientist.database.session.AsyncSessionLocal",
+            "openscientist.database.session.async_session_local",
             side_effect=Exception("no db"),
         ):
             await agent.prepare_job_workspace(**kwargs)

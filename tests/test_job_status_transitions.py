@@ -316,7 +316,7 @@ async def test_a_status_write_that_cannot_reach_the_database_raises(
     manager = _manager(tmp_path)
     job = await make_job(JobStatus.RUNNING)
     with (
-        patch("openscientist.job_manager._run_async", side_effect=RuntimeError("database down")),
+        patch("openscientist.job_manager.run_sync", side_effect=RuntimeError("database down")),
         patch.object(manager, "_send_status_notification") as notify,
         pytest.raises(RuntimeError, match="database down"),
     ):

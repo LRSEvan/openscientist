@@ -308,11 +308,11 @@ class AbstractAgent[P: Provider](abc.ABC):
         ``super()``."""
         if self.skills_subdir is None:
             return
-        from openscientist.database.session import AsyncSessionLocal
+        from openscientist.database.session import async_session_local
         from openscientist.prompts import get_enabled_skills
 
         try:
-            async with AsyncSessionLocal() as session:
+            async with async_session_local() as session:
                 skills = await get_enabled_skills(session)
         except Exception as e:
             logger.warning("Failed to load enabled skills: %s", e)

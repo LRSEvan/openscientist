@@ -14,7 +14,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import TextContent
 from sqlalchemy import delete
 
-from openscientist.database import AsyncSessionLocal
+from openscientist.database import async_session_local
 from openscientist.database.models.job import Job
 from openscientist.knowledge_state import KnowledgeState
 from openscientist_tools.knowledge import (
@@ -38,7 +38,7 @@ async def _spawned_for_job(
     """Create a Job row, spawn the subprocess MCP server with env bound to
     that job_id (and optional ``env_overrides``), yield a connected
     `ClientSession`, then delete the Job."""
-    async with AsyncSessionLocal() as setup:
+    async with async_session_local() as setup:
         setup.add(
             Job(
                 id=job_id,
@@ -60,7 +60,7 @@ async def _spawned_for_job(
                 await session.initialize()
                 yield session
     finally:
-        async with AsyncSessionLocal() as cleanup:
+        async with async_session_local() as cleanup:
             await cleanup.execute(delete(Job).where(Job.id == job_id))
             await cleanup.commit()
 
@@ -272,7 +272,7 @@ async def test_update_hypothesis_via_subprocess(
     _apply_migrations_once: None,
 ) -> None:
     job_id = uuid4()
-    async with AsyncSessionLocal() as setup:
+    async with async_session_local() as setup:
         setup.add(
             Job(
                 id=job_id,
@@ -306,7 +306,7 @@ async def test_update_hypothesis_via_subprocess(
         entry = next(h for h in reloaded.data["hypotheses"] if h["id"] == "H001")
         assert entry["status"] == "supported"
     finally:
-        async with AsyncSessionLocal() as cleanup:
+        async with async_session_local() as cleanup:
             await cleanup.execute(delete(Job).where(Job.id == job_id))
             await cleanup.commit()
 

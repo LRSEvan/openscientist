@@ -18,7 +18,7 @@ from sqlalchemy import func, select, update
 
 from openscientist.database.models.job import Job as JobModel
 from openscientist.database.retry import CONTAINER_DB_RETRY_SECONDS, retry_async
-from openscientist.database.session import AsyncSessionLocal, SessionOpener
+from openscientist.database.session import SessionOpener, async_session_local
 from openscientist.knowledge_state import KnowledgeState
 from openscientist.prompts.common import namespace_tool_mentions
 
@@ -392,7 +392,7 @@ async def _get_job_status(job_id: str) -> str | None:
     for :data:`CONTAINER_DB_RETRY_SECONDS`."""
 
     async def read() -> str | None:
-        async with AsyncSessionLocal() as session:
+        async with async_session_local() as session:
             result = await session.execute(
                 select(JobModel.status).where(JobModel.id == UUID(job_id))
             )
@@ -471,7 +471,7 @@ async def update_job_status(
         status,
         error_message,
         allowed_from,
-        open_session or AsyncSessionLocal,
+        open_session or async_session_local,
         retry_for,
     )
 
