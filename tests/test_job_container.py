@@ -540,12 +540,10 @@ class TestPhenixMount:
 
         return settings
 
-    @patch("openscientist.job_container.runner.os.stat")
     @patch("openscientist.job_container.runner.resolve_docker_network", return_value="bridge")
     @patch("openscientist.job_container.runner.get_settings")
-    def test_phenix_mounted_when_available(self, mock_get_settings, _net, mock_stat):
+    def test_phenix_mounted_when_available(self, mock_get_settings, _net):
         """The configured Linux Phenix path is mounted into the agent container."""
-        mock_stat.return_value = MagicMock(st_gid=999)
         settings = self._mock_settings(
             phenix_available=True,
             phenix_path="/opt/phenix",
@@ -567,12 +565,10 @@ class TestPhenixMount:
         assert volumes["/Applications/phenix-1.21.2"] == {"bind": "/opt/phenix", "mode": "ro"}
         assert env["PHENIX_PATH"] == "/opt/phenix"
 
-    @patch("openscientist.job_container.runner.os.stat")
     @patch("openscientist.job_container.runner.resolve_docker_network", return_value="bridge")
     @patch("openscientist.job_container.runner.get_settings")
-    def test_phenix_not_mounted_without_host_path(self, mock_get_settings, _net, mock_stat):
+    def test_phenix_not_mounted_without_host_path(self, mock_get_settings, _net):
         """Phenix is not mounted when phenix_host_path is unset."""
-        mock_stat.return_value = MagicMock(st_gid=999)
         settings = self._mock_settings(
             phenix_available=True,
             phenix_path="/Applications/phenix-1.21.2",
@@ -594,12 +590,10 @@ class TestPhenixMount:
             assert "phenix" not in key.lower()
         assert "PHENIX_PATH" not in env
 
-    @patch("openscientist.job_container.runner.os.stat")
     @patch("openscientist.job_container.runner.resolve_docker_network", return_value="bridge")
     @patch("openscientist.job_container.runner.get_settings")
-    def test_phenix_not_mounted_when_unavailable(self, mock_get_settings, _net, mock_stat):
+    def test_phenix_not_mounted_when_unavailable(self, mock_get_settings, _net):
         """Phenix mounts are omitted when the feature is unavailable."""
-        mock_stat.return_value = MagicMock(st_gid=999)
         settings = self._mock_settings(phenix_available=False)
         mock_get_settings.return_value = settings
 
@@ -676,13 +670,11 @@ class TestGcpCredentialsMount:
         settings.phenix.phenix_host_path = None
         return settings
 
-    @patch("openscientist.job_container.runner.os.stat")
     @patch("openscientist.job_container.runner.resolve_docker_network", return_value="bridge")
     @patch("openscientist.job_container.runner.get_settings")
-    def test_launch_mounts_and_advertises_with_host_path(self, mock_get_settings, _net, mock_stat):
+    def test_launch_mounts_and_advertises_with_host_path(self, mock_get_settings, _net):
         """With a host path the runner threads the container path so the provider
         emits GOOGLE_APPLICATION_CREDENTIALS, and the creds file is bound."""
-        mock_stat.return_value = MagicMock(st_gid=999)
         mock_get_settings.return_value = self._launch_settings(host_path="/host/creds.json")
         runner, mock_client = self._make_runner()
 
@@ -695,12 +687,10 @@ class TestGcpCredentialsMount:
         assert volumes["/host/creds.json"] == {"bind": AGENT_GCP_CREDENTIALS_PATH, "mode": "ro"}
         assert env["GOOGLE_APPLICATION_CREDENTIALS"] == AGENT_GCP_CREDENTIALS_PATH
 
-    @patch("openscientist.job_container.runner.os.stat")
     @patch("openscientist.job_container.runner.resolve_docker_network", return_value="bridge")
     @patch("openscientist.job_container.runner.get_settings")
-    def test_launch_omits_creds_without_host_path(self, mock_get_settings, _net, mock_stat):
+    def test_launch_omits_creds_without_host_path(self, mock_get_settings, _net):
         """Without a host path nothing is mounted and no creds env is advertised."""
-        mock_stat.return_value = MagicMock(st_gid=999)
         mock_get_settings.return_value = self._launch_settings(host_path=None)
         runner, mock_client = self._make_runner()
 
