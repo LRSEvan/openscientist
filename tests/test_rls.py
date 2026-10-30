@@ -15,27 +15,9 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from openscientist.database import (
-    list_rls_policies,
-    set_current_user,
-    verify_rls_enabled,
-)
+from openscientist.database import set_current_user
 from openscientist.database.models import Administrator, Job, JobShare, User
 from tests.helpers import enable_rls
-
-
-@pytest.mark.asyncio
-async def test_rls_enabled_on_tables(db_session: AsyncSession):
-    """Verify that RLS is enabled on all expected tables."""
-    # Check critical tables
-    assert await verify_rls_enabled(db_session, "users")
-    assert await verify_rls_enabled(db_session, "jobs")
-    assert await verify_rls_enabled(db_session, "job_shares")
-    assert await verify_rls_enabled(db_session, "api_keys")
-    assert await verify_rls_enabled(db_session, "hypotheses")
-    assert await verify_rls_enabled(db_session, "findings")
-    assert await verify_rls_enabled(db_session, "review_tokens")
-    assert await verify_rls_enabled(db_session, "review_tokens")
 
 
 @pytest.mark.asyncio
@@ -419,16 +401,6 @@ async def test_bypassrls_role_sees_all_jobs(test_engine):
 
         # Admin bypasses RLS — sees all jobs regardless of set_current_user
         assert len(visible) >= 2
-
-
-@pytest.mark.asyncio
-async def test_list_rls_policies(db_session: AsyncSession):
-    """Test listing RLS policies."""
-    policies = await list_rls_policies(db_session, "jobs")
-    assert len(policies) > 0
-    # Should have policies for jobs table
-    policy_names = [p["name"] for p in policies]
-    assert any("jobs" in name for name in policy_names)
 
 
 # =============================================================================

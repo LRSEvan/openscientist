@@ -24,11 +24,15 @@ from nicegui import app, ui
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from openscientist.container_manager import get_container_manager
 from openscientist.database.login_guard import (
     DATABASE_SECRETS,
     database_login_problem,
     leaked_database_secrets,
 )
+from openscientist.database.models import Job
+from openscientist.database.rls import APP_ROLE, tables_without_enforced_rls
+from openscientist.exceptions import MissingImageError
 from openscientist.job_manager import JobManager
 from openscientist.listener import ListenerBindError
 from openscientist.security import register_scanner_block_middleware
@@ -331,62 +335,65 @@ def get_job_manager() -> JobManager:
     return _state.job_manager
 
 
+#: Mapped tables that hold no per-user rows, so no RLS policy guards them.
+_TABLES_WITHOUT_RLS = frozenset({"pubmed_articles", "pubmed_corpus_meta"})
+
+
+class RlsNotEnforcedError(RuntimeError):
+    """A table that holds per-user rows is missing, or its RLS is not both
+    enabled and forced, so the web would serve rows past their policies."""
+
+
 async def _verify_db_connection_and_rls(engine: AsyncEngine) -> None:
-    """Verify database connection, tables, and RLS configuration."""
+    """Verify the database connection and the RLS configuration.
+
+    A database that cannot be reached only logs, so the web still starts and
+    shows its outage page. A reachable database whose RLS is not enforced, on a
+    table that holds per-user rows or through an app role that bypasses it,
+    raises ``RlsNotEnforcedError``, which stops the web from starting.
+
+    Raises:
+        RlsNotEnforcedError: RLS is not enforced on a table or by the app role.
+    """
     from sqlalchemy import text
 
+    protected = frozenset(Job.metadata.tables) - _TABLES_WITHOUT_RLS
     try:
         async with engine.begin() as conn:
-            # Simple query to verify connection
             await conn.execute(text("SELECT 1"))
             logger.info("Database connection verified")
-
-            # Verify RLS is properly configured
-            rls_result = await conn.execute(
-                text(
-                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'jobs'"
+            unprotected = await tables_without_enforced_rls(conn, protected)
+            role = (
+                await conn.execute(
+                    text("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = :role"),
+                    {"role": APP_ROLE},
                 )
-            )
-            rls_row = rls_result.first()
-            if rls_row is None:
-                logger.warning("RLS CHECK: 'jobs' table not found — migrations may not have run")
-            elif not rls_row[0] or not rls_row[1]:
-                logger.error(
-                    "RLS CHECK FAILED: jobs table has rowsecurity=%s, forcerowsecurity=%s — "
-                    "run 'alembic upgrade head' to fix",
-                    rls_row[0],
-                    rls_row[1],
-                )
-            else:
-                logger.info("RLS CHECK: jobs table has RLS enabled and forced")
-
-            # Verify openscientist_app role exists and is not superuser
-            role_result = await conn.execute(
-                text(
-                    "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'openscientist_app'"
-                )
-            )
-            role_row = role_result.first()
-            if role_row is None:
-                logger.error(
-                    "RLS CHECK FAILED: 'openscientist_app' role does not exist — "
-                    "run 'alembic upgrade head' to create it"
-                )
-            elif role_row[0]:
-                logger.error(
-                    "RLS CHECK FAILED: 'openscientist_app' role is a SUPERUSER — "
-                    "this bypasses all RLS policies"
-                )
-            elif role_row[1]:
-                logger.error(
-                    "RLS CHECK FAILED: 'openscientist_app' role has BYPASSRLS — "
-                    "this bypasses all RLS policies"
-                )
-            else:
-                logger.info("RLS CHECK: openscientist_app role is correctly configured")
+            ).first()
     except Exception as e:
         logger.error("Database connection failed: %s", e)
         logger.warning("Application will continue but database features may not work")
+        return
+
+    problems = []
+    if unprotected:
+        problems.append(f"RLS is not enabled and forced on {', '.join(unprotected)}")
+    if role is None:
+        problems.append(f"the '{APP_ROLE}' role does not exist")
+    elif role.rolsuper:
+        problems.append(f"the '{APP_ROLE}' role is a SUPERUSER, which bypasses every policy")
+    elif role.rolbypassrls:
+        problems.append(f"the '{APP_ROLE}' role has BYPASSRLS, which bypasses every policy")
+    if problems:
+        raise RlsNotEnforcedError(
+            f"{'; '.join(problems)}. Run 'alembic upgrade head' as the owner, or restore "
+            "the RLS configuration, before starting the web."
+        )
+    logger.info(
+        "RLS CHECK: all %d tables with per-user rows have RLS enabled and forced, and "
+        "the %s role enforces it",
+        len(protected),
+        APP_ROLE,
+    )
 
 
 async def _ensure_default_skill_sources() -> None:
@@ -434,10 +441,44 @@ async def _ensure_default_skill_sources() -> None:
         logger.warning("Failed to seed default skill sources: %s", e)
 
 
+def _missing_container_images() -> list[str] | None:
+    """The agent and executor images Docker does not have, or None when Docker
+    cannot be asked."""
+    manager = get_container_manager()
+    if not manager.is_available():
+        return None
+    container = get_settings().container
+    return [
+        image
+        for image in (container.agent_image, container.executor_image)
+        if not manager.check_image_available(image)
+    ]
+
+
+async def _check_container_images() -> None:
+    """Name at startup each image a job would need and Docker lacks. Docker's
+    client blocks, so the check runs off the event loop."""
+    try:
+        missing = await asyncio.to_thread(_missing_container_images)
+    except Exception as e:
+        logger.warning("Could not check the container images: %s", e)
+        return
+    if missing is None:
+        logger.warning("Docker is not reachable, so the container images were not checked")
+    elif missing:
+        logger.error(
+            "%s Jobs and chat turns fail until the images are built.",
+            " ".join(str(MissingImageError(image)) for image in missing),
+        )
+    else:
+        logger.info("Container images present")
+
+
 async def _start_background_tasks(engine: AsyncEngine) -> None:
     """Start background tasks after database verification."""
     await _verify_db_connection_and_rls(engine)
     await _ensure_default_skill_sources()
+    await _check_container_images()
 
     # Start skill sync scheduler
     try:
@@ -513,7 +554,7 @@ def _create_lifespan() -> Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
             engine = get_engine()
             await _start_background_tasks(engine)
-        except ListenerBindError:
+        except (ListenerBindError, RlsNotEnforcedError):
             raise
         except Exception as e:
             logger.error("Failed to initialize database: %s", e)

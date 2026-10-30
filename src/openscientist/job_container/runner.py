@@ -29,6 +29,7 @@ from docker.models.containers import Container
 import docker
 from docker import errors as docker_errors
 from openscientist.database.retry import CONTAINER_DB_RETRY_SECONDS
+from openscientist.exceptions import MissingImageError
 from openscientist.exec_broker_client import (
     EXEC_BROKER_URL_ENV,
     EXEC_TOKEN_ENV,
@@ -378,27 +379,30 @@ class JobContainerRunner:
             }
             labels[RUN_HOME_LABEL] = str(home)
 
-        return self._docker.containers.run(
-            image=cs.agent_image,
-            name=name,
-            detach=True,
-            remove=False,
-            environment=env,
-            volumes=volumes,
-            network=network,
-            mem_limit=agent_memory,
-            nano_cpus=int(agent_cpu * 1e9),
-            platform=agent_platform or None,
-            security_opt=["no-new-privileges:true"],
-            cap_add=cap_add,
-            user=run_user,
-            entrypoint=entrypoint,
-            # Map host.docker.internal to the host gateway so the container can
-            # reach a model server on the host (e.g. a local Ollama). Harmless
-            # otherwise. On Linux this is not provided by default.
-            extra_hosts={"host.docker.internal": "host-gateway"},
-            labels=labels,
-        )
+        try:
+            return self._docker.containers.run(
+                image=cs.agent_image,
+                name=name,
+                detach=True,
+                remove=False,
+                environment=env,
+                volumes=volumes,
+                network=network,
+                mem_limit=agent_memory,
+                nano_cpus=int(agent_cpu * 1e9),
+                platform=agent_platform or None,
+                security_opt=["no-new-privileges:true"],
+                cap_add=cap_add,
+                user=run_user,
+                entrypoint=entrypoint,
+                # Map host.docker.internal to the host gateway so the container can
+                # reach a model server on the host (e.g. a local Ollama). Harmless
+                # otherwise. On Linux this is not provided by default.
+                extra_hosts={"host.docker.internal": "host-gateway"},
+                labels=labels,
+            )
+        except docker_errors.ImageNotFound as error:
+            raise MissingImageError(cs.agent_image) from error
 
     def run_chat_turn(
         self, job_id: str, job_dir: Path, chat_turn: str, *, timeout: int = 300
