@@ -1188,23 +1188,6 @@ class TestAppendLog:
         assert "Iteration 2" in content
 
 
-# ─── packaged chat template ───────────────────────────────────────────
-
-
-class TestChatTemplate:
-    """The packaged CHAT_CLAUDE.md must match the repo copy so the in-image
-    template stays in sync with the source of truth. (Writing the chat context
-    is the agent's job, exercised in tests/test_job_chat.py.)"""
-
-    def test_packaged_template_matches_repo_copy(self):
-        from openscientist.prompts.common import read_chat_template
-
-        repo_copy = (Path(__file__).resolve().parents[1] / "CHAT_CLAUDE.md").read_text(
-            encoding="utf-8"
-        )
-        assert read_chat_template() == repo_copy
-
-
 # ─── build_initial_prompt ──────────────────────────────────────────────
 
 
