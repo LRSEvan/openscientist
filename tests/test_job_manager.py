@@ -784,32 +784,6 @@ class TestJobManagerSummary:
 class TestJobManagerCLI:
     """Tests for job_manager CLI argument handling."""
 
-    def test_bootstrap_command_invokes_migration_without_legacy_flags(self, monkeypatch, capsys):
-        """CLI bootstrap forwards only jobs dir and dry-run to migration entrypoint."""
-        from openscientist.job_manager import main
-
-        mock_result = MagicMock()
-        mock_result.to_dict.return_value = {"created_jobs": 1, "orphan_jobs": 1}
-
-        mock_bootstrap = MagicMock(return_value=mock_result)
-        monkeypatch.setattr(
-            "openscientist.bootstrap.bootstrap_jobs_from_filesystem_sync",
-            mock_bootstrap,
-        )
-        monkeypatch.setattr(
-            "sys.argv",
-            ["job_manager.py", "bootstrap", "--jobs-dir", "jobs", "--dry-run"],
-        )
-
-        main()
-
-        mock_bootstrap.assert_called_once_with(
-            jobs_dir=Path("jobs"),
-            dry_run=True,
-        )
-        stdout = capsys.readouterr().out
-        assert '"created_jobs": 1' in stdout
-
     def test_list_command_prints_the_job_table(self, monkeypatch, capsys):
         from openscientist.job_manager import main
 

@@ -69,16 +69,13 @@ async def _status(test_engine: AsyncEngine, job_id: str) -> str:
         return str(result.scalar_one())
 
 
-def test_a_user_loads_the_knowledge_of_their_own_job_only(alices_job: _Fixture) -> None:
-    mine = KnowledgeState.load_from_database_sync(
-        alices_job.job_id, open_session=partial(thread_safe_user_session, alices_job.owner)
-    )
+async def test_a_user_loads_the_knowledge_of_their_own_job_only(alices_job: _Fixture) -> None:
+    async with thread_safe_user_session(alices_job.owner) as session:
+        mine = await KnowledgeState.load_from_database(alices_job.job_id, session)
     assert [f["title"] for f in mine.data["findings"]] == ["Alice's finding"]
     with pytest.raises(ValueError, match="not found"):
-        KnowledgeState.load_from_database_sync(
-            alices_job.job_id,
-            open_session=partial(thread_safe_user_session, alices_job.stranger),
-        )
+        async with thread_safe_user_session(alices_job.stranger) as session:
+            await KnowledgeState.load_from_database(alices_job.job_id, session)
 
 
 @pytest.mark.asyncio

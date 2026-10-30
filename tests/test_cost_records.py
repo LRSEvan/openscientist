@@ -28,7 +28,6 @@ from openscientist.database.models import CostRecord, Job
 from openscientist.job_chat import _chat_turn_files, run_chat_turn_async
 from openscientist.job_container.db_login import AGENT_LOGIN_LABEL
 from openscientist.job_container.runner import _STOP_GRACE_SECONDS, JobContainerRunner
-from openscientist.knowledge_state import KnowledgeState
 from openscientist.orchestrator.discovery import (
     _CostLedger,
     _ReportOutcome,
@@ -177,7 +176,6 @@ async def test_a_completed_run_writes_each_phase_cost_as_it_goes(
     }
     job_dir = tmp_path / str(job)
     job_dir.mkdir(parents=True)
-    ks = KnowledgeState(str(job), "Q?", 2)
 
     with (
         patch(
@@ -207,10 +205,6 @@ async def test_a_completed_run_writes_each_phase_cost_as_it_goes(
             return_value=None,
         ),
         patch("openscientist.orchestrator.discovery.increment_ks_iteration"),
-        patch(
-            "openscientist.orchestrator.discovery.KnowledgeState.load_from_database_sync",
-            return_value=ks,
-        ),
         patch(
             "openscientist.orchestrator.discovery._get_job_status",
             new_callable=AsyncMock,
@@ -255,7 +249,6 @@ async def test_report_regeneration_writes_only_the_report_cost(
     }
     job_dir = tmp_path / str(job)
     job_dir.mkdir(parents=True)
-    ks = KnowledgeState(str(job), "Q?", 1)
 
     with (
         patch(
@@ -277,10 +270,6 @@ async def test_report_regeneration_writes_only_the_report_cost(
             return_value="completed",
         ),
         patch("openscientist.orchestrator.discovery.update_job_status", new_callable=AsyncMock),
-        patch(
-            "openscientist.orchestrator.discovery.KnowledgeState.load_from_database_sync",
-            return_value=ks,
-        ),
     ):
         result = await regenerate_report_async(job_dir)
 
