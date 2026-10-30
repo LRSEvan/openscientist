@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from openscientist.agent.base import AbstractAgent, AgentBackend, AgentConfig
+from openscientist.agent.base import AbstractAgent, AgentConfig
 from openscientist.agent.claude_code_agent import ClaudeCodeAgent
 from openscientist.agent.omp_agent import OmpAgent
 from openscientist.providers import provider_class
@@ -105,11 +105,6 @@ def agent_class_for_provider_id(provider_id: str) -> type[AbstractAgent[Any]]:
     except ValueError:
         return ClaudeCodeAgent
     return _agent_class_for(cls, _resolve_harness())
-
-
-def backend_for_provider_id(provider_id: str) -> AgentBackend:
-    """The agent backend for a provider id without instantiating it (UI)."""
-    return agent_class_for_provider_id(provider_id).backend
 
 
 def build_agent(config: AgentConfig, provider: Provider) -> AbstractAgent[Provider]:
