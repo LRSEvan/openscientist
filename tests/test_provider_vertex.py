@@ -278,3 +278,26 @@ class TestVertexClaudeCompatible:
         settings = _mock_settings(self._creds_file(tmp_path), model="claude-custom")
         with patch("openscientist.providers.vertex.get_settings", return_value=settings):
             assert VertexProvider().claude_model_name() == "claude-custom"
+
+
+class TestVertexCostInfo:
+    """Tests for the Vertex AI billing lookup."""
+
+    def test_failed_billing_query_reports_spend_unavailable(self, tmp_path: Path) -> None:
+        creds = tmp_path / "sa.json"
+        creds.write_text("{}")
+        settings = _mock_settings(str(creds))
+        bq_client = MagicMock()
+        bq_client.query.side_effect = RuntimeError("billing export table not found")
+        with (
+            patch("openscientist.providers.vertex.get_settings", return_value=settings),
+            patch("google.oauth2.service_account.Credentials.from_service_account_file"),
+            patch("google.cloud.bigquery.Client", return_value=bq_client),
+        ):
+            info = VertexProvider().get_cost_info(lookback_hours=6)
+
+        assert info.total_spend_usd is None
+        assert info.recent_spend_usd is None
+        assert info.recent_period_hours == 6
+        assert info.data_lag_note == "Billing data unavailable (ensure BigQuery export is enabled)"
+        assert info.metadata == {"project_id": "proj-123"}
